@@ -1,9 +1,10 @@
-docs_dir: doc
+docs_dir: docs
 site_name: 'blitzy-odoo'
 nav:
   - Home: index.md
   - Project Guide: project-guide.md
   - Technical Specifications: technical-specifications.md
+  - Change Archaeology & Review: change-archaeology-and-review.md
 plugins:
   - techdocs-core
   - mermaid2
