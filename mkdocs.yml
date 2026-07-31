@@ -1,5 +1,11 @@
 docs_dir: docs
 site_name: 'blitzy-odoo'
+site_description: >-
+  Odoo 19.0 fork pursuing enterprise accounting parity — financial reporting
+  engine and bank reconciliation — with an IBM Carbon Design System UI
+  redesign as planned direction.
+repo_url: https://github.com/Blitzy-Sandbox/blitzy-odoo
+edit_uri: edit/19.0/docs/
 nav:
   - Home: index.md
   - Project Guide: project-guide.md
@@ -7,4 +13,9 @@ nav:
   - Change Archaeology & Review: change-archaeology-and-review.md
 plugins:
   - techdocs-core
-  - mermaid2
+markdown_extensions:
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
