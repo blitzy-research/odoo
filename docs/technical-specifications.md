@@ -1,12 +1,12 @@
 # 0. Agent Action Plan
 
-> **Status: UNEXECUTED PLAN.** This document is a planning artifact, not a description of implemented software. Nothing it specifies has been built in this repository. Read every requirement, epic, user story, directory tree, and module inventory below as a creation target, never as an inventory of what exists.
+> **Status: UNEXECUTED PLAN.** This document is a planning artifact, not a description of implemented software. Nothing it specifies has been built on branch `19.0`, the branch you are reading it on. Read every requirement, epic, user story, directory tree, and module inventory below as a creation target, never as an inventory of what exists here.
 >
 > **Provenance:** The content was authored against branch `pdlc` via pull request #2 of `Blitzy-Sandbox/blitzy-odoo` ("Enterprise Accounting Docs & Reports Scaffold", the pull request linked from this repository's `catalog-info.yaml` service descriptor), whose change set carries 81 changed files and 27,905 additions per the hosting platform's pull-request record. It is published here on branch `19.0`, a different branch carrying a different change set.
 >
 > **Absent from branch `19.0`:** every artifact this plan targets is missing from the branch you are reading it on, verified by direct filesystem check of this checkout — the `tickets/` documentation tree, the `addons/account_financial_report_ce/` module, and the accounting addons `account_reports`, `account_accountant`, `account_asset`, `account_budget`, and `account_followup`.
 >
-> **What branch `19.0` actually contains:** the agent-authored change set on this branch is 13 commits touching 6 files, with 2,025 insertions and 0 deletions — measured with `git rev-list --count` and `git diff --shortstat` over the range from the last upstream commit to the branch head. All six are documentation and configuration files; no accounting module, financial reporting engine, bank reconciliation, or ticket artifact is among them.
+> **The original reconstructed pre-remediation agent-authored change set on branch `19.0`:** the change set this branch carried before remediation began is 13 commits touching 6 files, with 2,025 insertions and 0 deletions — measured with `git rev-list --count 7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8` and `git diff --shortstat 7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8`, the fixed historical range running from the last upstream commit `7bd7718bcd4c` to `c789a23602c2`, the last commit of that change set. All six are documentation and configuration files; no accounting module, financial reporting engine, bank reconciliation, or ticket artifact is among them. Both endpoints are named rather than left as `HEAD` because the remediation commits that follow `c789a23602c2` extend the branch beyond these figures.
 
 ## 0.1 Intent Clarification
 

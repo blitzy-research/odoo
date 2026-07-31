@@ -1,6 +1,6 @@
 # Project Guide: Enterprise Accounting Epic for Odoo Community Edition
 
-> ⚠️ **Provenance**: this guide was authored against branch `pdlc` via pull request PR #2 ("Enterprise Accounting Docs & Reports Scaffold") of `Blitzy-Sandbox/blitzy-odoo`, which carries **81 changed files and 27,905 additions**. It is published on branch `19.0`, whose agent-authored change set is **13 commits, 6 files, 2,025 insertions, 0 deletions** — measured with `git log --oneline 7bd7718bcd4c..HEAD` and `git diff --stat 7bd7718bcd4c..HEAD` (baseline commit `7bd7718bcd4c`, head `c789a23602c2`), which report `catalog-info.yaml` 32, `mkdocs.yml` 9, `doc/index.md` 5, `docs/index.md` 3, `doc/project-guide.md` 502, `doc/technical-specifications.md` 1474.
+> ⚠️ **Provenance**: this guide was authored against branch `pdlc` via pull request PR #2 ("Enterprise Accounting Docs & Reports Scaffold") of `Blitzy-Sandbox/blitzy-odoo`, which carries **81 changed files and 27,905 additions**. It is published on branch `19.0`, whose **original reconstructed pre-remediation agent-authored change set** is **13 commits, 6 files, 2,025 insertions, 0 deletions** over the fixed historical range `7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8` — measured with `git log --oneline 7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8` and `git diff --stat 7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8`, where `7bd7718bcd4c` is the last upstream commit and `c789a23602c2` the last commit of that change set, which report `catalog-info.yaml` 32, `mkdocs.yml` 9, `doc/index.md` 5, `docs/index.md` 3, `doc/project-guide.md` 502, `doc/technical-specifications.md` 1474. Both endpoints are named rather than left as `HEAD` because the remediation commits that follow `c789a23602c2` add to every one of those figures: they are an archaeology record of that fixed range, not a census of the branch as it now stands.
 >
 > ⚠️ **Artifacts described below that are ABSENT from branch `19.0`** — every one verified on this checkout: the `tickets/` documentation tree, `addons/account_financial_report_ce/`, and the accounting addons `account_reports`, `account_accountant`, `account_asset`, `account_budget`, and `account_followup`.
 >
@@ -32,7 +32,7 @@ This project delivers comprehensive user story documentation for implementing en
 
 ## Validation Results Summary
 
-⚠️ **Scope**: both tables below record validation performed against the branch `pdlc` working tree. The counts and the ✅ verdicts are accurate for `pdlc` and are retained unchanged. They are **not** reproducible on branch `19.0`, which contains neither the 43 documentation files nor `addons/account_financial_report_ce/`; with no source present there is nothing here to compile or validate.
+⚠️ **Scope**: both tables below record validation performed against the branch `pdlc` working tree. The counts and the ✅ verdicts are accurate for `pdlc`. They are **not** reproducible on branch `19.0`, which contains neither the 43 documentation files nor `addons/account_financial_report_ce/`; with no source present there is nothing here to compile or validate.
 
 ### Documentation Validation (43 files, branch `pdlc`)
 | Category | Count | Status |
@@ -280,16 +280,19 @@ source venv/bin/activate
 # 3. Install Python dependencies
 pip install -r requirements.txt
 
-# 4. Install additional dependencies for reports
-pip install xlsxwriter xlrd openpyxl
+# 4. Verify the report dependencies pinned by requirements.txt are importable
+python -c "import xlsxwriter, xlrd, openpyxl"
 ```
 
 ### Database Setup
 
 ```bash
-# 1. Create PostgreSQL database
-sudo -u postgres createuser -s odoo
-sudo -u postgres createdb odoo_enterprise_accounting
+# 1. Create a least-privileged PostgreSQL role and the database it owns.
+#    --no-superuser and --no-createrole keep the application role off server-wide
+#    control; --createdb is the only elevated privilege Odoo needs, because its
+#    database manager creates and duplicates databases.
+sudo -u postgres createuser --createdb --no-createrole --no-superuser odoo
+sudo -u postgres createdb --owner=odoo odoo_enterprise_accounting
 
 # 2. Initialize Odoo database
 ./odoo-bin -d odoo_enterprise_accounting -i base --stop-after-init
@@ -308,7 +311,7 @@ sudo -u postgres createdb odoo_enterprise_accounting
 ### Running Odoo Server
 
 ```bash
-# Development mode
+# Start the server and upgrade the financial reports module
 ./odoo-bin -d odoo_enterprise_accounting --addons-path=addons -u account_financial_report_ce
 
 # With specific port
@@ -321,8 +324,8 @@ sudo -u postgres createdb odoo_enterprise_accounting
 # Run financial reports module tests
 ./odoo-bin -d odoo_enterprise_accounting --test-enable --stop-after-init -i account_financial_report_ce
 
-# Run with coverage (requires pytest-odoo)
-pip install pytest-odoo coverage
+# Run the native Odoo test suite under coverage
+pip install coverage
 coverage run --source=addons/account_financial_report_ce ./odoo-bin -d test_db --test-enable --stop-after-init -i account_financial_report_ce
 coverage report
 ```
@@ -390,7 +393,7 @@ action = wizard.button_generate_report()
 
 ### Branch `pdlc` — PR #2, the change set this guide describes
 
-⚠️ Every figure in this table belongs to branch `pdlc`, not to the branch this guide is published on. `Lines Added` reads **27,905**, taken from the authoritative PR #2 record; the lower figure carried by earlier revisions of this guide was wrong even for `pdlc` and has been corrected.
+⚠️ Every figure in this table belongs to branch `pdlc`, not to the branch this guide is published on. `Lines Added` reads **27,905**, the figure carried by the authoritative PR #2 record.
 
 | Metric | Value |
 |--------|-------|
@@ -403,9 +406,9 @@ action = wizard.button_generate_report()
 | XML LOC | 2,292 |
 | SCSS LOC | 596 |
 
-### Branch `19.0` — what this branch actually contains
+### Branch `19.0` — the original reconstructed pre-remediation agent-authored change set
 
-⚠️ Anchor to reality. Branch `19.0` carries **13 commits, 6 files, 2,025 insertions, 0 deletions** from the agent-authored change set — measured on this checkout with `git log --oneline 7bd7718bcd4c..HEAD | wc -l` and `git diff --stat 7bd7718bcd4c..HEAD`. None of the `pdlc` figures above applies here.
+⚠️ Anchor to reality. The agent-authored change set originally reconstructed on branch `19.0` — what the branch carried before remediation began — is **13 commits, 6 files, 2,025 insertions, 0 deletions** over the fixed historical range `7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8`, reproduced on this checkout with `git log --oneline 7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8 | wc -l` and `git diff --stat 7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8`, where `7bd7718bcd4c` is the last upstream commit and `c789a23602c2` the last commit of that change set. Both endpoints are named rather than left as `HEAD` because the remediation commits that follow `c789a23602c2` add to every figure in the table below, so a moving upper bound no longer reports these values: the table is that fixed archaeology inventory rather than a census of the branch as it now stands. None of the `pdlc` figures above applies here.
 
 | Metric | Value |
 |--------|-------|
@@ -424,7 +427,7 @@ action = wizard.button_generate_report()
 
 ## File Inventory (branch `pdlc`)
 
-⚠️ Both trees below record what PR #2 created on branch `pdlc`. Verified on this checkout, `ls -d tickets` and `ls -d addons/account_financial_report_ce` both report *No such file or directory*: **neither tree exists on branch `19.0`**. They are retained unchanged as an accurate reference for the `pdlc` deliverable, not as a description of this branch.
+⚠️ Both trees below record what PR #2 created on branch `pdlc`. Verified on this checkout, `ls -d tickets` and `ls -d addons/account_financial_report_ce` both report *No such file or directory*: **neither tree exists on branch `19.0`**. They document the `pdlc` deliverable and do not describe this branch.
 
 ### Documentation Files (tickets/ — created on `pdlc`; ABSENT on `19.0`)
 
@@ -509,8 +512,6 @@ The ordering below is a dependency chain, not a calendar. Each phase states what
 2. Begin Bank Reconciliation module development (HT-002)
 3. Establish CI/CD pipeline for automated testing
 
-⚠️ Item 3 is still outstanding on branch `19.0`: `.github/` contains only `ISSUE_TEMPLATE/1_bug_form.yml`, `ISSUE_TEMPLATE/config.yml`, and `PULL_REQUEST_TEMPLATE.md`, so no automated workflow exists to run these tests.
-
 ### Phase 3 — Depends on Phase 2
 1. Complete remaining modules (HT-003 through HT-006)
 2. Conduct integration testing (HT-007)
@@ -526,7 +527,7 @@ The ordering below is a dependency chain, not a calendar. Each phase states what
 
 ## Conclusion
 
-⚠️ **This conclusion is qualified to branch `pdlc`.** It is not withdrawn, because it is accurate for the branch it was written against; it is restricted, because none of the artifacts it credits exists on branch `19.0`, where this guide is published. On `19.0` there is no module source to compile, no prototype to hand off, and therefore no evidential basis for a zero-blocking-issues verdict.
+⚠️ **This conclusion applies to branch `pdlc` only.** None of the artifacts it credits exists on branch `19.0`, where this guide is published: there is no module source to compile, no prototype to hand off, and therefore no evidential basis here for a zero-blocking-issues verdict.
 
 On branch `pdlc`, the Enterprise Accounting Epic documentation project has successfully delivered:
 
