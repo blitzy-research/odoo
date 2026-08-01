@@ -12,7 +12,21 @@ nav:
   - Technical Specifications: technical-specifications.md
   - Change Archaeology & Review: change-archaeology-and-review.md
 plugins:
-  - techdocs-core
+  # techdocs-core remains the sole declared plugin (AAP §0.8.1). The nested
+  # mapping below sets one of the plugin's own documented options, so the
+  # declared plugin list is still exactly [techdocs-core] and no ninth
+  # top-level key is introduced.
+  #
+  # use_material_search: true selects mkdocs-material's search plugin instead
+  # of MkDocs' core SearchPlugin. techdocs-core registers whichever it is told
+  # to under the config key "search"; the core plugin's on_config appends the
+  # stock default-theme script search/main.js, which dereferences a global
+  # `base_url` that the Material theme never emits. The result was an uncaught
+  # ReferenceError on every page load, and a search worker that was never
+  # constructed. The Material plugin ships its search index through the theme
+  # bundle instead, so no stray script is emitted and no global is required.
+  - techdocs-core:
+      use_material_search: true
 markdown_extensions:
   - pymdownx.superfences:
       custom_fences:

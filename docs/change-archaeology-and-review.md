@@ -1,6 +1,6 @@
 # Change Archaeology & Segmented PR Review
 
-> ⚠️ **Provenance**: this record covers the **agent-authored change set on branch `19.0`** of `Blitzy-Sandbox/blitzy-odoo`, reconstructed by commit authorship rather than by filename. The reconstructed range is the fixed interval `7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8` — **13 commits, 6 files, 2,025 insertions, 0 deletions**. Both endpoints are named explicitly rather than left as `HEAD`, because the remediation commits that follow `c789a23602c2` change every figure below: this is an archaeology record of a fixed historical range, not a census of the branch as it now stands.
+> ⚠️ **Provenance**: `Blitzy-Sandbox/blitzy-odoo`, branch `19.0`. This record covers the **agent-authored change set on that branch**, reconstructed by commit authorship rather than by filename. The reconstructed range is the fixed interval `7bd7718bcd4c..c789a23602c2` — **13 commits, 6 files, 2,025 insertions, 0 deletions**. Both endpoints are named explicitly rather than left as `HEAD`, because the remediation commits that follow `c789a23602c2` change every figure below: this is an archaeology record of a fixed historical range, not a census of the branch as it now stands. Both endpoints are given in the abbreviated form this document uses throughout, per the conventions of subsection 1.2; their full forty-character object names are recorded in the boundary table of subsection 1.1.
 >
 > ⚠️ **This document is the assessment half of "assess and remediate".** It records what was found and what each repair must achieve. It is not itself a specification of working software, and it makes no claim about accounting capability on this branch — see [the landing page](index.md) for what branch `19.0` actually contains.
 
@@ -134,21 +134,21 @@ Every entry is an addition. There are no deletions and no modifications to any p
 
 Twelve are authored by Michael Montanaro &lt;michael@blitzy.com&gt; on 2026-04-06; the thirteenth by ajay-blitzy &lt;awadhwani@blitzy.com&gt; on 2026-05-15. Every row nevertheless carries its own author identity and commit date rather than relying on that summary, so each entry is attributable on its own. The ordering is oldest first, and the metadata is authoritative: `git log --reverse --date=short --format='%h|%s|%an <%ae>|%ad' 7bd7718bcd4c..c789a23602c2`.
 
-| # | Commit | Author | Date | Subject | Effect |
-|---|--------|--------|------|---------|--------|
-| 1 | `3322c9fb56fc` | Michael Montanaro &lt;michael@blitzy.com&gt; | 2026-04-06 | Add Backstage catalog-info.yaml for developer portal integration | Adds the descriptor with tags `python`/`web-app`/`in-progress`, an `in-progress` status label, no TechDocs annotation, and system `blitzy-sandbox-projects` |
-| 2 | `89bf914d81fe` | Michael Montanaro &lt;michael@blitzy.com&gt; | 2026-04-06 | chore: update catalog tags — remove status, add work type | Removes both the `in-progress` tag and the status label; adds tag `refactor`. Net effect: the only in-progress signal is deleted while the declared lifecycle stays `production` |
-| 3 | `4519ac913f3c` | Michael Montanaro &lt;michael@blitzy.com&gt; | 2026-04-06 | chore: add techdocs-ref annotation for TechDocs support | Adds `backstage.io/techdocs-ref: dir:.`; also strips the trailing newline |
-| 4 | `fd9479eeb937` | Michael Montanaro &lt;michael@blitzy.com&gt; | 2026-04-06 | chore: add mkdocs.yml for TechDocs | Adds the site config with no `docs_dir`, so MkDocs defaults to `docs/` — which did not yet exist. **The build is broken at this commit.** |
-| 5 | `d9f5402fba36` | Michael Montanaro &lt;michael@blitzy.com&gt; | 2026-04-06 | chore: add docs/index.md for TechDocs | Creates `docs/index.md`. The build is fixed |
-| 6 | `c42e4df275b6` | Michael Montanaro &lt;michael@blitzy.com&gt; | 2026-04-06 | chore: set docs_dir to doc/ for TechDocs compatibility | Repoints the documentation root to `doc/`. **Breaks the build again** and strands `docs/index.md`; also strips the trailing newline |
-| 7 | `f3679676519f` | Michael Montanaro &lt;michael@blitzy.com&gt; | 2026-04-06 | chore: assign component to blitzy-python system for catalog graph | Changes `spec.system` to `blitzy-python` |
-| 8 | `3be4d5ce4ae8` | Michael Montanaro &lt;michael@blitzy.com&gt; | 2026-04-06 | docs: add index.md for TechDocs | Creates `doc/index.md` with text differing from `docs/index.md`. The build is fixed and `docs/index.md` is now permanently orphaned |
-| 9 | `4e0e6df0811f` | Michael Montanaro &lt;michael@blitzy.com&gt; | 2026-04-06 | docs: add mermaid2 plugin for diagram support | Adds the `mermaid2` plugin but no fence configuration, so the stated purpose is not achieved — see subsection 3.5 |
-| 10 | `ce5781adcadf` | Michael Montanaro &lt;michael@blitzy.com&gt; | 2026-04-06 | docs: add Project Guide from Blitzy | Adds the 502-line project guide |
-| 11 | `e684fbe46c33` | Michael Montanaro &lt;michael@blitzy.com&gt; | 2026-04-06 | docs: add Technical Specifications from Blitzy | Adds the 1,474-line specification |
-| 12 | `b58d620c4fb2` | Michael Montanaro &lt;michael@blitzy.com&gt; | 2026-04-06 | docs: add Blitzy documentation to nav | Adds two navigation entries; leaves the file without a trailing newline |
-| 13 | `c789a23602c2` | ajay-blitzy &lt;awadhwani@blitzy.com&gt; | 2026-05-15 | chore: extend catalog tags (security, audit) | Adds two tags, but the diff is sixteen insertions against thirteen deletions because the whole file was round-tripped through a YAML serialiser — the description was folded, sequence indentation changed from four spaces to two, quoting style changed, and the trailing newline was restored |
+| # | Commit | Author & date | Subject | Effect |
+|---|--------|---------------|---------|--------|
+| 1 | `3322c9fb56fc` | `Michael Montanaro <michael@blitzy.com>` · 2026-04-06 | Add Backstage catalog-info.yaml for developer portal integration | Adds the descriptor with tags `python`/`web-app`/`in-progress`, an `in-progress` status label, no TechDocs annotation, and system `blitzy-sandbox-projects` |
+| 2 | `89bf914d81fe` | `Michael Montanaro <michael@blitzy.com>` · 2026-04-06 | chore: update catalog tags — remove status, add work type | Removes both the `in-progress` tag and the status label; adds tag `refactor`. Net effect: the only in-progress signal is deleted while the declared lifecycle stays `production` |
+| 3 | `4519ac913f3c` | `Michael Montanaro <michael@blitzy.com>` · 2026-04-06 | chore: add techdocs-ref annotation for TechDocs support | Adds `backstage.io/techdocs-ref: dir:.`; also strips the trailing newline |
+| 4 | `fd9479eeb937` | `Michael Montanaro <michael@blitzy.com>` · 2026-04-06 | chore: add mkdocs.yml for TechDocs | Adds the site config with no `docs_dir`, so MkDocs defaults to `docs/` — which did not yet exist. **The build is broken at this commit.** |
+| 5 | `d9f5402fba36` | `Michael Montanaro <michael@blitzy.com>` · 2026-04-06 | chore: add docs/index.md for TechDocs | Creates `docs/index.md`. The build is fixed |
+| 6 | `c42e4df275b6` | `Michael Montanaro <michael@blitzy.com>` · 2026-04-06 | chore: set docs_dir to doc/ for TechDocs compatibility | Repoints the documentation root to `doc/`. **Breaks the build again** and strands `docs/index.md`; also strips the trailing newline |
+| 7 | `f3679676519f` | `Michael Montanaro <michael@blitzy.com>` · 2026-04-06 | chore: assign component to blitzy-python system for catalog graph | Changes `spec.system` to `blitzy-python` |
+| 8 | `3be4d5ce4ae8` | `Michael Montanaro <michael@blitzy.com>` · 2026-04-06 | docs: add index.md for TechDocs | Creates `doc/index.md` with text differing from `docs/index.md`. The build is fixed and `docs/index.md` is now permanently orphaned |
+| 9 | `4e0e6df0811f` | `Michael Montanaro <michael@blitzy.com>` · 2026-04-06 | docs: add mermaid2 plugin for diagram support | Adds the `mermaid2` plugin but no fence configuration, so the stated purpose is not achieved — see subsection 3.5 |
+| 10 | `ce5781adcadf` | `Michael Montanaro <michael@blitzy.com>` · 2026-04-06 | docs: add Project Guide from Blitzy | Adds the 502-line project guide |
+| 11 | `e684fbe46c33` | `Michael Montanaro <michael@blitzy.com>` · 2026-04-06 | docs: add Technical Specifications from Blitzy | Adds the 1,474-line specification |
+| 12 | `b58d620c4fb2` | `Michael Montanaro <michael@blitzy.com>` · 2026-04-06 | docs: add Blitzy documentation to nav | Adds two navigation entries; leaves the file without a trailing newline |
+| 13 | `c789a23602c2` | `ajay-blitzy <awadhwani@blitzy.com>` · 2026-05-15 | chore: extend catalog tags (security, audit) | Adds two tags, but the diff is sixteen insertions against thirteen deletions because the whole file was round-tripped through a YAML serialiser — the description was folded, sequence indentation changed from four spaces to two, quoting style changed, and the trailing newline was restored |
 
 Reviewing the net diff alone would have concealed commits 4 through 8 entirely, because their effects cancel in the aggregate while leaving permanent residue. Each commit was therefore replayed individually.
 
@@ -176,6 +176,19 @@ graph TD
     C --> F["SIDE EFFECT<br/>site root now points at<br/>upstream CLA archive"]
 %% Reconstructed by replaying commits 4 through 8 of the thirteen agent-authored commits individually
 ```
+
+**Diagram text alternative** — *the documentation-root flip-flop*, a
+top-to-bottom graph with six nodes and five edges. The chain runs
+`fd9479eeb937` (add `mkdocs.yml`, no `docs_dir`, defaults to `docs/`) to
+`d9f5402fba36` (create `docs/index.md`, build fixed) to `c42e4df275b6` (set
+`docs_dir: doc`, build broken again) to `3be4d5ce4ae8` (create `doc/index.md`,
+build fixed), and finally to a terminal node reading *residue at
+`c789a23602c2`* — `docs/index.md` orphaned outside the build, two landing pages
+with divergent text. A fifth edge branches separately out of `c42e4df275b6` to
+a second terminal node reading *side effect* — the site root now points at the
+upstream CLA archive. So `c42e4df275b6` is the only node with two outbound
+edges, and the two terminal nodes are the two consequences that outlived the
+sequence.
 
 Two consequences outlived the sequence. First, `docs/index.md` was left orphaned outside the build — present in the tree, reachable by no consumer, and carrying text that diverged from the page that replaced it. Second, and far more consequential, the configured site root was pointed at `doc/`, a directory that at the boundary commit contained **nothing but Odoo's contributor-agreement archive**.
 
@@ -242,7 +255,7 @@ Because the checkout carries **45,666** tracked files at `c789a23602c2`, the abs
 
 > ⚠️ **Boundary discipline — no measurement in this section is expressed against a moving reference.** The archaeology range has a *fixed* upper bound, `c789a23602c2`. Substituting `HEAD` for it would not merely be imprecise, it would be wrong: measured while this record was being written, `7bd7718bcd4c..HEAD` already resolved to more commits and more insertions than the fixed range's **13 commits and 2,025 insertions**, and it moves again with every remediation commit. Working-tree queries such as `git status --porcelain` and `git ls-files` are moving references for the same reason, so every check below is given in its commit-pinned `git diff <sha>..<sha>` / `git ls-tree <sha>` / `git grep <sha>` form instead.
 
-### 4.1 Proof pinned to the reconstructed change set — `7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8`
+### 4.1 Proof pinned to the reconstructed change set — `7bd7718bcd4c..c789a23602c2`
 
 | # | Check | Exact command | Result |
 |---|-------|---------------|--------|
@@ -309,15 +322,17 @@ Finally, the fact that makes the whole of section 5 necessary: **both changed co
 
 Every total below is derived mechanically by adding up the per-finding rows in subsections 5.1 to 5.5; none is restated from a separate summary, precisely so that the register and the totals cannot drift apart. Two arithmetic facts are worth stating explicitly because they are easy to miscount: SEG-4 carries **three** Blockers — S4-01, S4-02 and S4-03 are each a factual claim the branch itself contradicts — and SEG-6 contributes **no** defect rows at all, so it adds nothing to any severity column.
 
-| Segment | Blocker | Major | Minor | Nit | Entries | Headline finding |
-|---------|--------:|------:|------:|----:|---------|------------------|
-| SEG-1 catalog metadata | 0 | 2 | 3 | 2 | 7 defects | A documentation link returning 404, and a `production` lifecycle contradicted by the repository's own completion status |
-| SEG-2 toolchain configuration | 2 | 1 | 2 | 1 | 6 defects | The site root captures 993 upstream legal documents, and diagram support does not function |
-| SEG-3 entry points | 0 | 2 | 1 | 0 | 3 defects | An orphaned landing page and a divergent duplicate |
-| SEG-4 generated content | 3 | 2 | 4 | 1 | 10 defects | Delivery statistics and file inventories describing a different branch |
-| SEG-5 integration | 0 | 0 | 2 | 1 | 3 defects | Four competing descriptions of the same repository |
-| SEG-6 blast radius and hygiene | 0 | 0 | 0 | 0 | 0 defects, 5 verification checks | Clean — non-regression proven; packaging and lint reach unaffected |
-| **Total** | **5** | **7** | **12** | **5** | **29 defects + 5 checks = 34 identifiers** | — |
+| Segment | Blocker | Major | Minor | Nit | Headline finding |
+|---------|--------:|------:|------:|----:|------------------|
+| SEG-1 catalog metadata | 0 | 2 | 3 | 2 | A documentation link returning 404, and a `production` lifecycle contradicted by the repository's own completion status |
+| SEG-2 toolchain configuration | 2 | 1 | 2 | 1 | The site root captures 993 upstream legal documents, and diagram support does not function |
+| SEG-3 entry points | 0 | 2 | 1 | 0 | An orphaned landing page and a divergent duplicate |
+| SEG-4 generated content | 3 | 2 | 4 | 1 | Delivery statistics and file inventories describing a different branch |
+| SEG-5 integration | 0 | 0 | 2 | 1 | Four competing descriptions of the same repository |
+| SEG-6 blast radius and hygiene | 0 | 0 | 0 | 0 | Clean — non-regression proven; packaging and lint reach unaffected |
+| **Total** | **5** | **7** | **12** | **5** | — |
+
+**Entries per segment**, restated here rather than as a seventh column because seven columns cannot fit the published content width: SEG-1 catalog metadata — 7 defects; SEG-2 toolchain configuration — 6 defects; SEG-3 entry points — 3 defects; SEG-4 generated content — 10 defects; SEG-5 integration — 3 defects; SEG-6 blast radius and hygiene — 0 defects, 5 verification checks; Total — 29 defects + 5 checks = 34 identifiers.
 
 **How the count reconciles, three ways.** By severity, 5 + 7 + 12 + 5 = **29**. By segment, 7 + 6 + 3 + 10 + 3 + 0 = **29**. By identifier, `S1-01`…`S1-07` (7) + `S2-01`…`S2-06` (6) + `S3-01`…`S3-03` (3) + `S4-01`…`S4-10` (10) + `S5-01`…`S5-03` (3) = **29**. All three agree. SEG-6's five entries are verification checks that produced no defect, which is why its row reads 0/0/0/0 and why they are deliberately **not** counted among the 29.
 
@@ -325,57 +340,101 @@ Every row carries an **Evidence** cell holding the locator that fixes the findin
 
 ### 5.1 SEG-1 — Service-catalog metadata
 
-| ID | Sev. | Class | Evidence | Finding | Remediation | Acceptance check |
-|----|------|-------|----------|---------|-------------|------------------|
-| S1-01 | Major | D2 | [catalog-info.yaml:L25] against [catalog-info.yaml:L20] and [catalog-info.yaml:L22]; `git ls-files blitzy/` → empty | The third link targets a `blitzy/documentation` tree path that is tracked nowhere in the range and does not exist on the published branch; an HTTP request returns **404**, while the repository root and the pull-request link both return **200**. The repository is public, so this is a genuine missing path, not an access restriction | Repoint the link at the real documentation root | Every outbound link in the descriptor returns HTTP 200 |
-| S1-02 | Major | D7/D1 | [catalog-info.yaml:L30] against [doc/project-guide.md:L5] | `lifecycle: production` asserts an established, maintained component. The documented well-known vocabulary defines `production` as established and maintained and `experimental` as early, non-production, with low or no reliability guarantees. The repository's own guide states **17% completion (110 of 640 hours)**, and the in-progress signal commit 1 supplied was deleted by commit 2 while `production` stayed | Set lifecycle to the well-known value `experimental`; restore the in-progress status label | Lifecycle is a documented well-known value and agrees with the stated project status |
-| S1-03 | Minor | D1 | [catalog-info.yaml:L29] | `spec.type: website` misclassifies a deployable application server. The documented well-known vocabulary is `service`, `website`, `library` | Change to `service` | Type is a documented well-known value. **Flagged for owner confirmation** — a taxonomy judgement, reversible in one line |
-| S1-04 | Minor | D7 | [catalog-info.yaml:L7-L12]; labels at [catalog-info.yaml:L13-L14]. `refactor` was added by commit 2 (`89bf914d81fe`) and `security`/`audit` by commit 13 (`c789a23602c2`); `git grep -lil -e security-audit -e 'security review' c789a23602c2` finds no supporting artifact | The tag sequence is `audit`, `python`, `refactor`, `security`, `web-app`. Tags are documented as component *classification* with no special semantics, constrained to lowercase alphanumerics and a small punctuation set separated by hyphens — yet `refactor` encodes a work type and `security`/`audit` assert attributes no evidence in the repository supports | Retain genuine classification tags; move the work-type claim to a label; drop the unevidenced attribute tags | Every remaining tag is a classification term and satisfies the documented tag format. **Flagged for owner confirmation** — dropping `security` and `audit` may remove signal the owner intended |
-| S1-05 | Minor | D1 | [catalog-info.yaml:L31-L32] | `owner: blitzy-sandbox` and `system: blitzy-python` generate ownership and parent relations that resolve against portal entities this repository cannot create; registering as-is risks dangling relations | **No file change is possible** — nothing in this repository can define a portal entity | Recorded as a portal-side prerequisite in section 7 |
-| S1-06 | Nit | D8 | [catalog-info.yaml:L19-L21] against the icons at [catalog-info.yaml:L24] and [catalog-info.yaml:L27] | Link icons are internally inconsistent: the second and third links each carry an `icon`, the first does not. The documented guidance is that links carry a required URL plus optional title, icon and type, and should be used only where an equivalent well-known annotation does not already cover the case | Add the missing icon | All links carry an icon |
-| S1-07 | Nit | D8 | `yamllint` on the descriptor reports six items verbatim — the warning `1:1 missing document start "---"` at [catalog-info.yaml:L1]; `line too long` at `5:81` (83 > 80), `18:81` (94 > 80) and `25:81` (85 > 80), citing [catalog-info.yaml:L5], [catalog-info.yaml:L18] and [catalog-info.yaml:L25]; and `wrong indentation: expected 4 but found 2` at `8:3` and `20:3`, citing the tag sequence at [catalog-info.yaml:L8] and the link sequence at [catalog-info.yaml:L20]. No `.yamllint*`, `.markdownlint*`, `.editorconfig`, `pyproject.toml`, `tox.ini`, `Makefile` or `package.json` is tracked anywhere | Advisory YAML style: no document-start marker, three lines beyond the 80-character default, and the two sequence-indentation positions a default linter profile flags — the latter a direct consequence of the commit-13 serialiser round trip described in subsection 3.4. Six advisory items in total, all in the descriptor | None mandated | **Advisory only** under ST-8 — the repository ships no YAML linter configuration, so nothing enforces this |
+| ID | Severity · class | Finding | Remediation |
+|----|------------------|---------|-------------|
+| S1-01 | Major · D2 | The third link targets a `blitzy/documentation` tree path that is tracked nowhere in the range and does not exist on the published branch; an HTTP request returns **404**, while the repository root and the pull-request link both return **200**. The repository is public, so this is a genuine missing path, not an access restriction | Repoint the link at the real documentation root |
+| S1-02 | Major · D7/D1 | `lifecycle: production` asserts an established, maintained component. The documented well-known vocabulary defines `production` as established and maintained and `experimental` as early, non-production, with low or no reliability guarantees. The repository's own guide states **17% completion (110 of 640 hours)**, and the in-progress signal commit 1 supplied was deleted by commit 2 while `production` stayed | Set lifecycle to the well-known value `experimental`; restore the in-progress status label |
+| S1-03 | Minor · D1 | `spec.type: website` misclassifies a deployable application server. The documented well-known vocabulary is `service`, `website`, `library` | Change to `service` |
+| S1-04 | Minor · D7 | The tag sequence is `audit`, `python`, `refactor`, `security`, `web-app`. Tags are documented as component *classification* with no special semantics, constrained to lowercase alphanumerics and a small punctuation set separated by hyphens — yet `refactor` encodes a work type and `security`/`audit` assert attributes no evidence in the repository supports | Retain genuine classification tags; move the work-type claim to a label; drop the unevidenced attribute tags |
+| S1-05 | Minor · D1 | `owner: blitzy-sandbox` and `system: blitzy-python` generate ownership and parent relations that resolve against portal entities this repository cannot create; registering as-is risks dangling relations | **No file change is possible** — nothing in this repository can define a portal entity |
+| S1-06 | Nit · D8 | Link icons are internally inconsistent: the second and third links each carry an `icon`, the first does not. The documented guidance is that links carry a required URL plus optional title, icon and type, and should be used only where an equivalent well-known annotation does not already cover the case | Add the missing icon |
+| S1-07 | Nit · D8 | Advisory YAML style: no document-start marker, three lines beyond the 80-character default, and the two sequence-indentation positions a default linter profile flags — the latter a direct consequence of the commit-13 serialiser round trip described in subsection 3.4. Six advisory items in total, all in the descriptor | None mandated |
+
+**Evidence and acceptance checks.**
+
+- **S1-01** — *Evidence:* [catalog-info.yaml:L25] against [catalog-info.yaml:L20] and [catalog-info.yaml:L22]; `git ls-files blitzy/` → empty — *Acceptance check:* Every outbound link in the descriptor returns HTTP 200
+- **S1-02** — *Evidence:* [catalog-info.yaml:L30] against [doc/project-guide.md:L5] — *Acceptance check:* Lifecycle is a documented well-known value and agrees with the stated project status
+- **S1-03** — *Evidence:* [catalog-info.yaml:L29] — *Acceptance check:* Type is a documented well-known value. **Flagged for owner confirmation** — a taxonomy judgement, reversible in one line
+- **S1-04** — *Evidence:* [catalog-info.yaml:L7-L12]; labels at [catalog-info.yaml:L13-L14]. `refactor` was added by commit 2 (`89bf914d81fe`) and `security`/`audit` by commit 13 (`c789a23602c2`); `git grep -lil -e security-audit -e 'security review' c789a23602c2` finds no supporting artifact — *Acceptance check:* Every remaining tag is a classification term and satisfies the documented tag format. **Flagged for owner confirmation** — dropping `security` and `audit` may remove signal the owner intended
+- **S1-05** — *Evidence:* [catalog-info.yaml:L31-L32] — *Acceptance check:* Recorded as a portal-side prerequisite in section 7
+- **S1-06** — *Evidence:* [catalog-info.yaml:L19-L21] against the icons at [catalog-info.yaml:L24] and [catalog-info.yaml:L27] — *Acceptance check:* All links carry an icon
+- **S1-07** — *Evidence:* `yamllint` on the descriptor reports six items verbatim — the warning `1:1 missing document start "---"` at [catalog-info.yaml:L1]; `line too long` at `5:81` (83 > 80), `18:81` (94 > 80) and `25:81` (85 > 80), citing [catalog-info.yaml:L5], [catalog-info.yaml:L18] and [catalog-info.yaml:L25]; and `wrong indentation: expected 4 but found 2` at `8:3` and `20:3`, citing the tag sequence at [catalog-info.yaml:L8] and the link sequence at [catalog-info.yaml:L20]. No `.yamllint*`, `.markdownlint*`, `.editorconfig`, `pyproject.toml`, `tox.ini`, `Makefile` or `package.json` is tracked anywhere — *Acceptance check:* **Advisory only** under ST-8 — the repository ships no YAML linter configuration, so nothing enforces this
 
 ### 5.2 SEG-2 — Docs toolchain configuration
 
-| ID | Sev. | Class | Evidence | Finding | Remediation | Acceptance check |
-|----|------|-------|----------|---------|-------------|------------------|
-| S2-01 | **Blocker** | D1 | [mkdocs.yml:L1]; the captured tree measured in subsection 3.2; baseline strict-build log | `docs_dir: doc` points the site root at a directory that, when the setting was introduced, held only the contributor-agreement archive. **Measured by executing the build**: 997 HTML files — **996 content pages** plus one theme-generated `404.html` — totalling **17 MB**, of which **993** are contributor-agreement documents listed as absent from the navigation configuration, plus **3** unresolved-link notices all originating in `doc/cla/sign-cla.md`. **993 of 996 content pages, or 99.7% of the published developer portal, is unrelated legal paperwork.** Critically, `mkdocs build --strict` **exits 0** here, because omitted-navigation files are reported at *informational* level and the run emits zero `WARNING` lines — which is exactly why the capture went unnoticed | Repoint the documentation root to the Blitzy-owned `docs/` folder and relocate the three Markdown documents into it | Strict build exits 0 **and** publishes exactly the intended page count **and** reports zero omitted-navigation notices |
-| S2-02 | **Blocker** | D1 | [mkdocs.yml:L9] against [mkdocs.yml:L8]; the seven fences at [doc/project-guide.md:L58], [doc/project-guide.md:L64], [doc/technical-specifications.md:L291], [doc/technical-specifications.md:L491], [doc/technical-specifications.md:L506], [doc/technical-specifications.md:L524] and [doc/technical-specifications.md:L539]; both build logs | The `mermaid2` plugin is declared but provably inert. **Root cause, established by reading the installed package sources**: the `techdocs-core` bundle appends an extension pack that already claims the `mermaid` fence and renders it as highlighted plain text, and it relocates the fence configuration to a different key than `mermaid2` inspects, so that plugin's custom loader never activates and its post-page hook never fires. All **7** fences render as `language-text` highlight tables with line numbers, emitting **zero** diagram markup and no diagram runtime. **Plugin ordering is irrelevant**: both orderings were tested and produce identical output, and the same plugin works correctly when the TechDocs bundle is absent. The bundle's own diagram support covers **Graphviz and PlantUML only**; Mermaid is not part of it at any version | Remove the inert plugin declaration and declare a `pymdownx.superfences` custom fence mapping the `mermaid` fence name to a passthrough code format | Exact count of correctly emitted diagram blocks rises to **2** and **5** respectively, accounting for all seven fences |
-| S2-03 | Major | D6 | [mkdocs.yml:L1-L9] — no `site_description` key anywhere; the published metadata file in the baseline build | With no site description, the metadata the publisher writes for the portal contains the literal string `"None"` where the component's documentation description belongs | Supply the site description | Published metadata carries real text, not `"None"` |
-| S2-04 | Minor | D6 | [mkdocs.yml:L1-L9] — neither `repo_url` nor `edit_uri` present | The theme's per-page edit action is enabled but dead. Severity is **Minor rather than Major because the publisher auto-populates both when absent**, warning that they may be set manually to control the behaviour | Add both, with the edit reference matching the final documentation root | Per-page edit action resolves; the publisher's derivation warning is gone |
-| S2-05 | Nit | D8 | [mkdocs.yml:L9] — the final byte is `2`, not a newline; equivalently `mkdocs.yml:L10 @ f9bee9fb4234` at 263 bytes | File left without a trailing newline by commit 12, and still without one at the upper bound — the only one of the two newline regressions never repaired inside the range | Restore it | File ends with a newline |
-| S2-06 | Minor | D6 | [.gitignore:L1-L2]; the file's own convention at [.gitignore:L45-L53] | Introducing MkDocs without ignoring its default output directory leaves that directory reported as untracked; the existing ignore rules cover only the superseded Sphinx `_build/` path. **Zero tracked paths** match a `site` directory anywhere in the tree, so a root-anchored entry cannot mask tracked content | Add a root-anchored ignore entry, matching the file's own convention for build and environment output | `git status` is clean after a documentation build |
+| ID | Severity · class | Finding | Remediation |
+|----|------------------|---------|-------------|
+| S2-01 | **Blocker** · D1 | `docs_dir: doc` points the site root at a directory that, when the setting was introduced, held only the contributor-agreement archive. **Measured by executing the build**: 997 HTML files — **996 content pages** plus one theme-generated `404.html` — totalling **17 MB**, of which **993** are contributor-agreement documents listed as absent from the navigation configuration, plus **3** unresolved-link notices all originating in `doc/cla/sign-cla.md`. **993 of 996 content pages, or 99.7% of the published developer portal, is unrelated legal paperwork.** Critically, `mkdocs build --strict` **exits 0** here, because omitted-navigation files are reported at *informational* level and the run emits zero `WARNING` lines — which is exactly why the capture went unnoticed | Repoint the documentation root to the Blitzy-owned `docs/` folder and relocate the three Markdown documents into it |
+| S2-02 | **Blocker** · D1 | The `mermaid2` plugin is declared but provably inert. **Root cause, established by reading the installed package sources**: the `techdocs-core` bundle appends an extension pack that already claims the `mermaid` fence and renders it as highlighted plain text, and it relocates the fence configuration to a different key than `mermaid2` inspects, so that plugin's custom loader never activates and its post-page hook never fires. All **7** fences render as `language-text` highlight tables with line numbers, emitting **zero** diagram markup and no diagram runtime. **Plugin ordering is irrelevant**: both orderings were tested and produce identical output, and the same plugin works correctly when the TechDocs bundle is absent. The bundle's own diagram support covers **Graphviz and PlantUML only**; Mermaid is not part of it at any version | Remove the inert plugin declaration and declare a `pymdownx.superfences` custom fence mapping the `mermaid` fence name to a passthrough code format |
+| S2-03 | Major · D6 | With no site description, the metadata the publisher writes for the portal contains the literal string `"None"` where the component's documentation description belongs | Supply the site description |
+| S2-04 | Minor · D6 | The theme's per-page edit action is enabled but dead. Severity is **Minor rather than Major because the publisher auto-populates both when absent**, warning that they may be set manually to control the behaviour | Add both, with the edit reference matching the final documentation root |
+| S2-05 | Nit · D8 | File left without a trailing newline by commit 12, and still without one at the upper bound — the only one of the two newline regressions never repaired inside the range | Restore it |
+| S2-06 | Minor · D6 | Introducing MkDocs without ignoring its default output directory leaves that directory reported as untracked; the existing ignore rules cover only the superseded Sphinx `_build/` path. **Zero tracked paths** match a `site` directory anywhere in the tree, so a root-anchored entry cannot mask tracked content | Add a root-anchored ignore entry, matching the file's own convention for build and environment output |
+
+**Evidence and acceptance checks.**
+
+- **S2-01** — *Evidence:* [mkdocs.yml:L1]; the captured tree measured in subsection 3.2; baseline strict-build log — *Acceptance check:* Strict build exits 0 **and** publishes exactly the intended page count **and** reports zero omitted-navigation notices
+- **S2-02** — *Evidence:* [mkdocs.yml:L9] against [mkdocs.yml:L8]; the seven fences at [doc/project-guide.md:L58], [doc/project-guide.md:L64], [doc/technical-specifications.md:L291], [doc/technical-specifications.md:L491], [doc/technical-specifications.md:L506], [doc/technical-specifications.md:L524] and [doc/technical-specifications.md:L539]; both build logs — *Acceptance check:* Exact count of correctly emitted diagram blocks rises to **2** and **5** respectively, accounting for all seven fences
+- **S2-03** — *Evidence:* [mkdocs.yml:L1-L9] — no `site_description` key anywhere; the published metadata file in the baseline build — *Acceptance check:* Published metadata carries real text, not `"None"`
+- **S2-04** — *Evidence:* [mkdocs.yml:L1-L9] — neither `repo_url` nor `edit_uri` present — *Acceptance check:* Per-page edit action resolves; the publisher's derivation warning is gone
+- **S2-05** — *Evidence:* [mkdocs.yml:L9] — the final byte is `2`, not a newline; equivalently `mkdocs.yml:L10 @ f9bee9fb4234` at 263 bytes — *Acceptance check:* File ends with a newline
+- **S2-06** — *Evidence:* [.gitignore:L1-L2]; the file's own convention at [.gitignore:L45-L53] — *Acceptance check:* `git status` is clean after a documentation build
 
 ### 5.3 SEG-3 — Documentation entry points
 
-| ID | Sev. | Class | Evidence | Finding | Remediation | Acceptance check |
-|----|------|-------|----------|---------|-------------|------------------|
-| S3-01 | Major | D5 | [docs/index.md:L1-L3] against [mkdocs.yml:L1]; the orphaning chain in subsection 3.1 | `docs/index.md` is orphaned by the four-commit chain — present in the tree, outside the configured root, reachable by no consumer, and excluded from the published site entirely | Promote it to the canonical landing page **rather than delete it** | The page is reachable and is the site's entry point |
-| S3-02 | Major | D4 | [docs/index.md:L3] against [doc/index.md:L3-L5] | Two landing pages assert different descriptions of the same repository: one carries the accounting-parity and IBM Carbon tagline, while the other says the repository is a Blitzy fork of Odoo and is the documentation home | Reconcile into one page and delete the duplicate | Exactly one index page exists under the documentation root |
-| S3-03 | Minor | D8 | [mkdocs.yml:L1] against the vendor's documented canonical layout | The layout deviates from the vendor's documented arrangement, which places the index page in a root-level `docs` folder beside the descriptor and site configuration — the same layout the generator writes as its own default | Converge on the documented layout | Layout matches the vendor default, so future tooling changes need no repository-specific compensation |
+| ID | Severity · class | Finding | Remediation |
+|----|------------------|---------|-------------|
+| S3-01 | Major · D5 | `docs/index.md` is orphaned by the four-commit chain — present in the tree, outside the configured root, reachable by no consumer, and excluded from the published site entirely | Promote it to the canonical landing page **rather than delete it** |
+| S3-02 | Major · D4 | Two landing pages assert different descriptions of the same repository: one carries the accounting-parity and IBM Carbon tagline, while the other says the repository is a Blitzy fork of Odoo and is the documentation home | Reconcile into one page and delete the duplicate |
+| S3-03 | Minor · D8 | The layout deviates from the vendor's documented arrangement, which places the index page in a root-level `docs` folder beside the descriptor and site configuration — the same layout the generator writes as its own default | Converge on the documented layout |
+
+**Evidence and acceptance checks.**
+
+- **S3-01** — *Evidence:* [docs/index.md:L1-L3] against [mkdocs.yml:L1]; the orphaning chain in subsection 3.1 — *Acceptance check:* The page is reachable and is the site's entry point
+- **S3-02** — *Evidence:* [docs/index.md:L3] against [doc/index.md:L3-L5] — *Acceptance check:* Exactly one index page exists under the documentation root
+- **S3-03** — *Evidence:* [mkdocs.yml:L1] against the vendor's documented canonical layout — *Acceptance check:* Layout matches the vendor default, so future tooling changes need no repository-specific compensation
 
 ### 5.4 SEG-4 — Generated documentation content
 
-| ID | Sev. | Class | Evidence | Finding | Remediation | Acceptance check |
-|----|------|-------|----------|---------|-------------|------------------|
-| S4-01 | **Blocker** | D3 | [doc/project-guide.md:L378-L388]; PR record `changed_files` 81 and `additions` 27,905 | The delivery statistics — 47 commits, 81 files created, 27,707 lines added, 43 documentation files, 36 module source files — describe a different branch entirely. This branch carries 13 commits and 6 files | Re-attribute the table to the pull request and branch it describes; correct the line-count figure against the authoritative record of **27,905** additions; add a row stating what this branch actually contains | Every statistic names the branch it applies to |
-| S4-02 | **Blocker** | D3 | [doc/project-guide.md:L7], [doc/project-guide.md:L10], [doc/project-guide.md:L393-L419] | The completion claim asserts a 100%-complete 43-file documentation set, and the tree describes a `tickets/` documentation set **absent from this branch**, verified by the direct check in subsection 3.6 | Re-scope both to the branch that contains them | Each claim is scoped; absence on this branch is stated plainly |
-| S4-03 | **Blocker** | D3 | [doc/project-guide.md:L11-L12], [doc/project-guide.md:L421-L460] | The module inventory gives a 36-file inventory and validation verdicts for `addons/account_financial_report_ce/`, an addon **absent from this branch** | Re-scope the inventory and the validation claims | Scoped, with absence stated |
-| S4-04 | Major | D3 | [doc/project-guide.md:L490-L502] | The concluding assessment draws a delivery-and-hand-off conclusion the branch cannot support — including a "zero blocking issues, all code compiles" verdict over module source that does not exist here | Withdraw or qualify it | No unsupported conclusion remains |
-| S4-05 | Minor | D8 | [doc/project-guide.md:L465-L487], with the calendar bands at [doc/project-guide.md:L466] and [doc/project-guide.md:L471] | Work is scheduled in calendar bands — *"Immediate Actions (Week 1)"* and *"Short-term Actions (Weeks 2-8)"*. **This is a defect under ST-7, not a stylistic preference**: platform-authored planning content states dependency ordering and never calendar time, so calendar bands in such content are a contract breach regardless of taste | Replace the calendar bands with dependency-ordered phases | No calendar scheduling remains |
-| S4-06 | Minor | D3 | [doc/technical-specifications.md:L1473] against [odoo/release.py:L15] | The document cites *"`odoo/release.py` line 10"* as the source of `version_info = (19, 0, 0, FINAL, 0, '')`. **Verified directly**: that declaration is at line 15; line 10 is a comment | Correct the cited line number | The citation resolves to the claimed content |
-| S4-07 | Minor | D8 | [doc/technical-specifications.md:L1] and [doc/technical-specifications.md:L3] | Two top-level headings — `# Technical Specification` and `# 0. Agent Action Plan` — produce an ambiguous page title | Delete the redundant heading. **Demoting the second was explicitly rejected**: it would cascade a re-levelling of the entire numbered hierarchy across 1,474 lines, disproportionate on a stable branch under ST-1 | Exactly one top-level heading |
-| S4-08 | Minor | D4 | [doc/technical-specifications.md:L1452] against [doc/technical-specifications.md:L41], L786, L1024 and L1471-L1474 | The constraints row states `Odoo 18.0` without qualification, while four other places in the same document already disclose the discrepancy. [doc/technical-specifications.md:L1227] is a verbatim quote of the user requirement and is deliberately left alone | Qualify it consistently with those four | The constraint agrees with its siblings |
-| S4-09 | Major | D3 | [doc/technical-specifications.md:L3-L45] and [doc/project-guide.md:L1-L20] | A planning artifact is published under the label "Technical Specifications", so a portal visitor reads it as a description of what exists rather than as an unexecuted plan. The preamble carries no status qualification | Add a provenance and status banner to **both** relocated documents | A banner names the source branch and pull request and identifies absent artifacts |
-| S4-10 | Nit | D8 | [doc/project-guide.md:L502] — the final byte is not a newline | The file is not terminated with a newline — its 502 inserted lines report as 501 under `wc -l` for exactly that reason | Terminate it | File ends with a newline |
+| ID | Severity · class | Finding | Remediation |
+|----|------------------|---------|-------------|
+| S4-01 | **Blocker** · D3 | The delivery statistics — 47 commits, 81 files created, 27,707 lines added, 43 documentation files, 36 module source files — describe a different branch entirely. This branch carries 13 commits and 6 files | Re-attribute the table to the pull request and branch it describes; correct the line-count figure against the authoritative record of **27,905** additions; add a row stating what this branch actually contains |
+| S4-02 | **Blocker** · D3 | The completion claim asserts a 100%-complete 43-file documentation set, and the tree describes a `tickets/` documentation set **absent from this branch**, verified by the direct check in subsection 3.6 | Re-scope both to the branch that contains them |
+| S4-03 | **Blocker** · D3 | The module inventory gives a 36-file inventory and validation verdicts for `addons/account_financial_report_ce/`, an addon **absent from this branch** | Re-scope the inventory and the validation claims |
+| S4-04 | Major · D3 | The concluding assessment draws a delivery-and-hand-off conclusion the branch cannot support — including a "zero blocking issues, all code compiles" verdict over module source that does not exist here | Withdraw or qualify it |
+| S4-05 | Minor · D8 | Work is scheduled in calendar bands — *"Immediate Actions (Week 1)"* and *"Short-term Actions (Weeks 2-8)"*. **This is a defect under ST-7, not a stylistic preference**: platform-authored planning content states dependency ordering and never calendar time, so calendar bands in such content are a contract breach regardless of taste | Replace the calendar bands with dependency-ordered phases |
+| S4-06 | Minor · D3 | The document cites *"`odoo/release.py` line 10"* as the source of `version_info = (19, 0, 0, FINAL, 0, '')`. **Verified directly**: that declaration is at line 15; line 10 is a comment | Correct the cited line number |
+| S4-07 | Minor · D8 | Two top-level headings — `# Technical Specification` and `# 0. Agent Action Plan` — produce an ambiguous page title | Delete the redundant heading. **Demoting the second was explicitly rejected**: it would cascade a re-levelling of the entire numbered hierarchy across 1,474 lines, disproportionate on a stable branch under ST-1 |
+| S4-08 | Minor · D4 | The constraints row states `Odoo 18.0` without qualification, while four other places in the same document already disclose the discrepancy. [doc/technical-specifications.md:L1227] is a verbatim quote of the user requirement and is deliberately left alone | Qualify it consistently with those four |
+| S4-09 | Major · D3 | A planning artifact is published under the label "Technical Specifications", so a portal visitor reads it as a description of what exists rather than as an unexecuted plan. The preamble carries no status qualification | Add a provenance and status banner to **both** relocated documents |
+| S4-10 | Nit · D8 | The file is not terminated with a newline — its 502 inserted lines report as 501 under `wc -l` for exactly that reason | Terminate it |
+
+**Evidence and acceptance checks.**
+
+- **S4-01** — *Evidence:* [doc/project-guide.md:L378-L388]; PR record `changed_files` 81 and `additions` 27,905 — *Acceptance check:* Every statistic names the branch it applies to
+- **S4-02** — *Evidence:* [doc/project-guide.md:L7], [doc/project-guide.md:L10], [doc/project-guide.md:L393-L419] — *Acceptance check:* Each claim is scoped; absence on this branch is stated plainly
+- **S4-03** — *Evidence:* [doc/project-guide.md:L11-L12], [doc/project-guide.md:L421-L460] — *Acceptance check:* Scoped, with absence stated
+- **S4-04** — *Evidence:* [doc/project-guide.md:L490-L502] — *Acceptance check:* No unsupported conclusion remains
+- **S4-05** — *Evidence:* [doc/project-guide.md:L465-L487], with the calendar bands at [doc/project-guide.md:L466] and [doc/project-guide.md:L471] — *Acceptance check:* No calendar scheduling remains
+- **S4-06** — *Evidence:* [doc/technical-specifications.md:L1473] against [odoo/release.py:L15] — *Acceptance check:* The citation resolves to the claimed content
+- **S4-07** — *Evidence:* [doc/technical-specifications.md:L1] and [doc/technical-specifications.md:L3] — *Acceptance check:* Exactly one top-level heading
+- **S4-08** — *Evidence:* [doc/technical-specifications.md:L1452] against [doc/technical-specifications.md:L41], L786, L1024 and L1471-L1474 — *Acceptance check:* The constraint agrees with its siblings
+- **S4-09** — *Evidence:* [doc/technical-specifications.md:L3-L45] and [doc/project-guide.md:L1-L20] — *Acceptance check:* A banner names the source branch and pull request and identifies absent artifacts
+- **S4-10** — *Evidence:* [doc/project-guide.md:L502] — the final byte is not a newline — *Acceptance check:* File ends with a newline
 
 ### 5.5 SEG-5 — Cross-segment integration
 
-| ID | Sev. | Class | Evidence | Finding | Remediation | Acceptance check |
-|----|------|-------|----------|---------|-------------|------------------|
-| S5-01 | Minor | D4 | [mkdocs.yml:L1], [catalog-info.yaml:L25], and the absent `edit_uri` in [mkdocs.yml:L1-L9] | The documentation root, the outbound catalog documentation link and the edit reference form a **lockstep triangle**; fixing any one alone reintroduces a broken reference. All three are enumerated in the reference matrix of subsection 6.5 | Change all three as one atomic unit | All three agree, and the portal never observes an intermediate state with a broken link |
-| S5-02 | Minor | D4 | [docs/index.md:L3], [doc/index.md:L3-L5], [catalog-info.yaml:L5-L6], and the published repository description | **Four** different descriptions of the same repository are in circulation — the two landing pages, the published repository description and the descriptor — so no single source of truth exists | Establish the descriptor description as the single source of truth and derive the landing page text and site description from it | One authoritative description; the other two are derived |
-| S5-03 | Nit | D7 | [catalog-info.yaml:L5-L6] and [docs/index.md:L3] | The "IBM Carbon Design System" claim asserts a capability with no supporting code. The string appears **only** inside the change-set content under review; a repository-wide search finds no code reference anywhere | Reword as planned direction | The claim reads as direction, not delivered capability |
+| ID | Severity · class | Finding | Remediation |
+|----|------------------|---------|-------------|
+| S5-01 | Minor · D4 | The documentation root, the outbound catalog documentation link and the edit reference form a **lockstep triangle**; fixing any one alone reintroduces a broken reference. All three are enumerated in the reference matrix of subsection 6.5 | Change all three as one atomic unit |
+| S5-02 | Minor · D4 | **Four** different descriptions of the same repository are in circulation — the two landing pages, the published repository description and the descriptor — so no single source of truth exists | Establish the descriptor description as the single source of truth and derive the landing page text and site description from it |
+| S5-03 | Nit · D7 | The "IBM Carbon Design System" claim asserts a capability with no supporting code. The string appears **only** inside the change-set content under review; a repository-wide search finds no code reference anywhere | Reword as planned direction |
+
+**Evidence and acceptance checks.**
+
+- **S5-01** — *Evidence:* [mkdocs.yml:L1], [catalog-info.yaml:L25], and the absent `edit_uri` in [mkdocs.yml:L1-L9] — *Acceptance check:* All three agree, and the portal never observes an intermediate state with a broken link
+- **S5-02** — *Evidence:* [docs/index.md:L3], [doc/index.md:L3-L5], [catalog-info.yaml:L5-L6], and the published repository description — *Acceptance check:* One authoritative description; the other two are derived
+- **S5-03** — *Evidence:* [catalog-info.yaml:L5-L6] and [docs/index.md:L3] — *Acceptance check:* The claim reads as direction, not delivered capability
 
 ### 5.6 SEG-6 — Blast radius and hygiene
 
@@ -539,6 +598,160 @@ Two prerequisites cannot be discharged by any file edit in this repository, and 
 |--------------|------------------------------|----------------------|
 | The `Group` referenced as owner — **`blitzy-sandbox`** at [catalog-info.yaml:L31] — and the `System` referenced as parent — **`blitzy-python`** at [catalog-info.yaml:L32] — must exist in the portal | Portal entities are not defined by this repository, and no file edit here can create one | The catalog entry registers with unresolved relations (finding S1-05) |
 | Client-side diagram rendering requires a portal addon | The portal renders TechDocs content inside a **shadow DOM** under its own reader, and the documented contributed addon set — expandable navigation, issue reporting, text sizing — contains **no** diagram addon. No file in this repository can add one, so the repository's obligation ends at emitting correct diagram markup | The markup is emitted correctly and its **validity is independently proven** — served from a standalone build of this tree, the theme bundle fetches a Mermaid runtime and renders the subsection 3.1 fence as a six-node, five-edge flowchart with no parse error — but **the portal does not guarantee that runtime**, so the same markup may still display as plain text there. **Documented fallback**: convert the seven diagrams to a notation the TechDocs bundle renders natively — Graphviz or PlantUML — which needs no client prerequisite |
+
+### 7.1 Runtime defects observed in the published site that no file in this repository can close
+
+Runtime testing of the built site raised a further set of rendering, interaction
+and accessibility defects beyond the twenty-nine documented above. They are
+recorded here, in the section that exists for exactly this purpose, because
+**their root cause lies in the theme or in the build plugin rather than in any
+in-scope file** — the theme is `mkdocs-material` 9.7.6, pinned transitively by
+`mkdocs-techdocs-core` 1.7.0, and neither package is declared by this repository
+at all.
+
+That attribution is a **measurement, not an assumption**. The published site
+loads exactly one stylesheet (`main.484c7ddc.min.css`, 139,849 bytes, 930 rules)
+and exactly one script bundle (`bundle.79ae519e.min.js`, 114,308 bytes), with
+**zero project-authored CSS and zero project-authored JavaScript**; every one of
+the 105 CSS rules governing the defects below resolves to that single bundle.
+The drawer toggle markup and its backing checkbox are **byte-identical across all
+four independently generated documents** (203 and 98 bytes respectively), which
+is only possible if a template — not authored content — emits them. Authored
+Markdown determines *how many* offending elements exist, by way of heading and
+table counts, and nothing else: not one colour, not one icon, not one ARIA
+attribute.
+
+Three constraints, taken together, make them non-closable here rather than
+merely inconvenient. Altering theme markup or theme CSS requires a `theme:` key
+carrying a `custom_dir` override, but the site configuration is fixed to
+exactly the eight allowlisted top-level keys enumerated in subsection 6.3, and
+`techdocs-core` must remain the **sole** declared plugin. Independently of that,
+the TechDocs generator maintains its own allowlist of supported configuration
+keys and **actively deletes anything outside it** before building, so even an
+added key would not survive publication. And the stable-series discipline at
+[CONTRIBUTING.md:L14] restricts the kind of change permitted on a maintained
+series. The repository's obligation therefore ends at the content and
+configuration it owns.
+
+One entry below is a **deliberate non-override rather than an impossibility**,
+and is labelled as such so that no reader mistakes a judgement for a technical
+limit. Where a lever exists, this record names it, states its cost, and gives the
+reason it was refused.
+
+> **Identifier note.** The `D`-prefixed references in this subsection are the
+> runtime testing round's own finding numbers. They are **not** the eight defect
+> *classes* `D1`–`D8` defined in subsection 1.4, which this record uses to
+> classify the twenty-nine review findings in section 5. The two numbering
+> schemes are unrelated and happen to overlap in the range `D1`–`D8`; every
+> reference below is a finding number.
+
+| Findings | What was observed at runtime | Why no file here can close it |
+|----------|------------------------------|-------------------------------|
+| **D8, D9, D10, D11, D12, D13, D17** | The mobile navigation drawer, with every mechanism established at source level. The toggle is **occluded at depth 10 of a 15-element hit stack** while the drawer is open, and the element actually on top at those coordinates is the drawer's own logo link — which is precisely why activating it navigates to the landing page. `Escape` does not dismiss the drawer because **no `Escape` branch exists in the bundle at all**; the seven registered hotkeys are other keys. Focus is not trapped: on the **52nd** consecutive press it escapes to the edit control, which is itself **behind the modal overlay**, and the occluded document scrolls roughly two thousand pixels to chase it. Keyboard tabbing can land on a **blank white panel 242 pixels wide and the full height of the viewport** — measured at 242 × 844 in an 844-tall viewport and 242 × 1024 in a 1024-tall one, because its height is declared as 100% — containing **54 focusable elements, none visually visible and none a recovery control**. The drawer **cannot be opened by keyboard at all**: fifteen consecutive presses never reach the toggle, and a whole-document enumeration of 150 focusable elements finds **zero** drawer toggles in the tab order. **51** closed-drawer links remain focusable off-screen at x = −242. And browser Back re-opens the drawer unprompted | The drawer is implemented entirely in the theme's own bundle and its label-and-checkbox markup — whose bytes are **identical across all four documents**. Two findings deserve their precise root cause on record. First, the bundle's **only** programmatic write to the drawer state is a *close*; there is no open path except a pointer-activated label, and the theme's own keyboard branch for such labels is dead code because it requires the label to already hold focus, which is impossible. Second, the Back behaviour is **the browser's back-forward cache restoring the live document**, proven by a unique realm marker surviving the navigation with both lifecycle events reporting a persisted document — not form-state restoration, so the `autocomplete="off"` the markup already carries cannot prevent it, and the bundle registers no handler for either event. No document, navigation entry or permitted configuration key participates in any of this |
+| **D14, D20, D26, D27** | Missing accessible names and programmatic state on theme chrome. The drawer toggle is not merely unnamed but **entirely absent from the accessibility tree**, confirmed in two independent snapshots. The edit pencil carries `aria-label: null`, though it does resolve a real accessible name — the tree exposes `link "Edit this page"` derived from its `title` — so its unambiguous defect is its **2.23:1** icon contrast rather than anonymity, and its 24 × 24 target does meet the minimum size criterion. The active navigation item exposes **no state of any kind**: a search across all 5,117 tree nodes finds zero `current`, `selected` or `active`, and `aria-current` appears **0 times** in the served markup of all four pages **and 0 times in the theme bundle**, so it is never emitted at build time or at runtime. **30 of 30** inline icons are unlabelled and **0 of 30** are marked decorative, leaving them neither named nor hidden | Every element named is emitted by a theme template, and authored Markdown contributes **zero** icons. The edit pencil and the whole footer exist only because the plugin unconditionally appends the corresponding theme features to the configuration, so neither their presence nor their styling is reachable from any key this repository may set |
+| **D31** *(deliberate non-override, not an impossibility)* | **156** heading permalinks — 3, 47, 65 and 41 across the four pages — announce as "¶" and all sit in the tab order. The pilcrow is additionally concatenated into each heading's **own** accessible name, so a screen-reader user hears it **twice per section** | The anchor is injected by the **build plugin**, not the theme, and a project-declared override **would** take effect, because the plugin snapshots any user configuration for this extension before injecting its own and re-merges it afterwards — and the key involved is already one of the eight allowlisted keys. It is nevertheless **declined**, because the only lever that changes the announced name sets the anchor's **visible text**: any string that fixes the announcement replaces the pilcrow with those words on all 156 headings. The title lever cannot substitute — the anchor **already** carries `title="Permanent link"` and still announces "¶", since an accessible name takes element text in preference to a title tooltip. The contrasting "Edit this page" link on the same page proves the mechanism rather than asserting it: identical title pattern, but no text content, and there the title **does** become the name. Suppressing the anchors outright would delete a navigation capability rather than repair it. Changing the visible rendering of every heading on every page is neither minimal nor non-behavioural under [CONTRIBUTING.md:L14], sits outside the extension content subsection 6.3 enumerates, and an accessibility heuristic does not override the plan |
+| **D18, D19, D22** | Colour-state defects in the theme palette. The header focus ring measures **1.61:1**; the root cause is sharper than a bad ring colour, because the identical ring measures **3.78:1 and passes** against the footer — it is the indigo header background, not the indicator, that breaks it. The selected navigation state sits at **2.35:1** against its unselected siblings and is **colour-only**, confirmed by diffing 22 computed properties — weight, decoration, background, all four borders, shadow, outline, padding, margin and both pseudo-elements are identical, and only `color` differs. Hovering then erases the distinction entirely: a hovered active item and a hovered inactive item resolve to the **same colour value**, a ratio of **1.00**, while the active item's own contrast *drops* from 6.86:1 to 4.26:1 | All are values in the theme's compiled stylesheet. The hover rule carries no exclusion for the active state and no media query, so it wins deterministically at every width; and the theme's own non-colour active-state variants cannot substitute, because the classes they need are never emitted and one of them paints white on white in this palette. Overriding requires `extra_css` or a `theme.custom_dir`, both outside the fixed key set |
+| **D21** | Footer hover is an inverted affordance, and the mechanism is an **opacity drop rather than a colour swap**: hovering reduces opacity from 1 to 0.7, taking contrast from **16.07:1 down to 8.50:1**, a 47% loss, with no underline, border, background, shadow or transform added in compensation — so the hovered link is visibly *less* prominent than its unhovered sibling in the same bar. Focus shares the same rule. The defect is also **self-inconsistent**: the adjacent footer-meta link hovers the *correct* way, brightening from 9.20:1 to 18.01:1, so two contradictory hover behaviours coexist inside one footer | A single theme declaration governs both hover and focus for this control, and a second theme rule supplies the compounding opacity on its sub-label. Neither is reachable without `extra_css` or a theme override |
+| **D24** | The Pygments line-number gutter is **borderline rather than clearly failing**, and the earlier figure of 4.47:1 across 87 nodes is not reproducible from any build of this tree. Measured against the gutter cell's own background — which the cell paints itself, so page white is the wrong reference — it resolves to **4.5152:1** from the exact colour tokens, **4.4963:1** from the browser's serialised values and **4.5423:1** rounded: it straddles the 4.5:1 threshold depending only on rounding. It is recorded as **not safely passing**. The node population is **268** gutter spans site-wide, not 87 | The gutter markup is generated wholesale by the build plugin, which forces line numbering on, and its colour is a theme token. Neither the markup nor the colour is expressible in authored Markdown |
+| **D23** | **Does not reproduce.** The footer copyright measures **4.51:1**, which **passes** AA for its 12.8 px weight-400 text. Three independent derivations agree — 4.5213 from exact tokens, 4.5059 from serialised values, 4.5194 rounded — and the reported 4.47:1 is not derivable from any colour token present in the build, nor from any of the five plausible alternative backgrounds tested. The stylesheet is **byte-identical** between the reporting round and this one, so no site change can explain the difference; the earlier value appears to rest on a background assumption rather than the three-layer composite the element actually sits on | No action required or taken. Recorded so the finding is disposed of on measured evidence rather than left open. A genuinely related defect *was* found in the same block and is noted below |
+| **D15** | **51** interactive targets on the project guide fall below the 44 × 44 minimum, 49 of them in both dimensions, and 47 of the 51 are the hover-only permalinks. Those permalinks sit at `opacity: 0` until their **parent heading** is hovered — the reveal is triggered by the ancestor, not the anchor itself — and the theme ships **no accommodation whatsoever for coarse pointers**: its single touch-oriented media block contains two rules, neither touching these anchors. On a real touch device the 156 anchors are therefore **permanently invisible yet permanently focusable and permanently announced** | Target sizing, the `opacity: 0` default and the ancestor-hover reveal are all theme CSS, and the anchors themselves are injected by the build plugin. Neither layer is reachable from authored content |
+| **D29, D30, D33** | Table and landmark semantics, with corrected populations. **129** tables site-wide — **116** authored data tables plus **13** generated code-block layout tables — carry **zero** captions and **zero** accessible names, and of **350** header cells **not one** uses `scope`. **0 of 13** layout tables are marked presentational, so all 13 announce as real data tables. Navigation landmarks are worse than first reported, not better: the heaviest page carries **27** in the markup, against the 15 previously noted, of which **13** are exposed in the accessibility tree. All 13 *are* labelled, so this is a **duplication** defect rather than an anonymity one — the theme renders the entire in-page contents tree twice, and ten of the thirteen exposed landmarks are contents wrappers rather than site navigation, one of them nested inside another | **Proven by ten empirical render tests rather than by reasoning.** Markdown's table syntax cannot emit a caption, a `scope` or a `role` on this stack: the attribute-list extension is enabled but has **no handler for the table processor**, which consumes the pipe-delimited lines first, so an attribute block placed after a table renders as a **visible extra table row** and one placed inside a header cell renders as **literal cell text** — both of which pass a naive check while being defects. The caption block extension emits a detached figure caption, never a table child. Only wholesale raw-HTML passthrough works, which would forfeit the raw-HTML-free property recorded as a positive in testing. The layout tables are generated by the highlighter and are never authored at all, and the scroll wrapper around every data table is injected by **theme JavaScript at runtime**, placing it beyond the reach even of a build-time post-processor |
+| **D25** | Performance reproduces: 99 desktop and 84 mobile on the landing page, 90–91 desktop and 44–49 mobile on the specification page, the mobile spread being ±4 across three consecutive runs on a 4× throttled simulation. The attribution was **measured by a counterfactual run rather than estimated** — repeating the mobile audit with the diagram CDN blocked raised Performance from 49 to **67** and cut total blocking time by **934 ms, or 82.5%**. That apportions roughly **18 points to the third-party diagram runtime**, **28 points to the theme's render-blocking stylesheet and bundle** — first paint stays at 4.59 s even with the CDN gone, so those points are structural — and about **5 points to the sheer length of the document**, which is served uncompressed. Layout stability is a perfect 0 and costs nothing | None of the three contributors is reachable from the eight permitted keys: the CDN reference and the bundle are inside the theme, and compression is a server concern. Performance optimisation is explicitly not a stated requirement of this work |
+| **D34** | With the diagram CDN blocked, the theme's bootstrap raises uncaught `ReferenceError`s at a rate of **one per diagram on the page plus one**, reproduced exactly as **3, 6 and 2** on the three diagram-bearing pages and **0** on the landing page, which carries none and for which the theme never injects the script at all. It is **not a retry storm**: one network request, one script element, every repeat inside a 1–2 millisecond window and nothing further across eighteen seconds of observation, with **zero** unhandled promise rejections on any page. The failure is **silent in signalling** — no banner, no placeholder, no broken-image glyph — and the raw diagram source leaks into view looking like a deliberate code sample | The bootstrap and its CDN reference are inside the theme bundle, and client-side diagram infrastructure is a portal-side prerequisite recorded in the table above. **Degradation is nevertheless graceful in content terms, and this was verified rather than assumed: all 8 of 8 text alternatives added for D28 survive the failed render intact**, fully laid out and between 180 and 853 characters each. On the archaeology page the alternative is in fact *more* complete than the leaked source, because 470 pixels of that source overflow horizontally behind an undrawn scrollbar while the alternative wraps and is wholly on screen. The documented fallback remains available: convert the diagrams to a notation the bundle renders natively, which needs no client prerequisite |
+
+**Two further theme-level observations surfaced while disposing of the findings
+above.** Neither was reported, and neither is actionable here, but both are
+recorded so the register is a complete account of what was measured.
+
+- **The footer attribution link is a second instance of the D19 colour-only
+  class.** It reads 9.20:1 against its own background, so it passes on its own
+  terms, but it contrasts with the immediately surrounding text at only
+  **2.04:1** and carries no underline — so its linkness is conveyed by colour
+  alone, exactly the failure mode D19 describes for navigation. It is theme
+  markup and theme CSS.
+- **No search interface renders anywhere, although the build ships a complete
+  search index.** The search container is absent from all four documents, and the
+  worker is never fetched, yet roughly 255 KB of index and worker are published
+  on every build. The cause is a **key-name mismatch between the two packages**:
+  the plugin registers the search engine under one key while the theme's header
+  template tests for a different one, so the condition guarding the search box can
+  never be true. This is worth stating precisely because the configuration
+  option this project *does* set for search achieved exactly what subsection 6.3
+  claims for it — the scripting error it was added to remove is gone, and the
+  console is clean on all four pages — but it cannot conjure a search box on this
+  package pairing. The absent search was already classified as vendor-inherent in
+  testing, and no key in the permitted set changes it.
+
+**Residuals measured inside the repairs themselves.** These are consequences of
+the remediation that were measured rather than assumed, and are recorded so that
+no future reader mistakes them for regressions.
+
+- **Horizontal scrolling persists at narrow viewports, and provably cannot be
+  eliminated.** At a 390 px viewport the content column is 358 px, leaving about
+  276 px of visible code width at an effective monospace advance of 8.57 px per
+  character — roughly 34 characters. A single unavoidable command such as
+  `./odoo-bin -d odoo_enterprise_accounting \` is 41 characters, so a
+  zero-overflow narrow-viewport render is unreachable without destroying the
+  commands the guide exists to convey. The repair still removed 74% of the code
+  overflow on the project guide, taking its worst single block from 824 px to
+  82 px, and content remains reachable by horizontal swipe inside the theme's
+  own scroll containers. The `addons/` tree listing in the specification is the
+  largest remaining contributor at that width; it is left as authored because it
+  does not overflow at all at the published desktop width.
+- **The two 2% slices of the *Documentation Completion* chart are narrower than
+  their own labels.** Each spans 8.37°, so each label's trailing `%` is grazed
+  by that slice's own boundary stroke. This is stroke-over-glyph geometry rather
+  than the label-over-label collision that was repaired, it is symmetric across
+  both slices, and neither glyph is rendered illegible.
+- **Inline code chips can paint up to 4.00 px beyond the text column when they
+  wrap, and which chips do so is positional rather than authored.** The specific
+  banner instance that was reported is closed, and this is the residual class
+  behind it. The theme sets `box-decoration-break: clone` with `padding: 0 4px`
+  on inline code, so a chip that breaks across two lines repaints its 4 px
+  trailing padding on the first fragment. The line breaker fits the *glyphs*
+  inside the content box but does not reserve that cloned padding: on the landing
+  page at a 390 px viewport one chip's text edge lands at 373.81 px against a
+  374.00 px bound — 0.19 px to spare — while its painted rect reaches 377.81 px,
+  exactly 4.00 px further. Every observed fragment width decomposes as
+  `4 + n × 8.158 + 4` at the theme's 13.6 px monospace advance, which is the same
+  arithmetic seen from the other side. The effect is **not** a function of chip
+  content: one byte-identical twenty-one-character chip occurs twelve times across
+  the site and measures anywhere from 3.58 px past the bound to 403.69 px inside
+  it, only one of the twelve being negative, because the overhang depends on where
+  the preceding prose leaves the line. Nor is it a function of length or
+  punctuation — one chip lost twenty-eight characters with no change whatever in
+  its clearance, and four of the eight residual cases contain neither a hyphen nor
+  a slash. A chip that does not wrap is **structurally immune**: the tightest
+  positive measurement anywhere is an unfragmented chip sitting 0.17 px inside the
+  bound, which can graze the edge but can never cross it. Eight cases survive
+  across twelve page-and-viewport measurements, and the populations are **not
+  nested** — the narrowest viewport and the widest each expose cases the other
+  does not, so a single-width check would miss them. Severity is bounded by
+  construction: the overhang is painted background decoration only, no glyph is
+  ever clipped, and the document scroll width equals its client width on all
+  twelve measurements, so no page acquires a horizontal scrollbar. The only
+  durable repair is CSS-side — reserving the cloned padding, or trading `clone`
+  for `slice` — which needs a stylesheet this configuration cannot carry, because
+  that would require a ninth top-level key beyond the eight allowlisted in
+  subsection 6.3, or a fifth file in the documentation root. Content editing was
+  measured and is **counterproductive as a general remedy**: shortening
+  neighbouring chips reflows the paragraph and re-rolls every break point in it,
+  which in one round pushed two previously-grazing chips 1.72 px further past the
+  bound before a second, targeted edit cleared both.
+- **A cross-origin request for the repository's latest release returns 404** on
+  every desktop page load, because the repository has no published release; the
+  sibling repository request returns 200. It is a network-level response with no
+  JavaScript exception, it is emitted by the theme's repository-information
+  widget, and it is a direct consequence of the `repo_url` key required by
+  subsection 6.3. It cannot be removed without removing that key, and it is
+  absent entirely at mobile widths where the widget is not rendered.
+- **No search input is rendered, although a search index is built and served.**
+  The theme's header gates the search control on `material/search` appearing in
+  the plugin list, whereas `techdocs-core` registers whichever search plugin it
+  selects under the key `search`. The control therefore cannot render, both
+  before and after remediation. Closing the gap would need a `theme:` key. The
+  configuration does select the theme's own search implementation, which is what
+  removes the stale bootstrap script that previously threw on every page load.
 
 **Findings that remain open by design, and where they will close.** The descriptor and the ignore file are deferred to the configuration checkpoint that owns them, so **S1-01 … S1-04, S1-06, S2-06** and the descriptor leg of **S5-01 … S5-03** are still open at the time of writing; subsection 6.1 pins the status of every transformation and subsection 6.3 measures each one. Nothing in this record should be read as claiming them closed.
 
