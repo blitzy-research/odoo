@@ -324,8 +324,12 @@ sudo -u postgres createdb --owner=odoo odoo_enterprise_accounting
 # Run financial reports module tests
 ./odoo-bin -d odoo_enterprise_accounting --test-enable --stop-after-init -i account_financial_report_ce
 
-# Run the native Odoo test suite under coverage
-pip install coverage
+# Run the native Odoo test suite under coverage.
+# The version is pinned to an exact release that has passed a current advisory
+# check, because an unpinned install resolves to whatever the index serves at
+# the time it runs. 7.15.2 declares requires-python >=3.10, which matches the
+# range odoo/release.py supports.
+pip install coverage==7.15.2
 coverage run --source=addons/account_financial_report_ce ./odoo-bin -d test_db --test-enable --stop-after-init -i account_financial_report_ce
 coverage report
 ```

@@ -740,11 +740,13 @@ No documentation generator configuration files are required for this markdown-ba
 |----------|--------------|---------|---------|
 | N/A | Markdown | N/A | Native markdown format for all documentation files |
 | N/A | Mermaid | N/A | Diagram syntax embedded in markdown (rendered by GitHub/GitLab) |
-| pip | mkdocs | 1.6.0 | Optional: Documentation site generator if web publishing needed |
-| pip | mkdocs-material | 9.5.0 | Optional: Material theme for mkdocs |
-| npm | mermaid-cli | 11.4.0 | Optional: CLI tool for offline mermaid diagram generation |
+| pip | mkdocs | 1.6.1 | Optional: Documentation site generator if web publishing needed |
+| pip | mkdocs-material | 9.7.6 | Optional: Material theme for mkdocs |
+| npm | @mermaid-js/mermaid-cli | 11.16.0 | Optional: CLI tool for offline mermaid diagram generation |
 
 **Note:** The primary documentation output is plain markdown files that require no build tooling. The optional packages are listed for scenarios where web-based documentation publishing is desired.
+
+⚠️ **Supply-chain correction to the three optional rows above**, made on the authority of the security review that named them. The npm row read `mermaid-cli` at `11.4.0`, but that unscoped name is a different, abandoned package: its latest release is `0.2.4`, its registry entry is deprecated in favour of mermaid core, and it has never published an `11.x` version — so the install fails as written, and would fetch whatever an attacker published if that abandoned name were ever claimed at that version. The maintained tool is the scoped `@mermaid-js/mermaid-cli`, pinned here to `11.16.0`, which is its current release. The reason for moving the version as well as the name is the **renderer floor**, and it is worth stating precisely rather than overstating: the CLI does not pin the renderer, it declares a range, so the coordinate alone does not determine which renderer gets installed. Release `11.4.0` declares `mermaid: ^11.0.2`, a floor that sits below every fix for the six moderate advisories that affect renderers in that range — GHSA-7rqq-prvp-x9jh and GHSA-8gwm-58g9-j8pw, fixed in `11.10.0`, and GHSA-6m6c-36f7-fhxh, GHSA-87f9-hvmw-gh4p, GHSA-ghcm-xqfw-q4vr and GHSA-xcj9-5m2h-648r, fixed in `11.15.0`. Release `11.16.0` declares `mermaid: ^11.14.0`, above two of those fixes outright. Resolved against the registry as it stands, **both** coordinates in fact pull `mermaid@11.16.0` and both audit clean, so this pin raises a floor and adopts the current release; it is not a claim that the older coordinate installs a vulnerable renderer today. Because no lockfile accompanies a documentation example, the declared floor is the only guarantee the coordinate itself carries. The two `pip` rows move off `1.6.0` and `9.5.0` onto the versions this repository's documentation toolchain actually installs and validates. Every version now named was checked against current advisory data and reports none; the scan evidence is in the change archaeology and review record.
 
 ### 0.6.2 Odoo Module Dependencies (Reference)
 

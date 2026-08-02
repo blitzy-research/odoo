@@ -47,8 +47,24 @@ plugins:
   - techdocs-core:
       use_material_search: true
 markdown_extensions:
+  # The custom fence claims the `mermaid` fence name before the techdocs-core
+  # extension pack's default handling can render it as highlighted plain text,
+  # and emits the body inside an element carrying `class="mermaid"`.
+  #
+  # `format:` is deliberately NOT declared, and must not be re-added.
+  # SuperFences already defaults the formatter to the same callable --
+  # `fence_format = custom.get('format', fence_code_format)` in its own
+  # source -- so naming it changed no output at all, proven by building the
+  # site with and without the key and diffing the two trees, which come out
+  # byte-identical. What naming it did change is how this file has to be
+  # parsed: a Python-name tag resolves only through PyYAML's unsafe
+  # constructor, which imports the module named in the tag, and the
+  # repository root precedes site-packages on `sys.path`. Omitting the key
+  # leaves fence behaviour identical and lets `yaml.safe_load` read this
+  # file. Quoting the tag as a string is NOT the equivalent fix: that hands
+  # SuperFences a string where it expects a callable, silently breaking the
+  # fence and returning the diagrams to highlighted plain text.
   - pymdownx.superfences:
       custom_fences:
         - name: mermaid
           class: mermaid
-          format: !!python/name:pymdownx.superfences.fence_code_format
