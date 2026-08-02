@@ -81,7 +81,8 @@ markdown_extensions:
   # the third portal-side prerequisite in section 7 of
   # docs/change-archaeology-and-review.md, whose subsection 7.2 carries the
   # measured evidence a portal operator needs, including the
-  # subresource-integrity value of the concrete release measured. Four
+  # subresource-integrity value of the concrete release measured and the
+  # exact preload and policy that were built and measured against it. Five
   # repository-side levers were exhausted, each declined for a named reason
   # rather than for lack of capability:
   #   1. Self-host the runtime beside the site. Needs `extra_javascript`,
@@ -99,6 +100,19 @@ markdown_extensions:
   #      server-side. AAP 0.5.1 considered and rejected exactly that in
   #      favour of this fence, AAP 0.5.5 keeps it only as a contingency, and
   #      it would be an unenumerated edit to two plan-protected documents.
+  #   5. Preload a pinned copy carrying an integrity attribute from a
+  #      theme.custom_dir override, so that the theme's own guard --
+  #      `typeof mermaid == "undefined"` -- short-circuits and the unpinned
+  #      request is never issued. This lever was BUILT AND MEASURED rather
+  #      than reasoned about: requests to the floating alias fall from 1 to
+  #      0, the integrity check passes, and both diagrams still render. It
+  #      is declined on SCOPE alone -- `theme` would be a ninth top-level
+  #      key beyond the eight AAP 0.6.3 authorises for this file, the
+  #      override template an unenumerated path beyond the ten of AAP 0.6.1,
+  #      and AAP 0.3.2 assigns client-side rendering infrastructure to the
+  #      portal, which is what owns the origin, the policy and the asset
+  #      hosting it needs. The measurement is recorded in subsection 7.2 of
+  #      the review record so that the portal can apply it directly.
   # The sole declared plugin offers no lever either: its whole option surface
   # is use_material_search and use_pymdownx_blocks (techdocs_core/core.py
   # L37-L38), neither of which touches the runtime origin.
