@@ -1,4 +1,4 @@
-# 0. Agent Action Plan — Technical Specifications
+# 0. Agent Action Plan
 
 > **Status: UNEXECUTED PLAN.** This document is a planning artifact, not a description of implemented software. Nothing it specifies has been built on branch `19.0`, the branch you are reading it on. Read every requirement, epic, user story, directory tree, and module inventory below as a creation target, never as an inventory of what exists here.
 >
@@ -6,7 +6,7 @@
 >
 > **Absent from branch `19.0`:** every artifact this plan targets is missing from the branch you are reading it on, verified by direct filesystem check of this checkout — the `tickets/` documentation tree, the `addons/account_financial_report_ce/` module, and the accounting addons `account_reports`, `account_accountant`, `account_asset`, `account_budget`, and `account_followup`.
 >
-> **The original reconstructed pre-remediation agent-authored change set on branch `19.0`:** the change set this branch carried before remediation began is 13 commits touching 6 files, with 2,025 insertions and 0 deletions — measured with `git rev-list --count` and `git diff --shortstat` over `7bd7718bcd4c..c789a23602c2`, the fixed historical range running from the last upstream commit `7bd7718bcd4c` to `c789a23602c2`, the last commit of that change set. All six are documentation and configuration files; no accounting module, financial reporting engine, bank reconciliation, or ticket artifact is among them. Both endpoints are named rather than left as `HEAD` because the remediation commits that follow `c789a23602c2` extend the branch beyond these figures.
+> **The original reconstructed pre-remediation agent-authored change set on branch `19.0`:** the change set this branch carried before remediation began is 13 commits touching 6 files, with 2,025 insertions and 0 deletions — measured with `git rev-list --count 7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8` and `git diff --shortstat 7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8`, the fixed historical range running from the last upstream commit `7bd7718bcd4c` to `c789a23602c2`, the last commit of that change set. All six are documentation and configuration files; no accounting module, financial reporting engine, bank reconciliation, or ticket artifact is among them. Both endpoints are named rather than left as `HEAD` because the remediation commits that follow `c789a23602c2` extend the branch beyond these figures.
 
 ## 0.1 Intent Clarification
 
@@ -67,7 +67,6 @@ User stories must follow the BDD format:
 ```
 
 **Style Preferences:**
-
 - Use markdown format for all documentation
 - Include Mermaid diagrams where workflows benefit from visualization
 - Keep acceptance criteria concise (3-6 scenarios per story as per BDD best practices)
@@ -94,21 +93,17 @@ These documentation requirements translate to the following technical documentat
 Based on codebase analysis, the following implicit documentation needs have been identified:
 
 **Module Structure Gaps:**
-
 - The `addons/` directory contains no `account_asset`, `account_budget`, `account_followup`, or `account_financial_reports` modules
 - These are Enterprise-only features, validating the epic's objective to bridge the Community/Enterprise gap
 
 **Related OCA Reference:**
-
 - User stories should reference OCA patterns from `OCA/account-financial-reporting`, `OCA/account-reconcile`, and `OCA/mis-builder` repositories for compatibility considerations
 
 **Integration Stories Needed:**
-
 - Stories documenting integration between new modules and existing `account.move`, `account.move.line`, `account.bank.statement` models
 - Stories for analytic account integration (budget allocation by analytic dimension)
 
 **Discovery Notes for Implementation:**
-
 - Codebase analysis required before implementation to understand existing `account` module structure
 - OCA module compatibility evaluation needed for integration vs. replacement decisions
 - Report engine strategy determination (extend Odoo reporting vs. dedicated engine)
@@ -121,7 +116,6 @@ Based on codebase analysis, the following implicit documentation needs have been
 **CRITICAL FINDING:** Repository analysis reveals minimal existing technical documentation infrastructure with no established user story/epic patterns.
 
 **Search Patterns Employed:**
-
 - Documentation files: `README.md`, `*.rst` files in `doc/`, `addons/*/README.md`
 - Documentation generators: No `mkdocs.yml`, `docusaurus.config.js`, or `sphinx.conf.py` found
 - User story templates: No existing `tickets/`, `stories/`, or `epics/` directories
@@ -173,7 +167,6 @@ addons/
 ```
 
 **Related Documentation Found:**
-
 - `addons/account/__manifest__.py` - Module dependencies: `base_setup`, `onboarding`, `product`, `analytic`, `portal`, `digest`
 - Module version: `1.4` (within Odoo 19.0 framework)
 - License: `LGPL-3` (compatible with AGPL-3.0 requirement)
@@ -191,33 +184,40 @@ addons/
 
 ### 0.2.3 Web Search Research Conducted
 
+Every borrowed statement in this subsection carries a numbered footnote naming the publication it came from and the URL it can be read at, so each is independently verifiable. Where no identifiable source could be traced for a statement, it is restated in this document's own voice and the footnote says so rather than presenting it as a quotation.
+
 **Best Practices for User Story Documentation:**
 
-<cite index="15-2,15-3">"The acronym INVEST helps to remember a widely accepted set of criteria, or checklist, to assess the quality of a user story. If the story fails to meet one of these criteria, the team may want to reword it, or even consider a rewrite."</cite>
+> The acronym INVEST helps to remember a widely accepted set of criteria, or checklist, to assess the quality of a user story. If the story fails to meet one of these criteria, the team may want to reword it, or even consider a rewrite.[^invest]
+
+[^invest]: Agile Alliance, *Agile Glossary — INVEST*, [agilealliance.org/glossary/invest](https://agilealliance.org/glossary/invest/). Quoted from the opening paragraph of the glossary entry. The original sentence continues with a parenthetical about physically replacing the story card, omitted here because it adds no criterion.
 
 **INVEST Principles Applied to This Epic:**
 
 | Principle | Application |
 |-----------|-------------|
-| **Independent** | Each feature (Financial Reporting, Bank Reconciliation, etc.) can be developed independently |
-| **Negotiable** | Stories describe outcomes, not implementations; allows developer flexibility |
-| **Valuable** | Each story tied to user persona and business value (CFO, Accountant, Auditor needs) |
-| **Estimable** | Stories scoped to 3-7 per feature, small enough to estimate |
-| **Small** | Features decomposed into discrete stories (e.g., separate Balance Sheet from P&L) |
-| **Testable** | BDD acceptance criteria enable objective verification |
+| **I**ndependent | Each feature (Financial Reporting, Bank Reconciliation, etc.) can be developed independently |
+| **N**egotiable | Stories describe outcomes, not implementations; allows developer flexibility |
+| **V**aluable | Each story tied to user persona and business value (CFO, Accountant, Auditor needs) |
+| **E**stimable | Stories scoped to 3-7 per feature, small enough to estimate |
+| **S**mall | Features decomposed into discrete stories (e.g., separate Balance Sheet from P&L) |
+| **T**estable | BDD acceptance criteria enable objective verification |
 
 **BDD Acceptance Criteria Best Practices:**
 
-<cite index="16-10,16-11">"BDD often uses the Gherkin syntax, which structures acceptance criteria in a Given-When-Then format. This format describes the preconditions (Given), the action or event (When), and the expected outcome (Then)."</cite>
+BDD states each acceptance criterion as a scenario written in Gherkin, whose `Given`, `When` and `Then` keywords name the precondition, the triggering action and the expected outcome respectively.[^gherkin] Two properties of that structure are what this epic relies on, and they pull in the same direction: a scenario reads as a behavioural claim a non-technical stakeholder can confirm or reject, and it simultaneously carries enough structure to be turned into an executable test without reinterpretation.[^bdd]
 
-<cite index="12-12,12-13,12-14">"Firstly, it is to articulate with clarity to a non-technical audience that the criteria will be used to validate a feature's behavior. Secondly, and equally important, it is to ensure that this requirement can be easily transformed into building and testing code. BDD happens to be a good medium to address these outcomes."</cite>
+[^gherkin]: Cucumber, *Gherkin Reference*, [cucumber.io/docs/gherkin/reference](https://cucumber.io/docs/gherkin/reference/). The normative description of the `Given`/`When`/`Then` keywords and of scenario structure.
+
+[^bdd]: Cucumber, *Behaviour-Driven Development*, [cucumber.io/docs/bdd](https://cucumber.io/docs/bdd/). **Paraphrase, not a quotation.** A quotation previously stood here that could not be traced to any identifiable publication, so the point it made has been restated in this document's own words and anchored to the practice's own documentation instead.
 
 **OCA Module Patterns Research:**
 
-<cite index="3-18,3-19">"This module adds a set of financial reports. They are accessible under Invoicing / Reporting / OCA accounting reports."</cite>
+> This module adds a set of financial reports. They are accessible under Invoicing / Reporting / OCA accounting reports.[^oca]
+
+[^oca]: OCA, `account_financial_report` module description — `readme/DESCRIPTION.md`, rendered into `README.rst` at line 35 — [github.com/OCA/account-financial-reporting/tree/18.0/account_financial_report](https://github.com/OCA/account-financial-reporting/tree/18.0/account_financial_report).
 
 The OCA `account_financial_report` module provides precedent for:
-
 - General Ledger reports
 - Trial Balance reports
 - Aged Partner Balance reports
@@ -295,7 +295,6 @@ The OCA `account_financial_report` module provides precedent for:
 Given the requirements and repository analysis, documentation gaps include:
 
 **Complete Absence (No Existing Documentation):**
-
 - User epic/story structure for Enterprise-equivalent features
 - BDD acceptance criteria templates for accounting features
 - Feature decomposition aligned with INVEST principles
@@ -304,7 +303,7 @@ Given the requirements and repository analysis, documentation gaps include:
 **Undocumented Integration Points:**
 
 ```mermaid
-graph LR
+graph TD
     A[New Financial Reporting Module] --> B[account.move]
     A --> C[account.move.line]
     A --> D[account.account]
@@ -326,20 +325,6 @@ graph LR
     O[New Follow-up Module] --> P[res.partner]
     O --> B
 ```
-
-**Diagram text alternative** — *Undocumented integration points*, a
-left-to-right graph of six planned modules, ten existing Odoo model nodes and
-fifteen one-directional edges running from module to model. `New Financial
-Reporting Module` points to `account.move`, `account.move.line` and
-`account.account`. `New Bank Reconciliation Module` points to
-`account.bank.statement`, `account.bank.statement.line` and
-`account.reconcile.model`. `New Budget Module` points to
-`account.analytic.account`, `account.analytic.plan` and `account.account`.
-`New Asset Module` points to `account.move` and `account.account`. `New
-Deferred Revenue Module` points to `account.move` and `account.move.line`.
-`New Follow-up Module` points to `res.partner` and `account.move`. No edge
-runs between two modules or between two models, and `account.account` is drawn
-twice because the source declares it as two separate nodes.
 
 **Missing User Journey Documentation:**
 
@@ -412,10 +397,10 @@ EPIC: Enterprise Accounting Capabilities
 
 ```
 tickets/
-├── README.md  # Epic overview and navigation
-├── EPIC-001-enterprise-accounting.md  # Master epic document
+├── README.md                                    # Epic overview and navigation
+├── EPIC-001-enterprise-accounting.md           # Master epic document
 ├── features/
-│   ├── FEATURE-001-financial-reporting.md  # Feature specification
+│   ├── FEATURE-001-financial-reporting.md      # Feature specification
 │   ├── FEATURE-002-bank-reconciliation.md
 │   ├── FEATURE-003-budget-management.md
 │   ├── FEATURE-004-asset-management.md
@@ -461,9 +446,9 @@ tickets/
 │       ├── PF-004-action-history-tracking.md
 │       └── PF-005-overdue-calculation.md
 └── templates/
-    ├── epic-template.md  # Reusable epic template
-    ├── feature-template.md  # Reusable feature template
-    └── story-template.md  # Reusable story template
+    ├── epic-template.md                        # Reusable epic template
+    ├── feature-template.md                     # Reusable feature template
+    └── story-template.md                       # Reusable story template
 ```
 
 ### 0.4.2 Content Generation Strategy
@@ -530,14 +515,6 @@ graph TB
     end
 ```
 
-**Diagram text alternative** — *Epic feature relationship*, a top-to-bottom
-graph entirely enclosed in one subgraph captioned `Enterprise Accounting Epic`.
-A single root node, `EPIC-001: Enterprise Accounting`, has six outbound edges,
-one to each of `Feature 1: Financial Reporting`, `Feature 2: Bank
-Reconciliation`, `Feature 3: Budget Management`, `Feature 4: Asset Management`,
-`Feature 5: Deferred Revenue` and `Feature 6: Payment Follow-ups`. There are no
-edges between the six features.
-
 **2. Financial Reporting Workflow Diagram:**
 
 ```mermaid
@@ -556,17 +533,6 @@ sequenceDiagram
     U->>R: Export PDF or Excel
 ```
 
-**Diagram text alternative** — *Financial reporting workflow*, a sequence
-diagram with four participants — `User CFO`, `Report Wizard`, `Report Engine`
-and `Data Layer` — exchanging eight messages in this order: User CFO to Report
-Wizard, `Select Report Type`; User CFO to Report Wizard, `Configure
-Parameters`; Report Wizard to Report Engine, `Generate Report`; Report Engine
-to Data Layer, `Query account.move.line`; Data Layer back to Report Engine,
-`Return Data`; Report Engine back to Report Wizard, `Render Report`; Report
-Wizard back to User CFO, `Display Report`; and finally User CFO to Report
-Wizard, `Export PDF or Excel`. The three reply messages — `Return Data`,
-`Render Report` and `Display Report` — are drawn as dashed arrows.
-
 **3. Bank Reconciliation Workflow Diagram:**
 
 ```mermaid
@@ -582,13 +548,6 @@ stateDiagram-v2
     Reconciled --> [*]
 ```
 
-**Diagram text alternative** — *Bank reconciliation workflow*, a state diagram
-with seven named states and nine transitions. From the start marker the flow
-enters `Import`, then `Unreconciled`, then `Matching`, then `Suggestions`, then
-`Review`. `Review` branches two ways: straight to `Reconciled`, or to `Manual`
-which then also leads to `Reconciled`. `Reconciled` transitions to the end
-marker. No transition returns from `Reconciled` to any earlier state.
-
 **4. Asset Depreciation Lifecycle Diagram:**
 
 ```mermaid
@@ -603,15 +562,6 @@ graph LR
     F --> G[Gain Loss Entry]
     G --> H[Closed Asset]
 ```
-
-**Diagram text alternative** — *Asset depreciation lifecycle*, a left-to-right
-graph with eight nodes and nine edges. `Acquisition` leads to `Active Asset`.
-From `Active Asset` the flow runs to `Depreciation Schedule`, then to
-`Depreciation Entry`, then back to `Active Asset`, forming a repeating
-depreciation cycle. `Active Asset` also leads to `Modification`, which returns
-to `Active Asset`, forming a second cycle. Finally `Active Asset` leads to
-`Disposal`, then to `Gain Loss Entry`, then to `Closed Asset`, which is
-terminal.
 
 ### 0.4.4 Persona-Based Story Mapping
 
@@ -643,7 +593,6 @@ terminal.
 **CRITICAL: Complete inventory of all documentation files to be created.**
 
 **Documentation Transformation Modes:**
-
 - **CREATE** - Create a new documentation file
 - **UPDATE** - Update an existing documentation file
 - **DELETE** - Remove an obsolete documentation file
@@ -710,7 +659,6 @@ terminal.
 | Source Code | User requirements input, repository analysis |
 
 **Sections:**
-
 - Business Context (Problem Statement, Target Users, Success Metrics)
 - Feature Summary (6 features with priorities)
 - Constraints (AGPL-3.0, no Enterprise, OCA standards, 80% coverage)
@@ -731,7 +679,6 @@ terminal.
 | Source Code | `addons/account/report/account_invoice_report.py` (pattern reference) |
 
 **Sections:**
-
 - Feature Overview (GAAP/IFRS-compliant financial statements)
 - User Personas (CFO, Accountant, Auditor, Business Owner)
 - Story List (FR-001 through FR-007)
@@ -749,7 +696,6 @@ terminal.
 | Source Code | `addons/account/models/account_account.py` (account types reference) |
 
 **Sections:**
-
 - User Story (As a CFO, I want..., So that...)
 - Acceptance Criteria (4-6 BDD scenarios)
   - Scenario 1: Generate Balance Sheet for current period
@@ -764,7 +710,6 @@ terminal.
 ### 0.5.3 Documentation Configuration Files
 
 No documentation generator configuration files are required for this markdown-based file structure. The `tickets/` directory uses plain markdown files compatible with:
-
 - GitHub/GitLab native rendering
 - Any markdown preview tool
 - Conversion to other formats via pandoc if needed
@@ -789,7 +734,6 @@ No documentation generator configuration files are required for this markdown-ba
 | Story files | Dependent story files | Dependency links |
 
 **Table of Contents Updates:**
-
 - `tickets/README.md` will contain complete navigation index
 - Each feature file will list all child stories
 - Each story file will reference parent feature and dependencies
@@ -806,9 +750,11 @@ No documentation generator configuration files are required for this markdown-ba
 | N/A | Mermaid | N/A | Diagram syntax embedded in markdown (rendered by GitHub/GitLab) |
 | pip | mkdocs | 1.6.0 | Optional: Documentation site generator if web publishing needed |
 | pip | mkdocs-material | 9.5.0 | Optional: Material theme for mkdocs |
-| npm | mermaid-cli | 11.4.0 | Optional: CLI tool for offline mermaid diagram generation |
+| npm | `@mermaid-js/mermaid-cli` | 11.4.0 | Optional: CLI tool (binary `mmdc`) for offline mermaid diagram generation |
 
 **Note:** The primary documentation output is plain markdown files that require no build tooling. The optional packages are listed for scenarios where web-based documentation publishing is desired.
+
+**The Mermaid CLI coordinate is scoped, and the scope is not optional.** The package that publishes version 11.4.0 and the `mmdc` binary is `@mermaid-js/mermaid-cli`; installing it is `npm install -g @mermaid-js/mermaid-cli@11.4.0`. The *unscoped* name `mermaid-cli` is a different and unrelated package: its newest release is **0.2.4**, published in 2014, and its registry entry is deprecated in favour of mermaid core. It has no 11.4.0 to install, so an unscoped coordinate either fails outright or silently installs decade-old software — which is why the scope is recorded here rather than left to inference.
 
 ### 0.6.2 Odoo Module Dependencies (Reference)
 
@@ -933,12 +879,12 @@ Each user story must pass this checklist:
 
 | Criterion | Validation Question |
 |-----------|---------------------|
-| **Independent** | Can this story be developed without completing other stories first? |
-| **Negotiable** | Does the story describe outcomes without prescribing implementation? |
-| **Valuable** | Does the "So that" clause clearly state business value? |
-| **Estimable** | Is the story small enough that effort can be estimated? |
-| **Small** | Can this story be completed within one sprint/iteration? |
-| **Testable** | Do acceptance criteria enable objective pass/fail determination? |
+| **I**ndependent | Can this story be developed without completing other stories first? |
+| **N**egotiable | Does the story describe outcomes without prescribing implementation? |
+| **V**aluable | Does the "So that" clause clearly state business value? |
+| **E**stimable | Is the story small enough that effort can be estimated? |
+| **S**mall | Is the story a single deliverable outcome of bounded effort, which cannot be decomposed further without one of the parts losing user value on its own? |
+| **T**estable | Do acceptance criteria enable objective pass/fail determination? |
 
 ### 0.7.4 Acceptance Criteria Quality Standards
 
@@ -987,7 +933,6 @@ Each user story must pass this checklist:
 **Test Traceability:**
 
 Each story's acceptance criteria will be structured to support automated test generation:
-
 - Gherkin-compatible Given/When/Then syntax
 - Specific, measurable outcomes
 - No ambiguous conditions
@@ -1074,14 +1019,12 @@ Each story's acceptance criteria will be structured to support automated test ge
 ### 0.8.3 Scope Validation Rules
 
 **Inclusion Criteria:**
-
 - Must be related to one of the 6 defined functional requirement areas
 - Must serve at least one of the 5 defined user personas
 - Must be achievable without Enterprise module dependencies
 - Must be documentable as a user story with testable acceptance criteria
 
 **Exclusion Criteria:**
-
 - Any feature requiring real-time external API integration for bank feeds
 - Any feature requiring AI/ML capabilities
 - Any feature specific to multi-company consolidation scenarios
@@ -1133,10 +1076,22 @@ Each story's acceptance criteria will be structured to support automated test ge
 
 **Optional: Documentation Site Generation (if mkdocs installed):**
 
-| Command | Purpose |
-|---------|---------|
-| `mkdocs build --site-dir docs_site` | Build documentation site |
-| `mkdocs serve` | Local preview (non-blocking) |
+MkDocs builds whatever `docs_dir` names, and its default is `docs`. A bare `mkdocs build` therefore publishes the repository's own `docs/` tree and never touches `tickets/`, so the documentation set this section is about would not appear in the output at all. Both commands below root the site at `tickets/` explicitly by supplying a configuration on standard input, which also leaves the repository's own site configuration untouched. Run them from the repository root, because `docs_dir` and `site_dir` resolve relative to the working directory when the configuration is read from stdin.
+
+```bash
+# Build the tickets/ tree into tickets_site/. Non-blocking: returns when the
+# build finishes, so this is the form to use in a script or a CI step.
+printf 'site_name: Enterprise Accounting Epic\ndocs_dir: tickets\nsite_dir: tickets_site\n' \
+    | mkdocs build -f -
+
+# Local preview of the tickets/ tree on http://127.0.0.1:8000/.
+# LONG-RUNNING AND BLOCKING: mkdocs serve starts a development server with a
+# file watcher and never returns on its own; it runs until interrupted. Never
+# place it in a script or a CI step, and never expect a following command in
+# the same shell to execute.
+printf 'site_name: Enterprise Accounting Epic\ndocs_dir: tickets\nsite_dir: tickets_site\n' \
+    | mkdocs serve -f -
+```
 
 ### 0.9.2 Documentation Validation Commands
 
@@ -1151,11 +1106,38 @@ Each story's acceptance criteria will be structured to support automated test ge
 
 **Content Validation:**
 
-| Validation | Command |
-|------------|---------|
-| User story format | `grep -l "As a\|I want\|So that" tickets/stories/**/*.md \| wc -l` |
-| BDD format | `grep -l "Given\|When\|Then" tickets/stories/**/*.md \| wc -l` |
-| Test coverage mention | `grep -l "80%" tickets/stories/**/*.md \| wc -l` |
+Each check below requires **every** listed token to be present in **every** story file, and asserts an exact expected total. An alternation such as `grep -l "As a\|I want\|So that"` must not be used for this purpose: it matches a file carrying only one of the three clauses, so a story missing both `I want` and `So that` would still be counted as conforming, and a bare `wc -l` reports a number without asserting what that number should be.
+
+```bash
+# Run from the repository root. Each check prints PASS only when every story
+# file carries every required token and the file total is exactly 32.
+STORIES=$(find tickets/stories -name '*.md' | wc -l)
+test "$STORIES" -eq 32 || echo "FAIL story count: expected 32, found $STORIES"
+
+check_all_tokens() {
+    label=$1; shift
+    missing=0
+    while IFS= read -r f; do
+        for token in "$@"; do
+            grep -qF -- "$token" "$f" || { echo "  MISSING '$token' in $f"; missing=1; }
+        done
+    done <<< "$(find tickets/stories -name '*.md' | sort)"
+    if [ "$missing" -eq 0 ] && [ "$STORIES" -eq 32 ]; then
+        echo "PASS $label: 32/32 story files carry every required token"
+    else
+        echo "FAIL $label"
+    fi
+}
+
+# User story format: all three clauses, in every file.
+check_all_tokens 'user story format' 'As a' 'I want' 'So that'
+
+# BDD format: all three Gherkin keywords, in every file.
+check_all_tokens 'BDD format' 'Given' 'When' 'Then'
+
+# Test coverage: the 80% requirement stated in every file.
+check_all_tokens 'test coverage requirement' '80%'
+```
 
 ### 0.9.3 Default Documentation Format
 
@@ -1255,19 +1237,17 @@ The following rules are explicitly emphasized in the user requirements and must 
 > "Each feature should decompose into 3-7 user stories following INVEST principles."
 
 All user stories must be validated against:
-
-- **Independent**: Minimize dependencies between stories
-- **Negotiable**: Describe outcomes, not implementations
-- **Valuable**: Clear business value in "So that" clause
-- **Estimable**: Appropriately sized for estimation
-- **Small**: Completable within one sprint
-- **Testable**: Objective pass/fail determination
+- **I**ndependent: Minimize dependencies between stories
+- **N**egotiable: Describe outcomes, not implementations
+- **V**aluable: Clear business value in "So that" clause
+- **E**stimable: Appropriately sized for estimation
+- **S**mall: A single deliverable outcome of bounded effort, not decomposable further without losing user value
+- **T**estable: Objective pass/fail determination
 
 **R-002: BDD Acceptance Criteria Format**
 > "Stories should specify WHAT and WHY without prescribing HOW—implementation details emerge from agent discovery of the codebase."
 
 All acceptance criteria must:
-
 - Use Given/When/Then format
 - Avoid UI element references
 - Avoid implementation details
@@ -1277,21 +1257,18 @@ All acceptance criteria must:
 > "AGPL-3.0 license compatibility required"
 
 All stories must include acceptance criterion:
-
 - "Module distributed under AGPL-3.0 compatible license"
 
 **R-004: No Enterprise Dependencies**
 > "No dependencies on Odoo Enterprise modules"
 
 All stories must include acceptance criterion:
-
 - "No imports or dependencies on Odoo Enterprise edition modules"
 
 **R-005: OCA Coding Standards**
 > "Adherence to Odoo and OCA coding standards"
 
 Technical notes must reference:
-
 - OCA module guidelines
 - Odoo development guidelines
 
@@ -1299,14 +1276,12 @@ Technical notes must reference:
 > "Minimum 80% test coverage for new functionality"
 
 All stories must include acceptance criterion:
-
 - "Implementation achieves minimum 80% test coverage"
 
 **R-007: Target Version**
 > "Target version: Odoo 18.0"
 
 Technical notes must include:
-
 - Version compatibility considerations
 - Note: Repository is 19.0, stories written version-agnostic
 
@@ -1318,7 +1293,6 @@ Per user requirements, the following areas require codebase analysis before impl
 > "Analyze current `account` module structure, model inheritance patterns, view architecture, and wizard conventions before proposing new modules or extensions."
 
 Stories must NOT specify:
-
 - Module names or structure
 - Model inheritance approach
 - View architecture decisions
@@ -1327,7 +1301,6 @@ Stories must NOT specify:
 > "Review OCA modules (account_financial_report, account_reconcile_oca, mis_builder) to determine integration vs replacement strategy."
 
 Stories must NOT specify:
-
 - Whether to integrate with OCA modules
 - Whether to replace OCA functionality
 - Specific OCA module dependencies
@@ -1336,7 +1309,6 @@ Stories must NOT specify:
 > "Determine whether to extend existing Odoo reporting infrastructure or implement dedicated financial report engine based on codebase analysis."
 
 Stories must NOT specify:
-
 - Report engine technology
 - QWeb vs dedicated engine choice
 - Report generation architecture
@@ -1345,7 +1317,6 @@ Stories must NOT specify:
 > "Assess current OWL component patterns in accounting views before designing reconciliation and reporting interfaces."
 
 Stories must NOT specify:
-
 - OWL component structure
 - JavaScript framework choices
 - UI implementation approach
@@ -1354,7 +1325,6 @@ Stories must NOT specify:
 > "Analyze existing account.move, account.move.line, account.bank.statement structures to determine extension approach."
 
 Stories must NOT specify:
-
 - New model names
 - Field definitions
 - Database schema
@@ -1366,11 +1336,9 @@ Stories must NOT specify:
 When user requirements include specific examples, they must be preserved verbatim in documentation.
 
 **User Provided Business Value Statements:**
-
 - "SMEs using Odoo Community Edition cannot produce standard financial reports required for regulatory compliance, investor reporting, bank loan applications, and internal financial management."
 
 **User Provided Success Metrics:**
-
 - "All standard financial statements (Balance Sheet, P&L, Cash Flow) producible"
 - "Bank reconciliation matching accuracy ≥95% with algorithmic suggestions"
 - "Budget variance reports available within 24 hours of period close"
@@ -1397,7 +1365,6 @@ Stories must stay within these boundaries:
 **SC-002: Documentation-Only Constraint**
 
 This task produces documentation artifacts only:
-
 - No source code files created
 - No test files created
 - No configuration files modified
@@ -1408,33 +1375,30 @@ This task produces documentation artifacts only:
 **QA-001: Story Completeness Check**
 
 Each story file must contain:
-
-- User story statement (As a / I want / So that)
-- 3-6 acceptance criteria scenarios
-- Given/When/Then format for each scenario
-- Technical notes section (discovery areas)
-- Dependencies section
-- Test requirements section (80% coverage)
+- [ ] User story statement (As a / I want / So that)
+- [ ] 3-6 acceptance criteria scenarios
+- [ ] Given/When/Then format for each scenario
+- [ ] Technical notes section (discovery areas)
+- [ ] Dependencies section
+- [ ] Test requirements section (80% coverage)
 
 **QA-002: Feature Completeness Check**
 
 Each feature file must contain:
-
-- Feature overview
-- User persona mapping
-- Story list with IDs
-- Acceptance criteria summary
-- Technical discovery notes
+- [ ] Feature overview
+- [ ] User persona mapping
+- [ ] Story list with IDs
+- [ ] Acceptance criteria summary
+- [ ] Technical discovery notes
 
 **QA-003: Epic Completeness Check**
 
 Epic file must contain:
-
-- Business context (problem, users, metrics)
-- All 6 features listed
-- Constraints documented
-- Out of scope documented
-- References section
+- [ ] Business context (problem, users, metrics)
+- [ ] All 6 features listed
+- [ ] Constraints documented
+- [ ] Out of scope documented
+- [ ] References section
 
 ## 0.11 References
 
@@ -1444,7 +1408,7 @@ Epic file must contain:
 
 | File Path | Purpose | Key Findings |
 |-----------|---------|--------------|
-| `odoo/release.py` | Version identification | Odoo 19.0 (Master), LGPL-3 license |
+| `odoo/release.py` | Version identification | Odoo 19.0 **stable** — [odoo/release.py:L15] reads `version_info = (19, 0, 0, FINAL, 0, '')`, and `FINAL` is the last of the four release levels declared at [odoo/release.py:L3], so this is a released series and not a development trunk; LGPL-3 license |
 | `addons/account/__manifest__.py` | Module configuration | Dependencies: base_setup, onboarding, product, analytic, portal, digest |
 | `addons/account/README.md` | Module description | High-level accounting feature overview |
 | `addons/account/models/` | Business logic layer | 35+ model files for accounting operations |
@@ -1475,7 +1439,7 @@ Epic file must contain:
 | Folder Path | Purpose | Children Examined |
 |-------------|---------|-------------------|
 | `/` (root) | Repository root | All first-level directories |
-| `addons/` | Module collection | 607 addon directories |
+| `addons/` | Module collection | **605** addon directories. `git ls-tree -d --name-only bc1e4f9f5c1b addons/` lists exactly 605 paths at commit `bc1e4f9f5c1b`; `find addons -maxdepth 1 -mindepth 1 -type d` lists the same 605 on the working tree; and the same `git ls-tree` at the baseline commit `7bd7718bcd4c` also lists 605, so the count is unchanged across the whole reconstructed range |
 | `addons/account/` | Core accounting module | models/, views/, wizard/, report/, tests/ |
 | `addons/account/models/` | Accounting models | 35+ Python model files |
 | `addons/account/wizard/` | Accounting wizards | 15+ transient model files |

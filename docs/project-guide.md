@@ -1,6 +1,6 @@
 # Project Guide: Enterprise Accounting Epic for Odoo Community Edition
 
-> ⚠️ **Provenance**: this guide was authored against branch `pdlc` via pull request PR #2 ("Enterprise Accounting Docs & Reports Scaffold") of `Blitzy-Sandbox/blitzy-odoo`, which carries **81 changed files and 27,905 additions**. It is published on branch `19.0`, whose **original reconstructed pre-remediation agent-authored change set** is **13 commits, 6 files, 2,025 insertions, 0 deletions** over the fixed historical range `7bd7718bcd4c..c789a23602c2` — measured over that range with `git log --oneline` and `git diff --stat`, where `7bd7718bcd4c` is the last upstream commit and `c789a23602c2` the last commit of that change set, which report `catalog-info.yaml` 32, `mkdocs.yml` 9, `doc/index.md` 5, `docs/index.md` 3, `doc/project-guide.md` 502, `doc/technical-specifications.md` 1474. Both endpoints are named rather than left as `HEAD` because the remediation commits that follow `c789a23602c2` add to every one of those figures: they are an archaeology record of that fixed range, not a census of the branch as it now stands.
+> ⚠️ **Provenance**: this guide was authored against branch `pdlc` via pull request PR #2 ("Enterprise Accounting Docs & Reports Scaffold") of `Blitzy-Sandbox/blitzy-odoo`, which carries **81 changed files and 27,905 additions**. It is published on branch `19.0`, whose **original reconstructed pre-remediation agent-authored change set** is **13 commits, 6 files, 2,025 insertions, 0 deletions** over the fixed historical range `7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8` — measured with `git log --oneline 7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8` and `git diff --stat 7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8`, where `7bd7718bcd4c` is the last upstream commit and `c789a23602c2` the last commit of that change set, which report `catalog-info.yaml` 32, `mkdocs.yml` 9, `doc/index.md` 5, `docs/index.md` 3, `doc/project-guide.md` 502, `doc/technical-specifications.md` 1474. Both endpoints are named rather than left as `HEAD` because the remediation commits that follow `c789a23602c2` add to every one of those figures: they are an archaeology record of that fixed range, not a census of the branch as it now stands.
 >
 > ⚠️ **Artifacts described below that are ABSENT from branch `19.0`** — every one verified on this checkout: the `tickets/` documentation tree, `addons/account_financial_report_ce/`, and the accounting addons `account_reports`, `account_accountant`, `account_asset`, `account_budget`, and `account_followup`.
 >
@@ -44,14 +44,27 @@ This project delivers comprehensive user story documentation for implementing en
 | Navigation Index | 1 | ✅ Complete |
 
 ### Module Validation (36 files, branch `pdlc`)
+
+Every row below is regenerated from the authoritative PR #2 file list of `Blitzy-Sandbox/blitzy-odoo`, grouped by the module's own directory layout. The `Count` column sums to the **36** files of `addons/account_financial_report_ce/` and the `Lines` column to the **6,667** additions those files carry, and the three language subtotals reproduce the `Python LOC`, `XML LOC` and `SCSS LOC` rows of the Git Statistics tables below exactly.
+
 | File Type | Count | Lines | Status |
 |-----------|-------|-------|--------|
-| Python Models | 8 | 2,824 | ✅ Compiles |
-| Python Wizards | 2 | 477 | ✅ Compiles |
-| Python Reports | 6 | 163 | ✅ Compiles |
-| Python Tests | 2 | 533 | ✅ Compiles |
-| XML Templates | 12 | 2,074 | ✅ Valid |
-| SCSS Styles | 2 | 596 | ✅ Valid |
+| Python models (`models/`) | 8 | 2,729 | ✅ Compiles |
+| Python tests (`tests/`) | 2 | 533 | ✅ Compiles |
+| Python wizards (`wizard/`) | 2 | 265 | ✅ Compiles |
+| Python report classes (`report/`) | 7 | 153 | ✅ Compiles |
+| Python module root (`__init__.py`, `__manifest__.py`) | 2 | 83 | ✅ Compiles |
+| **Python subtotal** | **21** | **3,763** | — |
+| XML report templates (`report/`) | 7 | 1,851 | ✅ Valid |
+| XML wizard views (`wizard/`) | 1 | 217 | ✅ Valid |
+| XML data (`data/`) | 1 | 95 | ✅ Valid |
+| XML menus and views (`views/`) | 1 | 89 | ✅ Valid |
+| XML security rules (`security/`) | 1 | 24 | ✅ Valid |
+| XML demo data (`demo/`) | 1 | 16 | ✅ Valid |
+| **XML subtotal** | **12** | **2,292** | — |
+| SCSS styles (`static/src/scss/`) | 2 | 596 | ✅ Valid |
+| CSV access rules (`security/ir.model.access.csv`) | 1 | 16 | ✅ Valid |
+| **Total** | **36** | **6,667** | — |
 
 ### Constraint Compliance
 | Constraint | Requirement | Status |
@@ -72,23 +85,14 @@ pie title Project Hours Breakdown
     "Remaining Work" : 530
 ```
 
-**Diagram text alternative** — *Project Hours Breakdown*, a two-slice pie over
-640 total hours: Completed Work 110 hours (rendered as 17%) and Remaining Work
-530 hours (rendered as 83%).
-
 ```mermaid
 pie title Documentation Completion
     "Epic" : 1
     "Features" : 6
     "Stories" : 32
-    "Index" : 1
     "Templates" : 3
+    "Index" : 1
 ```
-
-**Diagram text alternative** — *Documentation Completion*, a five-slice pie over
-the 43 documentation files created on branch `pdlc`: Epic 1 file (rendered as
-2%), Features 6 files (14%), Stories 32 files (74%), Index 1 file (2%) and
-Templates 3 files (7%).
 
 ---
 
@@ -116,7 +120,6 @@ Templates 3 files (7%).
 **Current State**: Module scaffold exists with model structure, wizard, and report templates.
 
 **Action Steps**:
-
 1. Implement full business logic in `balance_sheet.py` (compute GAAP/IFRS compliant totals)
 2. Implement full business logic in `profit_loss.py` (compute income/expense categorization)
 3. Implement full business logic in `cash_flow.py` (compute operating/investing/financing activities)
@@ -129,7 +132,6 @@ Templates 3 files (7%).
 10. Execute test suite and achieve 80% coverage
 
 **Files to Modify**:
-
 - `addons/account_financial_report_ce/models/*.py`
 - `addons/account_financial_report_ce/report/*.py`
 - `addons/account_financial_report_ce/tests/test_financial_reports.py`
@@ -142,7 +144,6 @@ Templates 3 files (7%).
 **Reference Stories**: BR-001 through BR-005
 
 **Action Steps**:
-
 1. Create module scaffold following `account_financial_report_ce` pattern
 2. Implement statement import wizard (CSV, OFX, QIF, CAMT.053 formats)
 3. Develop algorithmic matching engine with confidence scoring
@@ -152,7 +153,6 @@ Templates 3 files (7%).
 7. Create comprehensive test suite (80% coverage)
 
 **Dependencies**: 
-
 - `account.bank.statement` model
 - `account.reconcile.model` patterns
 - OCA `account_reconcile_oca` for reference
@@ -165,7 +165,6 @@ Templates 3 files (7%).
 **Reference Stories**: BM-001 through BM-005
 
 **Action Steps**:
-
 1. Create `account_budget_ce` module scaffold
 2. Implement budget definition models with analytic dimension support
 3. Create period allocation wizard (monthly/quarterly/annual)
@@ -175,7 +174,6 @@ Templates 3 files (7%).
 7. Create comprehensive test suite (80% coverage)
 
 **Dependencies**:
-
 - `account.analytic.account` model
 - `account.analytic.plan` model
 
@@ -187,7 +185,6 @@ Templates 3 files (7%).
 **Reference Stories**: AM-001 through AM-006
 
 **Action Steps**:
-
 1. Create `account_asset_ce` module scaffold
 2. Implement asset registration from purchase invoices
 3. Create depreciation configuration (straight-line, declining balance, units of production)
@@ -198,7 +195,6 @@ Templates 3 files (7%).
 8. Create comprehensive test suite (80% coverage)
 
 **Dependencies**:
-
 - `account.move` model for journal entries
 - `product.product` model for asset classification
 
@@ -210,7 +206,6 @@ Templates 3 files (7%).
 **Reference Stories**: DR-001 through DR-004
 
 **Action Steps**:
-
 1. Create `account_deferred_revenue_ce` module scaffold
 2. Implement deferral schedule definition models
 3. Create automatic period allocation engine (ASC 606/IFRS 15 compliant)
@@ -219,7 +214,6 @@ Templates 3 files (7%).
 6. Create comprehensive test suite (80% coverage)
 
 **Dependencies**:
-
 - `account.move` model
 - `account.move.line` model
 
@@ -231,7 +225,6 @@ Templates 3 files (7%).
 **Reference Stories**: PF-001 through PF-005
 
 **Action Steps**:
-
 1. Create `account_followup_ce` module scaffold
 2. Implement follow-up level configuration
 3. Create automated email generation with templates
@@ -241,7 +234,6 @@ Templates 3 files (7%).
 7. Create comprehensive test suite (80% coverage)
 
 **Dependencies**:
-
 - `res.partner` model
 - `mail.template` model
 - `account.move` model
@@ -252,7 +244,6 @@ Templates 3 files (7%).
 **Priority**: Medium | **Severity**: Medium
 
 **Action Steps**:
-
 1. Create integration test suite spanning all 6 modules
 2. Test cross-module workflows (e.g., asset purchase → depreciation → financial reports)
 3. Validate data consistency across reporting modules
@@ -266,7 +257,6 @@ Templates 3 files (7%).
 **Priority**: Low | **Severity**: Medium
 
 **Action Steps**:
-
 1. Create Docker deployment configuration
 2. Write installation guide with prerequisites
 3. Configure CI/CD pipeline for automated testing
@@ -280,20 +270,25 @@ Templates 3 files (7%).
 
 ### System Prerequisites
 
-| Requirement | Version | Purpose |
-|-------------|---------|---------|
-| Python | 3.10+ | Runtime environment |
-| PostgreSQL | 12+ | Database server |
-| Node.js | 18+ | Asset compilation |
-| wkhtmltopdf | 0.12.6+ | PDF report generation |
-| Git | 2.x | Version control |
+The Python and PostgreSQL bounds below are the ones this repository declares for itself at [odoo/release.py:L39-L41] — `MIN_PY_VERSION = (3, 10)`, `MAX_PY_VERSION = (3, 13)` and `MIN_PG_VERSION = 13` — not general recommendations. They are not all enforced the same way, so the *Enforcement* column records what actually happens.
+
+| Requirement | Version | Purpose | Enforcement |
+|-------------|---------|---------|-------------|
+| Python | 3.10 – 3.13 | Runtime environment | Hard: [odoo/init.py:L9] asserts `sys.version_info > MIN_PY_VERSION`, so an older interpreter aborts at import. Above 3.13, [odoo/cli/server.py:L69-L73] logs an unsupported-version warning and continues |
+| PostgreSQL | 13+ | Database server | [odoo/sql_db.py:L693-L694] warns on every connection when the server reports below `MIN_PG_VERSION`. PostgreSQL 12 is therefore below the declared minimum and unsupported |
+| Node.js | 18+ | Asset compilation | Not checked by the server; required by the asset pipeline |
+| wkhtmltopdf | 0.12.6+ | PDF report generation | Not checked by the server; required for PDF report output |
+| Git | 2.x | Version control | Not checked by the server; required to obtain the source |
 
 ### Environment Setup
 
+The branch this guide describes exists only in the fork. `blitzy-226b0e2b-67da-4341-b2ee-58a436783f1b` is the head branch of PR #2 in `Blitzy-Sandbox/blitzy-odoo`; the branches API returns **200** for it there and **404** for the same name in `odoo/odoo`. Cloning upstream and then checking that branch out therefore cannot work, so step 1 clones the fork.
+
 ```bash
-# 1. Clone the repository
-git clone https://github.com/odoo/odoo.git
-cd odoo
+# 1. Clone the fork that carries this branch. The upstream
+#    odoo/odoo repository does not have it.
+git clone https://github.com/Blitzy-Sandbox/blitzy-odoo.git
+cd blitzy-odoo
 git checkout blitzy-226b0e2b-67da-4341-b2ee-58a436783f1b
 
 # 2. Create Python virtual environment
@@ -303,71 +298,66 @@ source venv/bin/activate
 # 3. Install Python dependencies
 pip install -r requirements.txt
 
-# 4. Verify the report dependencies pinned by
-#    requirements.txt are importable
+# 4. Verify the report dependencies pinned by requirements.txt are importable
 python -c "import xlsxwriter, xlrd, openpyxl"
 ```
 
 ### Database Setup
 
-```bash
-# 1. Create a least-privileged PostgreSQL role and
-#    the database it owns. --no-superuser and
-#    --no-createrole keep the application role off
-#    server-wide control; --createdb is the only
-#    elevated privilege Odoo needs, because its
-#    database manager creates and duplicates databases.
-sudo -u postgres createuser --createdb \
-    --no-createrole --no-superuser odoo
-sudo -u postgres createdb --owner=odoo \
-    odoo_enterprise_accounting
+Creating the role is only half the job: Odoo connects as `db_user` if that option is set, otherwise as `PGUSER`, otherwise as the invoking OS user. The binding is declared at [odoo/tools/config.py:L371-L374], where `--db_user` carries `env_name='PGUSER'` and `--db_password` carries `env_name='PGPASSWORD'`, and the resolution order is visible at [odoo/cli/server.py:L63] as `user = config['db_user'] or os.environ.get('PGUSER', 'default')`. Because the shell user is almost never named `odoo`, the role created in step 1 must be named explicitly, or every subsequent command connects as the wrong role and fails on the database it does not own. A password is set alongside it because the role is a password-authenticated login role rather than a peer-authenticated OS account.
 
-# 2. Initialize Odoo database
-./odoo-bin -d odoo_enterprise_accounting \
-    -i base --stop-after-init
+```bash
+# 1. Create a least-privileged PostgreSQL role and the database it owns.
+#    --no-superuser and --no-createrole keep the application role off server-wide
+#    control; --createdb is the only elevated privilege Odoo needs, because its
+#    database manager creates and duplicates databases.
+sudo -u postgres createuser --createdb --no-createrole --no-superuser --pwprompt odoo
+sudo -u postgres createdb --owner=odoo odoo_enterprise_accounting
+
+# 2. Point every later command at that role. Export it once for the shell
+#    session; the equivalent per-command form is --db_user=odoo --db_password=...
+export PGUSER=odoo
+export PGPASSWORD='the password entered at the --pwprompt above'
+
+# 3. Confirm the role and the server version before going further.
+#    The server must report 13 or higher (odoo/release.py MIN_PG_VERSION).
+psql -d odoo_enterprise_accounting -c "SELECT current_user, current_database(), current_setting('server_version');"
+
+# 4. Initialize Odoo database as that role
+./odoo-bin -d odoo_enterprise_accounting --db_user=odoo -i base --stop-after-init
 ```
+
+The `PGUSER` and `PGPASSWORD` exported in step 2 govern **every** `odoo-bin` and `psql` invocation in the sections that follow, so those commands need no further connection flags as long as they run in the same shell session. In a fresh session, either re-export the two variables or append `--db_user=odoo` together with `--db_password` to each `odoo-bin` command.
 
 ### Module Installation
 
 ```bash
 # 1. Install account module (dependency)
-./odoo-bin -d odoo_enterprise_accounting \
-    -i account --stop-after-init
+./odoo-bin -d odoo_enterprise_accounting -i account --stop-after-init
 
 # 2. Install financial reports module
-./odoo-bin -d odoo_enterprise_accounting \
-    -i account_financial_report_ce --stop-after-init
+./odoo-bin -d odoo_enterprise_accounting -i account_financial_report_ce --stop-after-init
 ```
 
 ### Running Odoo Server
 
 ```bash
-# Start the server and upgrade the financial
-# reports module
-./odoo-bin -d odoo_enterprise_accounting \
-    --addons-path=addons \
-    -u account_financial_report_ce
+# Start the server and upgrade the financial reports module
+./odoo-bin -d odoo_enterprise_accounting --addons-path=addons -u account_financial_report_ce
 
 # With specific port
-./odoo-bin -d odoo_enterprise_accounting \
-    --addons-path=addons --http-port=8069
+./odoo-bin -d odoo_enterprise_accounting --addons-path=addons --http-port=8069
 ```
 
 ### Running Tests
 
 ```bash
 # Run financial reports module tests
-./odoo-bin -d odoo_enterprise_accounting \
-    --test-enable --stop-after-init \
-    -i account_financial_report_ce
+./odoo-bin -d odoo_enterprise_accounting --test-enable --stop-after-init -i account_financial_report_ce
 
 # Run the native Odoo test suite under coverage
 pip install coverage
-coverage run \
-    --source=addons/account_financial_report_ce \
-    ./odoo-bin -d test_db \
-    --test-enable --stop-after-init \
-    -i account_financial_report_ce
+coverage run --source=addons/account_financial_report_ce ./odoo-bin -d test_db --test-enable --stop-after-init -i account_financial_report_ce
 coverage report
 ```
 
@@ -434,11 +424,11 @@ action = wizard.button_generate_report()
 
 ### Branch `pdlc` — PR #2, the change set this guide describes
 
-⚠️ Every figure in this table belongs to branch `pdlc`, not to the branch this guide is published on. `Lines Added` reads **27,905**, the figure carried by the authoritative PR #2 record.
+⚠️ Every figure in this table belongs to branch `pdlc`, not to the branch this guide is published on. Every value is taken from the authoritative PR #2 record of `Blitzy-Sandbox/blitzy-odoo` — `commits`, `changed_files` and `additions` on the pull request itself, and the per-file `additions` of its 81-entry file list for the language rows.
 
 | Metric | Value |
 |--------|-------|
-| Total Commits | 47 |
+| Total Commits | 49 |
 | Files Created | 81 |
 | Lines Added | 27,905 |
 | Documentation Files | 43 |
@@ -449,7 +439,7 @@ action = wizard.button_generate_report()
 
 ### Branch `19.0` — the original reconstructed pre-remediation agent-authored change set
 
-⚠️ Anchor to reality. The agent-authored change set originally reconstructed on branch `19.0` — what the branch carried before remediation began — is **13 commits, 6 files, 2,025 insertions, 0 deletions** over the fixed historical range `7bd7718bcd4c..c789a23602c2`, reproduced on this checkout by counting `git log --oneline` and reading `git diff --stat` over that range, where `7bd7718bcd4c` is the last upstream commit and `c789a23602c2` the last commit of that change set. Both endpoints are named rather than left as `HEAD` because the remediation commits that follow `c789a23602c2` add to every figure in the table below, so a moving upper bound no longer reports these values: the table is that fixed archaeology inventory rather than a census of the branch as it now stands. None of the `pdlc` figures above applies here.
+⚠️ Anchor to reality. The agent-authored change set originally reconstructed on branch `19.0` — what the branch carried before remediation began — is **13 commits, 6 files, 2,025 insertions, 0 deletions** over the fixed historical range `7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8`, reproduced on this checkout with `git log --oneline 7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8 | wc -l` and `git diff --stat 7bd7718bcd4c..c789a23602c24606458ee86783a318f7224d1dd8`, where `7bd7718bcd4c` is the last upstream commit and `c789a23602c2` the last commit of that change set. Both endpoints are named rather than left as `HEAD` because the remediation commits that follow `c789a23602c2` add to every figure in the table below, so a moving upper bound no longer reports these values: the table is that fixed archaeology inventory rather than a census of the branch as it now stands. None of the `pdlc` figures above applies here.
 
 | Metric | Value |
 |--------|-------|
@@ -464,32 +454,19 @@ action = wizard.button_generate_report()
 | XML LOC | 0 |
 | SCSS LOC | 0 |
 
-### Basis of the line counts — the two line-count tables are not comparable
+### Basis of the line counts
 
-The `Lines` column of the **Module Validation (36 files, branch `pdlc`)** table
-and the per-language rows of the **Branch `pdlc` — PR #2** table above measure
-different things over different populations. They are deliberately **not**
-reconciled to a single total, and they must not be cross-summed.
+Two populations are measured on branch `pdlc`, and mixing them is the mistake this note exists to prevent.
 
-| Table | Population it covers | What its numbers count | Column sum |
-|-------|----------------------|------------------------|------------|
-| Module Validation (36 files, branch `pdlc`) | the 36 files of `addons/account_financial_report_ce/` only | lines per module file group | 2,824 + 477 + 163 + 533 + 2,074 + 596 = **6,667** |
-| Branch `pdlc` — PR #2 | all 81 files the pull request changed, which includes the 43 Markdown documentation files | `Lines Added` over every changed file, plus three language rows scoped to Python, XML and SCSS only | Python 3,763 + XML 2,292 + SCSS 596 = **6,651**, against a `Lines Added` total of 27,905 |
+| Figure | Population | Authority |
+|--------|------------|-----------|
+| `Lines Added` **27,905** | all 81 files PR #2 changed, including the 43 Markdown documentation files and the two `blitzy/documentation/` files | the `additions` field of the pull request itself |
+| `Python LOC` **3,763**, `XML LOC` **2,292**, `SCSS LOC` **596** | only the 36 files of `addons/account_financial_report_ce/`, split by extension | the per-file `additions` of the pull request's 81-entry file list |
+| Module Validation `Lines` column, **6,667** | the same 36 module files, split by directory | the same per-file `additions` |
 
-Because the populations differ, **6,667 ≠ 6,651 is expected and is not an
-error**: the module figure covers a single addon, whereas `Lines Added` covers
-all 81 changed files and the three language rows cover only the code subset of
-them.
+So `3,763 + 2,292 + 596 + 16` (the CSV row) `= 6,667`, and the Module Validation table and the three language rows are two views of one measurement rather than two independent counts. The remaining `27,905 − 6,667 = 21,238` additions belong to the 45 non-module files, all of them Markdown — 43 under `tickets/` and 2 under `blitzy/documentation/` — and none of them code. That residual is obtained by subtraction from the pull-request total rather than by summing the file list, because the file-list endpoint reports no additions for 19 of those 45 documentation entries; all 36 module entries do report additions, so the module figures need no such treatment.
 
-⚠️ One residual is **reported rather than resolved**. The module table's four
-Python rows sum to 2,824 + 477 + 163 + 533 = **3,997**, which *exceeds* the
-`Python LOC` figure of **3,763** in the PR table. `addons/account_financial_report_ce/`
-is absent from branch `19.0` — `ls -d addons/account_financial_report_ce`
-reports *No such file or directory* on this checkout — so **neither figure can
-be re-measured here**, and no derivation reconciling the two can be verified
-from this branch. Both are therefore reproduced verbatim from the `pdlc`
-pull-request record, which is their only authority. Do not derive either table
-from the other, and do not read the difference as a corrected figure.
+Neither population is measurable on branch `19.0`: `ls -d addons/account_financial_report_ce` reports *No such file or directory* on this checkout, which is why every figure here is attributed to the pull-request record rather than re-derived locally.
 
 ---
 
@@ -604,7 +581,6 @@ On branch `pdlc`, the Enterprise Accounting Epic documentation project has succe
 3. **Zero Blocking Issues**: All code compiles successfully with no critical errors — a verdict recorded against the `pdlc` working tree; **it does not hold for `19.0`**, which contains none of that code
 
 The remaining 530 hours of work primarily involves:
-
 - Implementing full business logic in the Financial Reports module
 - Creating 5 additional modules following the documented user stories
 - Integration testing and deployment configuration

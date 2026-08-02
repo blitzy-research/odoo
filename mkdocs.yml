@@ -18,13 +18,32 @@ plugins:
   # top-level key is introduced.
   #
   # use_material_search: true selects mkdocs-material's search plugin instead
-  # of MkDocs' core SearchPlugin. techdocs-core registers whichever it is told
-  # to under the config key "search"; the core plugin's on_config appends the
-  # stock default-theme script search/main.js, which dereferences a global
-  # `base_url` that the Material theme never emits. The result was an uncaught
-  # ReferenceError on every page load, and a search worker that was never
-  # constructed. The Material plugin ships its search index through the theme
-  # bundle instead, so no stray script is emitted and no global is required.
+  # of MkDocs' core SearchPlugin. With the option off, that core plugin's
+  # on_config appends the stock default-theme script search/main.js, which
+  # dereferences a global `base_url` the Material theme never emits — an
+  # uncaught ReferenceError on every page load. The Material plugin ships its
+  # index through the theme bundle, so no stray script and no global is
+  # required.
+  #
+  # KNOWN RESIDUAL, deliberately not worked around here: neither setting of
+  # this option renders a search *control* on this package pairing.
+  # techdocs-core registers whichever plugin it selects under the key "search"
+  # (techdocs_core/core.py:L101), while the theme's header gates the control
+  # on the key "material/search" (material/.../partials/header.html:L48), so
+  # the condition can never hold. Three repository-side levers were measured
+  # and none is taken: declaring material/search is forbidden by the
+  # sole-plugin rule; a hooks: entry aliasing the key is out of reach, because
+  # hooks sits outside the generator's supported-key allowlist and is deleted
+  # before the portal build; and a theme.custom_dir override is an available
+  # key rather than a forbidden one — theme is allowlisted and techdocs-core
+  # preserves the override — but is declined, as a ninth top-level key
+  # encoding a workaround for a vendor key-name mismatch. The fix
+  # belongs in the portal-supplied bundle, and this configuration is its
+  # precondition — proven by registering the selected plugin under
+  # "material/search" in that package alone, which renders the control with
+  # this file byte-identical. Unmet, the cost is confined to standalone
+  # serving: Backstage removes .md-header wholesale and searches the
+  # search_index.json published here, which this option keeps valid.
   - techdocs-core:
       use_material_search: true
 markdown_extensions:
