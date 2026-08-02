@@ -2,42 +2,23 @@ apiVersion: backstage.io/v1alpha1
 kind: Component
 metadata:
   name: blitzy-odoo
-  # S5-02/S5-03 — authoritative repository description. mkdocs.yml's
-  # site_description and the opening line of docs/index.md are derived from this
-  # value and byte-identical to it; editing one alone reintroduces the
-  # divergence it replaces. "as planned direction" is load-bearing: the IBM
-  # Carbon redesign has no supporting code in the tree, so the claim is
-  # qualified as intent rather than asserted as delivered.
+  # Canonical description; keep mkdocs.yml and docs/index.md synchronized.
   description: Odoo 19.0 fork pursuing enterprise accounting parity — financial
     reporting engine and bank reconciliation — with an IBM Carbon Design System
     UI redesign as planned direction.
-  # S1-04 — tags are component classification only and carry no special
-  # semantics, so nothing else belongs here. `refactor` encoded a work type and
-  # moved to a label below; `security` and `audit` were dropped because no
-  # artifact in the repository substantiates either. FLAGGED FOR OWNER
-  # CONFIRMATION — that removal may drop signal the owner intended.
   tags:
   - python
   - web-app
-  # Labels carry the non-classification claims. The status label restores the
-  # in-progress signal commit 89bf914d81fe deleted while leaving
-  # lifecycle: production in place; work-type is the relocated `refactor` claim.
   labels:
     blitzy.com/language: python
     blitzy.com/status: in-progress
     blitzy.com/work-type: refactor
-  # INVARIANT — leave both annotations alone. techdocs-ref is a path relative to
-  # this descriptor at which the site configuration is found, and `dir:.` is the
-  # documented form for a configuration co-located with it: mkdocs.yml stays at
-  # the repository root, so the documentation relocation moved docs_dir *inside*
-  # that file, not the file itself. source-location points at the branch root,
-  # not the documentation folder, so the relocation does not affect it either.
+  # `dir:.` resolves the root-level mkdocs.yml; source-location remains the
+  # branch root.
   annotations:
     backstage.io/techdocs-ref: dir:.
     github.com/project-slug: Blitzy-Sandbox/blitzy-odoo
     backstage.io/source-location: url:https://github.com/Blitzy-Sandbox/blitzy-odoo/tree/19.0/
-  # Links take a required url plus optional title, icon and type. All three now
-  # carry an icon (S1-06) and all three resolve to HTTP 200.
   links:
   - url: https://github.com/Blitzy-Sandbox/blitzy-odoo
     title: GitHub Repository
@@ -45,27 +26,14 @@ metadata:
   - url: https://github.com/Blitzy-Sandbox/blitzy-odoo/pull/2
     title: 'PR #2: Enterprise Accounting Docs & Reports Scaffold'
     icon: github
-  # S1-01 — repointed off the `blitzy/documentation` tree path, which is tracked
-  # nowhere and returned HTTP 404. This URL is the third leg of the lockstep
-  # triangle it forms with mkdocs.yml's docs_dir and edit_uri; all three must
-  # name the same `docs` root.
+  # Keep this URL aligned with mkdocs.yml's docs_dir and edit_uri.
   - url: https://github.com/Blitzy-Sandbox/blitzy-odoo/tree/19.0/docs
     title: Blitzy Documentation
     icon: docs
 spec:
-  # S1-03 — `service` is the well-known value for a deployable application
-  # server, which is what Odoo is; the vocabulary is service/website/library.
-  # FLAGGED FOR OWNER CONFIRMATION — a taxonomy judgement, not a defect with one
-  # provable answer, and fully reversible in this single line.
   type: service
-  # S1-02 — `experimental` is the well-known value for an early, non-production
-  # component with low or no reliability guarantees, where `production` asserts
-  # an established, maintained one. The project guide records 17% completion
-  # (110 of 640 hours), which contradicts `production`.
   lifecycle: experimental
-  # S1-05 — deliberately unchanged. These generate ownership and parent
-  # relations resolving against portal-side Group and System entities this
-  # repository cannot define, so the finding is discharged as a portal
-  # prerequisite in docs/change-archaeology-and-review.md, not by editing here.
+  # The referenced Group and System are portal-managed entities and must
+  # exist there.
   owner: blitzy-sandbox
   system: blitzy-python
