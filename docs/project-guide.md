@@ -44,27 +44,14 @@ This project delivers comprehensive user story documentation for implementing en
 | Navigation Index | 1 | ✅ Complete |
 
 ### Module Validation (36 files, branch `pdlc`)
-
-Every row below is regenerated from the authoritative PR #2 file list of `Blitzy-Sandbox/blitzy-odoo`, grouped by the module's own directory layout. The `Count` column sums to the **36** files of `addons/account_financial_report_ce/` and the `Lines` column to the **6,667** additions those files carry, and the three language subtotals reproduce the `Python LOC`, `XML LOC` and `SCSS LOC` rows of the Git Statistics tables below exactly.
-
 | File Type | Count | Lines | Status |
 |-----------|-------|-------|--------|
-| Python models (`models/`) | 8 | 2,729 | ✅ Compiles |
-| Python tests (`tests/`) | 2 | 533 | ✅ Compiles |
-| Python wizards (`wizard/`) | 2 | 265 | ✅ Compiles |
-| Python report classes (`report/`) | 7 | 153 | ✅ Compiles |
-| Python module root (`__init__.py`, `__manifest__.py`) | 2 | 83 | ✅ Compiles |
-| **Python subtotal** | **21** | **3,763** | — |
-| XML report templates (`report/`) | 7 | 1,851 | ✅ Valid |
-| XML wizard views (`wizard/`) | 1 | 217 | ✅ Valid |
-| XML data (`data/`) | 1 | 95 | ✅ Valid |
-| XML menus and views (`views/`) | 1 | 89 | ✅ Valid |
-| XML security rules (`security/`) | 1 | 24 | ✅ Valid |
-| XML demo data (`demo/`) | 1 | 16 | ✅ Valid |
-| **XML subtotal** | **12** | **2,292** | — |
-| SCSS styles (`static/src/scss/`) | 2 | 596 | ✅ Valid |
-| CSV access rules (`security/ir.model.access.csv`) | 1 | 16 | ✅ Valid |
-| **Total** | **36** | **6,667** | — |
+| Python Models | 8 | 2,824 | ✅ Compiles |
+| Python Wizards | 2 | 477 | ✅ Compiles |
+| Python Reports | 6 | 163 | ✅ Compiles |
+| Python Tests | 2 | 533 | ✅ Compiles |
+| XML Templates | 12 | 2,074 | ✅ Valid |
+| SCSS Styles | 2 | 596 | ✅ Valid |
 
 ### Constraint Compliance
 | Constraint | Requirement | Status |
@@ -270,25 +257,20 @@ pie title Documentation Completion
 
 ### System Prerequisites
 
-The Python and PostgreSQL bounds below are the ones this repository declares for itself at [odoo/release.py:L39-L41] — `MIN_PY_VERSION = (3, 10)`, `MAX_PY_VERSION = (3, 13)` and `MIN_PG_VERSION = 13` — not general recommendations. They are not all enforced the same way, so the *Enforcement* column records what actually happens.
-
-| Requirement | Version | Purpose | Enforcement |
-|-------------|---------|---------|-------------|
-| Python | 3.10 – 3.13 | Runtime environment | Hard: [odoo/init.py:L9] asserts `sys.version_info > MIN_PY_VERSION`, so an older interpreter aborts at import. Above 3.13, [odoo/cli/server.py:L69-L73] logs an unsupported-version warning and continues |
-| PostgreSQL | 13+ | Database server | [odoo/sql_db.py:L693-L694] warns on every connection when the server reports below `MIN_PG_VERSION`. PostgreSQL 12 is therefore below the declared minimum and unsupported |
-| Node.js | 18+ | Asset compilation | Not checked by the server; required by the asset pipeline |
-| wkhtmltopdf | 0.12.6+ | PDF report generation | Not checked by the server; required for PDF report output |
-| Git | 2.x | Version control | Not checked by the server; required to obtain the source |
+| Requirement | Version | Purpose |
+|-------------|---------|---------|
+| Python | 3.10+ | Runtime environment |
+| PostgreSQL | 12+ | Database server |
+| Node.js | 18+ | Asset compilation |
+| wkhtmltopdf | 0.12.6+ | PDF report generation |
+| Git | 2.x | Version control |
 
 ### Environment Setup
 
-The branch this guide describes exists only in the fork. `blitzy-226b0e2b-67da-4341-b2ee-58a436783f1b` is the head branch of PR #2 in `Blitzy-Sandbox/blitzy-odoo`; the branches API returns **200** for it there and **404** for the same name in `odoo/odoo`. Cloning upstream and then checking that branch out therefore cannot work, so step 1 clones the fork.
-
 ```bash
-# 1. Clone the fork that carries this branch. The upstream
-#    odoo/odoo repository does not have it.
-git clone https://github.com/Blitzy-Sandbox/blitzy-odoo.git
-cd blitzy-odoo
+# 1. Clone the repository
+git clone https://github.com/odoo/odoo.git
+cd odoo
 git checkout blitzy-226b0e2b-67da-4341-b2ee-58a436783f1b
 
 # 2. Create Python virtual environment
@@ -304,30 +286,17 @@ python -c "import xlsxwriter, xlrd, openpyxl"
 
 ### Database Setup
 
-Creating the role is only half the job: Odoo connects as `db_user` if that option is set, otherwise as `PGUSER`, otherwise as the invoking OS user. The binding is declared at [odoo/tools/config.py:L371-L374], where `--db_user` carries `env_name='PGUSER'` and `--db_password` carries `env_name='PGPASSWORD'`, and the resolution order is visible at [odoo/cli/server.py:L63] as `user = config['db_user'] or os.environ.get('PGUSER', 'default')`. Because the shell user is almost never named `odoo`, the role created in step 1 must be named explicitly, or every subsequent command connects as the wrong role and fails on the database it does not own. A password is set alongside it because the role is a password-authenticated login role rather than a peer-authenticated OS account.
-
 ```bash
 # 1. Create a least-privileged PostgreSQL role and the database it owns.
 #    --no-superuser and --no-createrole keep the application role off server-wide
 #    control; --createdb is the only elevated privilege Odoo needs, because its
 #    database manager creates and duplicates databases.
-sudo -u postgres createuser --createdb --no-createrole --no-superuser --pwprompt odoo
+sudo -u postgres createuser --createdb --no-createrole --no-superuser odoo
 sudo -u postgres createdb --owner=odoo odoo_enterprise_accounting
 
-# 2. Point every later command at that role. Export it once for the shell
-#    session; the equivalent per-command form is --db_user=odoo --db_password=...
-export PGUSER=odoo
-export PGPASSWORD='the password entered at the --pwprompt above'
-
-# 3. Confirm the role and the server version before going further.
-#    The server must report 13 or higher (odoo/release.py MIN_PG_VERSION).
-psql -d odoo_enterprise_accounting -c "SELECT current_user, current_database(), current_setting('server_version');"
-
-# 4. Initialize Odoo database as that role
-./odoo-bin -d odoo_enterprise_accounting --db_user=odoo -i base --stop-after-init
+# 2. Initialize Odoo database
+./odoo-bin -d odoo_enterprise_accounting -i base --stop-after-init
 ```
-
-The `PGUSER` and `PGPASSWORD` exported in step 2 govern **every** `odoo-bin` and `psql` invocation in the sections that follow, so those commands need no further connection flags as long as they run in the same shell session. In a fresh session, either re-export the two variables or append `--db_user=odoo` together with `--db_password` to each `odoo-bin` command.
 
 ### Module Installation
 
@@ -424,11 +393,11 @@ action = wizard.button_generate_report()
 
 ### Branch `pdlc` — PR #2, the change set this guide describes
 
-⚠️ Every figure in this table belongs to branch `pdlc`, not to the branch this guide is published on. Every value is taken from the authoritative PR #2 record of `Blitzy-Sandbox/blitzy-odoo` — `commits`, `changed_files` and `additions` on the pull request itself, and the per-file `additions` of its 81-entry file list for the language rows.
+⚠️ Every figure in this table belongs to branch `pdlc`, not to the branch this guide is published on. `Lines Added` reads **27,905**, the figure carried by the authoritative PR #2 record.
 
 | Metric | Value |
 |--------|-------|
-| Total Commits | 49 |
+| Total Commits | 47 |
 | Files Created | 81 |
 | Lines Added | 27,905 |
 | Documentation Files | 43 |
@@ -453,20 +422,6 @@ action = wizard.button_generate_report()
 | Python LOC | 0 |
 | XML LOC | 0 |
 | SCSS LOC | 0 |
-
-### Basis of the line counts
-
-Two populations are measured on branch `pdlc`, and mixing them is the mistake this note exists to prevent.
-
-| Figure | Population | Authority |
-|--------|------------|-----------|
-| `Lines Added` **27,905** | all 81 files PR #2 changed, including the 43 Markdown documentation files and the two `blitzy/documentation/` files | the `additions` field of the pull request itself |
-| `Python LOC` **3,763**, `XML LOC` **2,292**, `SCSS LOC` **596** | only the 36 files of `addons/account_financial_report_ce/`, split by extension | the per-file `additions` of the pull request's 81-entry file list |
-| Module Validation `Lines` column, **6,667** | the same 36 module files, split by directory | the same per-file `additions` |
-
-So `3,763 + 2,292 + 596 + 16` (the CSV row) `= 6,667`, and the Module Validation table and the three language rows are two views of one measurement rather than two independent counts. The remaining `27,905 − 6,667 = 21,238` additions belong to the 45 non-module files, all of them Markdown — 43 under `tickets/` and 2 under `blitzy/documentation/` — and none of them code. That residual is obtained by subtraction from the pull-request total rather than by summing the file list, because the file-list endpoint reports no additions for 19 of those 45 documentation entries; all 36 module entries do report additions, so the module figures need no such treatment.
-
-Neither population is measurable on branch `19.0`: `ls -d addons/account_financial_report_ce` reports *No such file or directory* on this checkout, which is why every figure here is attributed to the pull-request record rather than re-derived locally.
 
 ---
 

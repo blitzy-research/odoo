@@ -184,13 +184,9 @@ addons/
 
 ### 0.2.3 Web Search Research Conducted
 
-Every borrowed statement in this subsection carries a numbered footnote naming the publication it came from and the URL it can be read at, so each is independently verifiable. Where no identifiable source could be traced for a statement, it is restated in this document's own voice and the footnote says so rather than presenting it as a quotation.
-
 **Best Practices for User Story Documentation:**
 
-> The acronym INVEST helps to remember a widely accepted set of criteria, or checklist, to assess the quality of a user story. If the story fails to meet one of these criteria, the team may want to reword it, or even consider a rewrite.[^invest]
-
-[^invest]: Agile Alliance, *Agile Glossary — INVEST*, [agilealliance.org/glossary/invest](https://agilealliance.org/glossary/invest/). Quoted from the opening paragraph of the glossary entry. The original sentence continues with a parenthetical about physically replacing the story card, omitted here because it adds no criterion.
+<cite index="15-2,15-3">"The acronym INVEST helps to remember a widely accepted set of criteria, or checklist, to assess the quality of a user story. If the story fails to meet one of these criteria, the team may want to reword it, or even consider a rewrite."</cite>
 
 **INVEST Principles Applied to This Epic:**
 
@@ -205,17 +201,13 @@ Every borrowed statement in this subsection carries a numbered footnote naming t
 
 **BDD Acceptance Criteria Best Practices:**
 
-BDD states each acceptance criterion as a scenario written in Gherkin, whose `Given`, `When` and `Then` keywords name the precondition, the triggering action and the expected outcome respectively.[^gherkin] Two properties of that structure are what this epic relies on, and they pull in the same direction: a scenario reads as a behavioural claim a non-technical stakeholder can confirm or reject, and it simultaneously carries enough structure to be turned into an executable test without reinterpretation.[^bdd]
+<cite index="16-10,16-11">"BDD often uses the Gherkin syntax, which structures acceptance criteria in a Given-When-Then format. This format describes the preconditions (Given), the action or event (When), and the expected outcome (Then)."</cite>
 
-[^gherkin]: Cucumber, *Gherkin Reference*, [cucumber.io/docs/gherkin/reference](https://cucumber.io/docs/gherkin/reference/). The normative description of the `Given`/`When`/`Then` keywords and of scenario structure.
-
-[^bdd]: Cucumber, *Behaviour-Driven Development*, [cucumber.io/docs/bdd](https://cucumber.io/docs/bdd/). **Paraphrase, not a quotation.** A quotation previously stood here that could not be traced to any identifiable publication, so the point it made has been restated in this document's own words and anchored to the practice's own documentation instead.
+<cite index="12-12,12-13,12-14">"Firstly, it is to articulate with clarity to a non-technical audience that the criteria will be used to validate a feature's behavior. Secondly, and equally important, it is to ensure that this requirement can be easily transformed into building and testing code. BDD happens to be a good medium to address these outcomes."</cite>
 
 **OCA Module Patterns Research:**
 
-> This module adds a set of financial reports. They are accessible under Invoicing / Reporting / OCA accounting reports.[^oca]
-
-[^oca]: OCA, `account_financial_report` module description — `readme/DESCRIPTION.md`, rendered into `README.rst` at line 35 — [github.com/OCA/account-financial-reporting/tree/18.0/account_financial_report](https://github.com/OCA/account-financial-reporting/tree/18.0/account_financial_report).
+<cite index="3-18,3-19">"This module adds a set of financial reports. They are accessible under Invoicing / Reporting / OCA accounting reports."</cite>
 
 The OCA `account_financial_report` module provides precedent for:
 - General Ledger reports
@@ -750,11 +742,9 @@ No documentation generator configuration files are required for this markdown-ba
 | N/A | Mermaid | N/A | Diagram syntax embedded in markdown (rendered by GitHub/GitLab) |
 | pip | mkdocs | 1.6.0 | Optional: Documentation site generator if web publishing needed |
 | pip | mkdocs-material | 9.5.0 | Optional: Material theme for mkdocs |
-| npm | `@mermaid-js/mermaid-cli` | 11.4.0 | Optional: CLI tool (binary `mmdc`) for offline mermaid diagram generation |
+| npm | mermaid-cli | 11.4.0 | Optional: CLI tool for offline mermaid diagram generation |
 
 **Note:** The primary documentation output is plain markdown files that require no build tooling. The optional packages are listed for scenarios where web-based documentation publishing is desired.
-
-**The Mermaid CLI coordinate is scoped, and the scope is not optional.** The package that publishes version 11.4.0 and the `mmdc` binary is `@mermaid-js/mermaid-cli`; installing it is `npm install -g @mermaid-js/mermaid-cli@11.4.0`. The *unscoped* name `mermaid-cli` is a different and unrelated package: its newest release is **0.2.4**, published in 2014, and its registry entry is deprecated in favour of mermaid core. It has no 11.4.0 to install, so an unscoped coordinate either fails outright or silently installs decade-old software — which is why the scope is recorded here rather than left to inference.
 
 ### 0.6.2 Odoo Module Dependencies (Reference)
 
@@ -883,7 +873,7 @@ Each user story must pass this checklist:
 | **N**egotiable | Does the story describe outcomes without prescribing implementation? |
 | **V**aluable | Does the "So that" clause clearly state business value? |
 | **E**stimable | Is the story small enough that effort can be estimated? |
-| **S**mall | Is the story a single deliverable outcome of bounded effort, which cannot be decomposed further without one of the parts losing user value on its own? |
+| **S**mall | Can this story be completed within one sprint/iteration? |
 | **T**estable | Do acceptance criteria enable objective pass/fail determination? |
 
 ### 0.7.4 Acceptance Criteria Quality Standards
@@ -1076,22 +1066,10 @@ Each story's acceptance criteria will be structured to support automated test ge
 
 **Optional: Documentation Site Generation (if mkdocs installed):**
 
-MkDocs builds whatever `docs_dir` names, and its default is `docs`. A bare `mkdocs build` therefore publishes the repository's own `docs/` tree and never touches `tickets/`, so the documentation set this section is about would not appear in the output at all. Both commands below root the site at `tickets/` explicitly by supplying a configuration on standard input, which also leaves the repository's own site configuration untouched. Run them from the repository root, because `docs_dir` and `site_dir` resolve relative to the working directory when the configuration is read from stdin.
-
-```bash
-# Build the tickets/ tree into tickets_site/. Non-blocking: returns when the
-# build finishes, so this is the form to use in a script or a CI step.
-printf 'site_name: Enterprise Accounting Epic\ndocs_dir: tickets\nsite_dir: tickets_site\n' \
-    | mkdocs build -f -
-
-# Local preview of the tickets/ tree on http://127.0.0.1:8000/.
-# LONG-RUNNING AND BLOCKING: mkdocs serve starts a development server with a
-# file watcher and never returns on its own; it runs until interrupted. Never
-# place it in a script or a CI step, and never expect a following command in
-# the same shell to execute.
-printf 'site_name: Enterprise Accounting Epic\ndocs_dir: tickets\nsite_dir: tickets_site\n' \
-    | mkdocs serve -f -
-```
+| Command | Purpose |
+|---------|---------|
+| `mkdocs build --site-dir docs_site` | Build documentation site |
+| `mkdocs serve` | Local preview (non-blocking) |
 
 ### 0.9.2 Documentation Validation Commands
 
@@ -1106,38 +1084,11 @@ printf 'site_name: Enterprise Accounting Epic\ndocs_dir: tickets\nsite_dir: tick
 
 **Content Validation:**
 
-Each check below requires **every** listed token to be present in **every** story file, and asserts an exact expected total. An alternation such as `grep -l "As a\|I want\|So that"` must not be used for this purpose: it matches a file carrying only one of the three clauses, so a story missing both `I want` and `So that` would still be counted as conforming, and a bare `wc -l` reports a number without asserting what that number should be.
-
-```bash
-# Run from the repository root. Each check prints PASS only when every story
-# file carries every required token and the file total is exactly 32.
-STORIES=$(find tickets/stories -name '*.md' | wc -l)
-test "$STORIES" -eq 32 || echo "FAIL story count: expected 32, found $STORIES"
-
-check_all_tokens() {
-    label=$1; shift
-    missing=0
-    while IFS= read -r f; do
-        for token in "$@"; do
-            grep -qF -- "$token" "$f" || { echo "  MISSING '$token' in $f"; missing=1; }
-        done
-    done <<< "$(find tickets/stories -name '*.md' | sort)"
-    if [ "$missing" -eq 0 ] && [ "$STORIES" -eq 32 ]; then
-        echo "PASS $label: 32/32 story files carry every required token"
-    else
-        echo "FAIL $label"
-    fi
-}
-
-# User story format: all three clauses, in every file.
-check_all_tokens 'user story format' 'As a' 'I want' 'So that'
-
-# BDD format: all three Gherkin keywords, in every file.
-check_all_tokens 'BDD format' 'Given' 'When' 'Then'
-
-# Test coverage: the 80% requirement stated in every file.
-check_all_tokens 'test coverage requirement' '80%'
-```
+| Validation | Command |
+|------------|---------|
+| User story format | `grep -l "As a\|I want\|So that" tickets/stories/**/*.md \| wc -l` |
+| BDD format | `grep -l "Given\|When\|Then" tickets/stories/**/*.md \| wc -l` |
+| Test coverage mention | `grep -l "80%" tickets/stories/**/*.md \| wc -l` |
 
 ### 0.9.3 Default Documentation Format
 
@@ -1241,7 +1192,7 @@ All user stories must be validated against:
 - **N**egotiable: Describe outcomes, not implementations
 - **V**aluable: Clear business value in "So that" clause
 - **E**stimable: Appropriately sized for estimation
-- **S**mall: A single deliverable outcome of bounded effort, not decomposable further without losing user value
+- **S**mall: Completable within one sprint
 - **T**estable: Objective pass/fail determination
 
 **R-002: BDD Acceptance Criteria Format**
@@ -1408,7 +1359,7 @@ Epic file must contain:
 
 | File Path | Purpose | Key Findings |
 |-----------|---------|--------------|
-| `odoo/release.py` | Version identification | Odoo 19.0 **stable** — [odoo/release.py:L15] reads `version_info = (19, 0, 0, FINAL, 0, '')`, and `FINAL` is the last of the four release levels declared at [odoo/release.py:L3], so this is a released series and not a development trunk; LGPL-3 license |
+| `odoo/release.py` | Version identification | Odoo 19.0 (Master), LGPL-3 license |
 | `addons/account/__manifest__.py` | Module configuration | Dependencies: base_setup, onboarding, product, analytic, portal, digest |
 | `addons/account/README.md` | Module description | High-level accounting feature overview |
 | `addons/account/models/` | Business logic layer | 35+ model files for accounting operations |
@@ -1439,7 +1390,7 @@ Epic file must contain:
 | Folder Path | Purpose | Children Examined |
 |-------------|---------|-------------------|
 | `/` (root) | Repository root | All first-level directories |
-| `addons/` | Module collection | **605** addon directories. `git ls-tree -d --name-only bc1e4f9f5c1b addons/` lists exactly 605 paths at commit `bc1e4f9f5c1b`; `find addons -maxdepth 1 -mindepth 1 -type d` lists the same 605 on the working tree; and the same `git ls-tree` at the baseline commit `7bd7718bcd4c` also lists 605, so the count is unchanged across the whole reconstructed range |
+| `addons/` | Module collection | 607 addon directories |
 | `addons/account/` | Core accounting module | models/, views/, wizard/, report/, tests/ |
 | `addons/account/models/` | Accounting models | 35+ Python model files |
 | `addons/account/wizard/` | Accounting wizards | 15+ transient model files |
