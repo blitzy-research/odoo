@@ -64,6 +64,44 @@ markdown_extensions:
   # file. Quoting the tag as a string is NOT the equivalent fix: that hands
   # SuperFences a string where it expects a callable, silently breaking the
   # fence and returning the diagrams to highlighted plain text.
+  #
+  # SEC-02 — SECURITY DISPOSITION, recorded here because this is the exact
+  # location the finding cites. `class: mermaid` is the selector the Material
+  # 9.7.6 bundle matches on (`pre.mermaid`), so every diagram-bearing page
+  # makes that bundle fetch and execute
+  # https://unpkg.com/mermaid@11/dist/mermaid.min.js — a floating
+  # major-version alias, ~3.57 MB, no digest, no integrity attribute, issued
+  # in a request mode that makes integrity checking structurally impossible —
+  # and latently https://unpkg.com/resize-observer-polyfill, which carries no
+  # version specifier at all. Both URLs are compiled into the vendor theme
+  # bundle (assets/javascripts/bundle.79ae519e.min.js, 114,308 bytes); this
+  # file authors neither, and the published pages carry no CSP.
+  #
+  # The finding stays OPEN and is deliberately NOT claimed closed here. It is
+  # the third portal-side prerequisite in section 7 of
+  # docs/change-archaeology-and-review.md, whose subsection 7.2 carries the
+  # measured evidence a portal operator needs, including the
+  # subresource-integrity value of the concrete release measured. Four
+  # repository-side levers were exhausted, each declined for a named reason
+  # rather than for lack of capability:
+  #   1. Self-host the runtime beside the site. Needs `extra_javascript`,
+  #      which sits outside the publisher's supported-key allowlist and is
+  #      deleted before the portal build. Fails on capability.
+  #   2. Enable mkdocs-material's own privacy plugin, which downloads
+  #      external assets at build time and rewrites them to local copies. It
+  #      ships with the installed theme and it does work. But it is a second
+  #      entry under `plugins`, and AAP 0.8.1 requires techdocs-core to
+  #      remain the sole declared plugin, as does the `plugins` row of AAP
+  #      0.6.3. Fails on scope; closing it needs separate authorisation.
+  #   3. Rename or drop this fence so no runtime is ever requested. That
+  #      re-opens blocker S2-02, so it is not a fix at all.
+  #   4. Convert the seven diagrams to a notation techdocs-core renders
+  #      server-side. AAP 0.5.1 considered and rejected exactly that in
+  #      favour of this fence, AAP 0.5.5 keeps it only as a contingency, and
+  #      it would be an unenumerated edit to two plan-protected documents.
+  # The sole declared plugin offers no lever either: its whole option surface
+  # is use_material_search and use_pymdownx_blocks (techdocs_core/core.py
+  # L37-L38), neither of which touches the runtime origin.
   - pymdownx.superfences:
       custom_fences:
         - name: mermaid
