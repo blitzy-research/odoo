@@ -73,12 +73,15 @@ pie title Project Hours Breakdown
 ```
 
 ```mermaid
+%% Slice order keeps the two single-file categories apart so their identical 2%
+%% labels cannot collide across the 12 o'clock boundary. Every datum is
+%% unchanged: 1 + 6 + 32 + 1 + 3 = 43 files.
 pie title Documentation Completion
     "Epic" : 1
     "Features" : 6
     "Stories" : 32
-    "Templates" : 3
     "Index" : 1
+    "Templates" : 3
 ```
 
 ---
@@ -107,6 +110,7 @@ pie title Documentation Completion
 **Current State**: Module scaffold exists with model structure, wizard, and report templates.
 
 **Action Steps**:
+
 1. Implement full business logic in `balance_sheet.py` (compute GAAP/IFRS compliant totals)
 2. Implement full business logic in `profit_loss.py` (compute income/expense categorization)
 3. Implement full business logic in `cash_flow.py` (compute operating/investing/financing activities)
@@ -119,6 +123,7 @@ pie title Documentation Completion
 10. Execute test suite and achieve 80% coverage
 
 **Files to Modify**:
+
 - `addons/account_financial_report_ce/models/*.py`
 - `addons/account_financial_report_ce/report/*.py`
 - `addons/account_financial_report_ce/tests/test_financial_reports.py`
@@ -131,6 +136,7 @@ pie title Documentation Completion
 **Reference Stories**: BR-001 through BR-005
 
 **Action Steps**:
+
 1. Create module scaffold following `account_financial_report_ce` pattern
 2. Implement statement import wizard (CSV, OFX, QIF, CAMT.053 formats)
 3. Develop algorithmic matching engine with confidence scoring
@@ -140,6 +146,7 @@ pie title Documentation Completion
 7. Create comprehensive test suite (80% coverage)
 
 **Dependencies**: 
+
 - `account.bank.statement` model
 - `account.reconcile.model` patterns
 - OCA `account_reconcile_oca` for reference
@@ -152,6 +159,7 @@ pie title Documentation Completion
 **Reference Stories**: BM-001 through BM-005
 
 **Action Steps**:
+
 1. Create `account_budget_ce` module scaffold
 2. Implement budget definition models with analytic dimension support
 3. Create period allocation wizard (monthly/quarterly/annual)
@@ -161,6 +169,7 @@ pie title Documentation Completion
 7. Create comprehensive test suite (80% coverage)
 
 **Dependencies**:
+
 - `account.analytic.account` model
 - `account.analytic.plan` model
 
@@ -172,6 +181,7 @@ pie title Documentation Completion
 **Reference Stories**: AM-001 through AM-006
 
 **Action Steps**:
+
 1. Create `account_asset_ce` module scaffold
 2. Implement asset registration from purchase invoices
 3. Create depreciation configuration (straight-line, declining balance, units of production)
@@ -182,6 +192,7 @@ pie title Documentation Completion
 8. Create comprehensive test suite (80% coverage)
 
 **Dependencies**:
+
 - `account.move` model for journal entries
 - `product.product` model for asset classification
 
@@ -193,6 +204,7 @@ pie title Documentation Completion
 **Reference Stories**: DR-001 through DR-004
 
 **Action Steps**:
+
 1. Create `account_deferred_revenue_ce` module scaffold
 2. Implement deferral schedule definition models
 3. Create automatic period allocation engine (ASC 606/IFRS 15 compliant)
@@ -201,6 +213,7 @@ pie title Documentation Completion
 6. Create comprehensive test suite (80% coverage)
 
 **Dependencies**:
+
 - `account.move` model
 - `account.move.line` model
 
@@ -212,6 +225,7 @@ pie title Documentation Completion
 **Reference Stories**: PF-001 through PF-005
 
 **Action Steps**:
+
 1. Create `account_followup_ce` module scaffold
 2. Implement follow-up level configuration
 3. Create automated email generation with templates
@@ -221,6 +235,7 @@ pie title Documentation Completion
 7. Create comprehensive test suite (80% coverage)
 
 **Dependencies**:
+
 - `res.partner` model
 - `mail.template` model
 - `account.move` model
@@ -231,6 +246,7 @@ pie title Documentation Completion
 **Priority**: Medium | **Severity**: Medium
 
 **Action Steps**:
+
 1. Create integration test suite spanning all 6 modules
 2. Test cross-module workflows (e.g., asset purchase → depreciation → financial reports)
 3. Validate data consistency across reporting modules
@@ -244,6 +260,7 @@ pie title Documentation Completion
 **Priority**: Low | **Severity**: Medium
 
 **Action Steps**:
+
 1. Create Docker deployment configuration
 2. Write installation guide with prerequisites
 3. Configure CI/CD pipeline for automated testing
@@ -540,6 +557,7 @@ On branch `pdlc`, the Enterprise Accounting Epic documentation project has succe
 3. **Zero Blocking Issues**: All code compiles successfully with no critical errors — a verdict recorded against the `pdlc` working tree; **it does not hold for `19.0`**, which contains none of that code
 
 The remaining 530 hours of work primarily involves:
+
 - Implementing full business logic in the Financial Reports module
 - Creating 5 additional modules following the documented user stories
 - Integration testing and deployment configuration
