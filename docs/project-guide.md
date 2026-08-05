@@ -66,23 +66,56 @@ This project delivers comprehensive user story documentation for implementing en
 
 ## Visual Representation
 
-```mermaid
-pie title Project Hours Breakdown
-    "Completed Work" : 110
-    "Remaining Work" : 530
-```
+⚠️ **Why these are tables and not pie charts.** Both distributions were
+previously drawn by a client-side diagram runtime fetched from a third-party
+origin. That arrangement failed on four separate counts, each measured rather
+than asserted: the two 2% slice labels rendered wider than the arcs they
+belonged to and were crossed by their own divider strokes; the slice fills and
+their legend swatches measured between 1.01:1 and 1.83:1 against the page
+background and between 1.04:1 and 1.51:1 against each other, so neither the
+slices nor the legend could be told apart; the mapping from slice to category
+was carried by colour alone with no pattern or direct label; and neither chart
+exposed any accessible name or description. Published as data tables the same
+figures carry every value exactly, stay legible at every viewport width from
+320 px upward, need no script at all, and survive a network outage. Every
+datum below is unchanged from the charts they replace.
 
-```mermaid
-%% Slice order keeps the two single-file categories apart so their identical 2%
-%% labels cannot collide across the 12 o'clock boundary. Every datum is
-%% unchanged: 1 + 6 + 32 + 1 + 3 = 43 files.
-pie title Documentation Completion
-    "Epic" : 1
-    "Features" : 6
-    "Stories" : 32
-    "Index" : 1
-    "Templates" : 3
-```
+**Percentages are given to one decimal place, and that is deliberate.** Rounded
+to whole numbers the five documentation shares read 2%, 14%, 74%, 2% and 7% and
+total **99%**, which is the rounding artefact the charts displayed without
+qualification. At one decimal place the same five shares total exactly
+**100.0%**. Absolute counts are given alongside every share so the reader never
+depends on a rounded figure.
+
+**Figure 1 — Project hours breakdown (branch `pdlc`).** Effort recorded as
+complete against effort still outstanding, out of a 640-hour total.
+
+| Category | Hours | Share of total |
+|----------|------:|---------------:|
+| Completed work | 110 | 17.2% |
+| Remaining work | 530 | 82.8% |
+| **Total** | **640** | **100.0%** |
+
+Remaining work is the larger part by a factor of roughly 4.8 to 1: 530 of the
+640 hours are still outstanding, which is the same 17.2% completion figure the
+Executive Summary states.
+
+**Figure 2 — Documentation deliverable mix (43 files, branch `pdlc`).** How the
+43-file documentation set divides by artifact type.
+
+| Artifact type | Files | Share of the 43 |
+|---------------|------:|----------------:|
+| User stories | 32 | 74.4% |
+| Feature specifications | 6 | 14.0% |
+| Templates | 3 | 7.0% |
+| Epic document | 1 | 2.3% |
+| Navigation index | 1 | 2.3% |
+| **Total** | **43** | **100.0%** |
+
+User stories dominate the set at just under three quarters of it; the epic
+document and the navigation index are one file each, which is why their shares
+are identical. Rows are ordered largest share first, so the two single-file
+categories no longer sit adjacent to a boundary that made their labels collide.
 
 ---
 
@@ -276,18 +309,28 @@ pie title Documentation Completion
 
 | Requirement | Version | Purpose |
 |-------------|---------|---------|
-| Python | 3.10+ | Runtime environment |
-| PostgreSQL | 12+ | Database server |
+| Python | 3.10–3.13 | Runtime environment |
+| PostgreSQL | 13+ | Database server |
 | Node.js | 18+ | Asset compilation |
 | wkhtmltopdf | 0.12.6+ | PDF report generation |
 | Git | 2.x | Version control |
 
+⚠️ The Python range and the PostgreSQL floor are the repository's own declared
+bounds, not estimates: `odoo/release.py` declares `MIN_PY_VERSION = (3, 10)`,
+`MAX_PY_VERSION = (3, 13)` and `MIN_PG_VERSION = 13`. An earlier revision of
+this table said *PostgreSQL 12+*, which is below the declared floor and would
+fail Odoo's own startup check.
+
 ### Environment Setup
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/odoo/odoo.git
-cd odoo
+# 1. Clone the repository.
+#    The branch below exists only on the Blitzy fork, so the fork is the
+#    remote to clone: `git ls-remote --heads https://github.com/odoo/odoo.git
+#    blitzy-226b0e2b-67da-4341-b2ee-58a436783f1b` returns no refs, while the
+#    same query against the fork returns exactly one.
+git clone https://github.com/Blitzy-Sandbox/blitzy-odoo.git
+cd blitzy-odoo
 git checkout blitzy-226b0e2b-67da-4341-b2ee-58a436783f1b
 
 # 2. Create Python virtual environment
@@ -305,49 +348,87 @@ python -c "import xlsxwriter, xlrd, openpyxl"
 
 ```bash
 # 1. Create a least-privileged PostgreSQL role and the database it owns.
-#    --no-superuser and --no-createrole keep the application role off server-wide
-#    control; --createdb is the only elevated privilege Odoo needs, because its
-#    database manager creates and duplicates databases.
-sudo -u postgres createuser --createdb --no-createrole --no-superuser odoo
+#    --no-superuser and --no-createrole keep the application role off
+#    server-wide control; --createdb is the only elevated privilege Odoo
+#    needs, because its database manager creates and duplicates databases.
+#    --pwprompt sets the role's password, which step 2 stores once.
+sudo -u postgres createuser --createdb --no-createrole \
+    --no-superuser --pwprompt odoo
 sudo -u postgres createdb --owner=odoo odoo_enterprise_accounting
 
-# 2. Initialize Odoo database
-./odoo-bin -d odoo_enterprise_accounting -i base --stop-after-init
+# 2. Record that role as the connection identity, once, so that every
+#    command below actually uses it. Without this step odoo-bin connects as
+#    the current operating-system user and the role created in step 1 is
+#    never exercised. `odoo.conf` at the repository root is ignored by the
+#    repository's own .gitignore rule `/odoo.conf`, and `umask 077` keeps
+#    the password readable only by its owner.
+read -rsp 'Password for role odoo: ' ODOO_DB_PASSWORD && echo
+umask 077
+cat > odoo.conf <<CONF
+[options]
+db_host = localhost
+db_port = 5432
+db_user = odoo
+db_password = ${ODOO_DB_PASSWORD}
+CONF
+unset ODOO_DB_PASSWORD
+
+# 3. Prove the role is what connects, before initialising anything.
+#    libpq reads PGHOST/PGPORT/PGUSER, so psql needs no flags of its own.
+export PGHOST=localhost PGPORT=5432 PGUSER=odoo
+psql -d odoo_enterprise_accounting \
+    -c 'SELECT current_user, current_database()'
+
+# 4. Initialize the Odoo database as that role.
+./odoo-bin -c odoo.conf -d odoo_enterprise_accounting \
+    -i base --stop-after-init
 ```
 
 ### Module Installation
 
 ```bash
+# Every invocation passes -c odoo.conf, which carries the db_user and
+# db_password recorded during Database Setup.
+
 # 1. Install account module (dependency)
-./odoo-bin -d odoo_enterprise_accounting -i account --stop-after-init
+./odoo-bin -c odoo.conf -d odoo_enterprise_accounting \
+    -i account --stop-after-init
 
 # 2. Install financial reports module
-./odoo-bin -d odoo_enterprise_accounting -i account_financial_report_ce --stop-after-init
+./odoo-bin -c odoo.conf -d odoo_enterprise_accounting \
+    -i account_financial_report_ce --stop-after-init
 ```
 
 ### Running Odoo Server
 
 ```bash
 # Start the server and upgrade the financial reports module
-./odoo-bin -d odoo_enterprise_accounting --addons-path=addons -u account_financial_report_ce
+./odoo-bin -c odoo.conf -d odoo_enterprise_accounting \
+    --addons-path=addons -u account_financial_report_ce
 
 # With specific port
-./odoo-bin -d odoo_enterprise_accounting --addons-path=addons --http-port=8069
+./odoo-bin -c odoo.conf -d odoo_enterprise_accounting \
+    --addons-path=addons --http-port=8069
 ```
 
 ### Running Tests
 
 ```bash
 # Run financial reports module tests
-./odoo-bin -d odoo_enterprise_accounting --test-enable --stop-after-init -i account_financial_report_ce
+./odoo-bin -c odoo.conf -d odoo_enterprise_accounting \
+    --test-enable --stop-after-init -i account_financial_report_ce
 
 # Run the native Odoo test suite under coverage.
-# The version is pinned to an exact release that has passed a current advisory
-# check, because an unpinned install resolves to whatever the index serves at
-# the time it runs. 7.15.2 declares requires-python >=3.10, which matches the
-# range odoo/release.py supports.
+# The version is pinned to an exact release that has passed a current
+# advisory check, because an unpinned install resolves to whatever the index
+# serves at the time it runs. 7.15.2 declares requires-python >=3.10, which
+# matches the range odoo/release.py supports.
+# The test database is created by odoo-bin itself, which is why the role
+# needs --createdb; the same odoo.conf supplies its credentials.
 pip install coverage==7.15.2
-coverage run --source=addons/account_financial_report_ce ./odoo-bin -d test_db --test-enable --stop-after-init -i account_financial_report_ce
+coverage run --source=addons/account_financial_report_ce \
+    ./odoo-bin -c odoo.conf -d test_db --test-enable \
+    --stop-after-init -i account_financial_report_ce
 coverage report
 ```
 
@@ -416,9 +497,20 @@ action = wizard.button_generate_report()
 
 ⚠️ Every figure in this table belongs to branch `pdlc`, not to the branch this guide is published on. `Lines Added` reads **27,905**, the figure carried by the authoritative PR #2 record.
 
+⚠️ **Retrieval pin.** The three head-of-table figures are read from the pull
+request's own record rather than counted by hand, so they move when the pull
+request moves. As retrieved on **2026-08-05** from
+`https://api.github.com/repos/Blitzy-Sandbox/blitzy-odoo/pulls/2` (HTTP 200),
+that record reports `commits: 49`, `changed_files: 81`, `additions: 27905`,
+`deletions: 0`, base branch `pdlc`, merged `2026-02-02T21:05:29Z`. `Total
+Commits` previously read **47**, a figure taken before the last two commits
+landed on the pull request; it is corrected below. Anyone re-checking these
+numbers should re-run that request and treat its answer, not this table, as
+authoritative.
+
 | Metric | Value |
 |--------|-------|
-| Total Commits | 47 |
+| Total Commits | 49 (as retrieved 2026-08-05; was 47) |
 | Files Created | 81 |
 | Lines Added | 27,905 |
 | Documentation Files | 43 |
