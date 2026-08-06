@@ -1,0 +1,30 @@
+{#-
+  Repository-owned Material for MkDocs override entry point.
+
+  Its only job is to attach the two repository-owned assets that close the
+  reported accessibility, keyboard and preference-handling defects in the
+  published theme chrome. They are attached from here rather than through
+  `extra_css` / `extra_javascript` for one concrete reason: the Backstage
+  TechDocs generator sanitises the site configuration against an allowlist of
+  supported top-level keys before building, and `extra_javascript` is not in
+  that allowlist — a stylesheet declared that way would survive publication but
+  the script would be deleted. `theme` is in the allowlist, and
+  `mkdocs-techdocs-core` preserves a Material override instead of replacing it,
+  so a custom directory is the one route that survives intact.
+
+  The stylesheet is loaded after the theme's own so that it can override
+  palette tokens; the script is loaded after the theme bundle so that runtime
+  markup the bundle injects (the horizontal scroll wrapper around every wide
+  table, the active table-of-contents state) is already present when it runs.
+-#}
+{% extends "base.html" %}
+
+{% block extrahead %}
+  {{ super() }}
+  <link rel="stylesheet" href="{{ 'assets/stylesheets/blitzy-techdocs.css' | url }}">
+{% endblock %}
+
+{% block scripts %}
+  {{ super() }}
+  <script src="{{ 'assets/javascripts/blitzy-techdocs.js' | url }}"></script>
+{% endblock %}

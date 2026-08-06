@@ -2,16 +2,19 @@ apiVersion: backstage.io/v1alpha1
 kind: Component
 metadata:
   name: blitzy-odoo
-  description: Odoo 19.0 enterprise accounting parity — financial reporting engine,
-    bank reconciliation, and IBM Carbon Design System UI redesign
+  # Canonical description; keep mkdocs.yml and docs/index.md synchronized.
+  description: Odoo 19.0 fork pursuing enterprise accounting parity — financial
+    reporting engine and bank reconciliation — with an IBM Carbon Design System
+    UI redesign as planned direction.
   tags:
-  - audit
   - python
-  - refactor
-  - security
   - web-app
   labels:
     blitzy.com/language: python
+    blitzy.com/status: in-progress
+    blitzy.com/work-type: refactor
+  # `dir:.` resolves the root-level mkdocs.yml; source-location remains the
+  # branch root.
   annotations:
     backstage.io/techdocs-ref: dir:.
     github.com/project-slug: Blitzy-Sandbox/blitzy-odoo
@@ -19,14 +22,18 @@ metadata:
   links:
   - url: https://github.com/Blitzy-Sandbox/blitzy-odoo
     title: GitHub Repository
+    icon: github
   - url: https://github.com/Blitzy-Sandbox/blitzy-odoo/pull/2
     title: 'PR #2: Enterprise Accounting Docs & Reports Scaffold'
     icon: github
-  - url: https://github.com/Blitzy-Sandbox/blitzy-odoo/tree/19.0/blitzy/documentation
+  # Keep this URL aligned with mkdocs.yml's docs_dir and edit_uri.
+  - url: https://github.com/Blitzy-Sandbox/blitzy-odoo/tree/19.0/docs
     title: Blitzy Documentation
     icon: docs
 spec:
-  type: website
-  lifecycle: production
+  type: service
+  lifecycle: experimental
+  # The referenced Group and System are portal-managed entities and must
+  # exist there.
   owner: blitzy-sandbox
   system: blitzy-python

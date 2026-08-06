@@ -1,9 +1,31 @@
-docs_dir: doc
+docs_dir: docs
 site_name: 'blitzy-odoo'
+site_description: >-
+  Odoo 19.0 fork pursuing enterprise accounting parity — financial reporting
+  engine and bank reconciliation — with an IBM Carbon Design System UI
+  redesign as planned direction.
+repo_url: https://github.com/Blitzy-Sandbox/blitzy-odoo
+edit_uri: edit/19.0/docs/
+# `name: material` must stay: mkdocs-techdocs-core replaces the whole theme
+# object unless the declared name already is `material`, which would discard
+# `custom_dir`. The override closes theme-chrome accessibility defects that no
+# other configuration key can reach; `theme` is inside the TechDocs
+# generator's supported-key allowlist, `extra_javascript` is not.
+theme:
+  name: material
+  custom_dir: techdocs-theme
 nav:
   - Home: index.md
   - Project Guide: project-guide.md
   - Technical Specifications: technical-specifications.md
+  - Change Archaeology & Review: change-archaeology-and-review.md
 plugins:
-  - techdocs-core
-  - mermaid2
+  # Use Material search: MkDocs' core search script expects a `base_url`
+  # global that the Material theme does not define.
+  - techdocs-core:
+      use_material_search: true
+# No `mermaid` custom fence is declared, and none may be reintroduced. The
+# theme satisfies a `.mermaid` element by fetching a ~3.57 MB runtime from a
+# floating major-version alias with no integrity attribute, and its
+# load-failure path is unhandled. Every figure is published as a table
+# instead; see docs/change-archaeology-and-review.md for the measurements.

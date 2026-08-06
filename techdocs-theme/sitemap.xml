@@ -1,0 +1,35 @@
+{#-
+  Deliberately empty override of the theme's `sitemap.xml` template.
+
+  MkDocs registers `sitemap.xml` as a static template and skips writing any
+  static template whose rendered output is blank, logging
+  `Template skipped: 'sitemap.xml' generated empty output.` Because this file
+  contains nothing but this Jinja comment, it renders to the empty string, so
+  the build writes neither `site/sitemap.xml` nor `site/sitemap.xml.gz`.
+
+  WHY THE SITEMAP IS SUPPRESSED RATHER THAN POPULATED
+  --------------------------------------------------
+  The theme's sitemap template enumerates `page.canonical_url`, which the
+  generator resolves only once a canonical site address is configured. With no
+  such address the loop yields nothing, so the build published a well-formed
+  file containing an empty `<urlset>` — a sitemap advertising zero URLs for
+  four live pages. That is worse than no sitemap: a crawler reads it as an
+  authoritative statement that the site has no indexable pages.
+
+  Populating it would require declaring an absolute origin, and no truthful one
+  exists to declare. This documentation is published by Backstage TechDocs
+  under a portal base address that this repository cannot know; the repository
+  itself serves no site (GitHub Pages is disabled), and the source-hosting URL
+  is not where the pages are served from. Inventing an origin would put a false
+  `<link rel="canonical">` on all four pages and false `<loc>` entries here —
+  precisely the class of unevidenced claim this remediation exists to remove.
+  The site configuration is additionally forbidden from carrying that key.
+
+  Suppression is therefore the honest outcome, and it costs nothing in this
+  deployment: the portal proxies this output and builds its own search index
+  rather than crawling a sitemap.
+
+  Removing this file restores the generator's default template and, with it,
+  the empty `<urlset>`. Do not delete it without first configuring a canonical
+  address that is genuinely true of where the site is served.
+-#}

@@ -1,0 +1,493 @@
+/*
+ * blitzy-techdocs.css — repository-owned corrections to the published
+ * Material for MkDocs 9.7.6 theme chrome.
+ *
+ * Every rule below closes a specific, measured runtime accessibility defect in
+ * the vendored theme. None of them is decorative, and none changes the
+ * information the pages carry. The theme is a third-party package, so its
+ * stylesheet cannot be edited; a stylesheet layered on top of it is the only
+ * available lever, and `theme.custom_dir` is the only configuration key that
+ * survives the Backstage TechDocs generator's key allowlist.
+ *
+ * Sections
+ *   1. Utilities used by blitzy-techdocs.js
+ *   2. Contrast — palette tokens that failed WCAG 2.1 AA
+ *   3. Interactive state — focus, hover, active, selected
+ *   4. Header layout — the 320px horizontal-overflow source
+ *   5. Scrollable regions — keyboard affordance for wide tables and code
+ *   6. Task list indicators — distinct unchecked glyph
+ *   7. prefers-reduced-motion
+ *   8. forced-colors (Windows High Contrast and friends)
+ *   9. prefers-color-scheme: dark
+ */
+
+/* ------------------------------------------------------------------------ *
+ * 1. Utilities
+ * ------------------------------------------------------------------------ */
+
+/* Visually hidden but exposed to assistive technology. Used for the table
+ * captions injected at runtime, which must name the table without altering
+ * its rendered appearance. */
+.blitzy-visually-hidden {
+  border: 0 !important;
+  clip-path: inset(50%) !important;
+  height: 1px !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  padding: 0 !important;
+  position: absolute !important;
+  white-space: nowrap !important;
+  width: 1px !important;
+}
+
+/* ------------------------------------------------------------------------ *
+ * 2. Contrast
+ *
+ * `--md-default-fg-color--lighter` is rgba(0,0,0,.32), which composites to
+ * 2.23:1 on the page background — below both the 4.5:1 text minimum and the
+ * 3:1 non-text minimum. It is the token behind every heading permalink and
+ * the per-page edit control. `--md-accent-fg-color` is #526cfe at 4.24:1 on
+ * white, and it is also used as the focus-ring colour on the indigo header,
+ * where it measures 1.61:1.
+ * ------------------------------------------------------------------------ */
+
+:root {
+  /* 8.9:1 on white, and still clearly an accent against the #3f51b5
+   * primary. Used by the theme for hover and focus text colour. */
+  --md-accent-fg-color: #303f9f;
+  --md-accent-fg-color--transparent: rgba(48, 63, 159, 0.1);
+
+  /* 7.0:1 on white. Replaces the 2.23:1 token wherever it carried meaning
+   * rather than decoration. */
+  --blitzy-muted-fg-color: #595959;
+
+  /* Every syntax-highlight token the theme resolves through
+   * `--md-default-fg-color--light` composites to #717171 on the #f5f5f5 code
+   * background — 4.47:1, which fails AA by 0.03. #565656 is 6.7:1 on the same
+   * background. The variable token alone accounted for 27 failing nodes. */
+  --md-code-hl-comment-color: #565656;
+  --md-code-hl-variable-color: #565656;
+  --md-code-hl-generic-color: #565656;
+  --md-code-hl-operator-color: #565656;
+  --md-code-hl-punctuation-color: #565656;
+}
+
+/* Both selectors are written at two-class specificity deliberately: the
+ * theme's own declarations are `.md-typeset .headerlink` and
+ * `.md-typeset .md-content__button`, so a single-class override loses the
+ * cascade and the edit control silently keeps its 2.23:1 colour. */
+.md-typeset .headerlink,
+.md-typeset .md-content__button,
+.md-content .md-content__button {
+  color: var(--blitzy-muted-fg-color);
+}
+
+/* The control's glyph is an inline SVG that inherits `currentColor`; state it
+ * explicitly so the icon cannot diverge from the link colour. */
+.md-typeset .md-content__button svg,
+.md-content .md-content__button svg {
+  fill: currentcolor;
+}
+
+/* Permalinks are revealed on hover/focus by the theme; keep them legible in
+ * that state too rather than dropping to the accent's lighter tints. */
+.md-typeset .headerlink:focus,
+.md-typeset .headerlink:hover,
+.md-typeset :target > .headerlink,
+.md-typeset .md-content__button:focus,
+.md-typeset .md-content__button:hover,
+.md-content .md-content__button:focus,
+.md-content .md-content__button:hover {
+  color: var(--md-accent-fg-color);
+}
+
+/* Pygments line-number gutter. The theme leaves it at the same 2.23:1 token,
+ * and Lighthouse reports every gutter span as a contrast failure. */
+.md-typeset .highlighttable .linenos,
+.md-typeset .highlighttable .linenos .normal,
+.md-typeset .highlighttable .linenos .special,
+.md-typeset .linenodiv pre,
+.md-typeset .linenodiv pre span {
+  color: var(--blitzy-muted-fg-color);
+}
+
+/* Footer copyright sat on the 4.47–4.51:1 boundary depending on which
+ * background reference is used. Lift it clear of the threshold entirely. */
+.md-copyright,
+.md-copyright__highlight {
+  color: var(--md-footer-fg-color--light);
+}
+
+/* Links in running prose must be distinguishable from surrounding text by
+ * more than colour: the theme's link colour measures only 1.99:1 against body
+ * text, so colour alone cannot carry the distinction (WCAG 1.4.1). Heading
+ * permalinks, navigation and footer chrome are excluded — they are not prose
+ * links and are handled by their own rules. */
+.md-typeset a:not(.headerlink):not(.md-content__button) {
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.15em;
+}
+
+.md-typeset a:not(.headerlink):not(.md-content__button):hover,
+.md-typeset a:not(.headerlink):not(.md-content__button):focus {
+  text-decoration-thickness: 2px;
+}
+
+/* ------------------------------------------------------------------------ *
+ * 3. Interactive state
+ *
+ * Three separate defects: the focus ring is drawn in the accent colour, which
+ * fails against the indigo header; the selected navigation item is
+ * distinguished from its siblings by colour alone at 2.35:1, and hovering any
+ * sibling resolves both to the same colour so the distinction disappears
+ * entirely; and no control has a pressed state.
+ * ------------------------------------------------------------------------ */
+
+:focus-visible {
+  outline: 2px solid var(--md-accent-fg-color);
+  outline-offset: 2px;
+}
+
+/* On the primary-coloured header and the dark footer the accent ring is
+ * invisible; the primary background colour is 6.7:1 against both. */
+.md-header :focus-visible,
+.md-footer :focus-visible,
+.md-search__form :focus-visible {
+  outline-color: var(--md-primary-bg-color);
+}
+
+/* The skip link is the first tab stop on every page and sits on its own dark
+ * chip, but `outline-offset` draws its ring on the indigo header behind it —
+ * 1.31:1 with the accent colour, 1.79:1 against the chip. A white ring with an
+ * accent-coloured halo outside it clears 3:1 against both surfaces at once, so
+ * the indicator is visible wherever the link happens to overlap. */
+.md-skip:focus,
+.md-skip:focus-visible {
+  outline: 2px solid var(--md-primary-bg-color);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px var(--md-accent-fg-color);
+}
+
+/* Selected navigation and table-of-contents items gain two non-colour cues,
+ * so the state survives both a hover that flattens the colours and a
+ * forced-colors palette that discards them. */
+.md-nav__link--active,
+.md-nav__item--active > .md-nav__link,
+.md-nav__link[aria-current] {
+  font-weight: 700;
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 0.2em;
+}
+
+/* Hover must never erase the selected state. The theme's hover rule carries
+ * no exclusion for the active item, so it is restated here with the active
+ * cues preserved. */
+.md-nav__link--active:hover,
+.md-nav__link--active:focus,
+.md-nav__link[aria-current]:hover,
+.md-nav__link[aria-current]:focus {
+  font-weight: 700;
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+}
+
+/* Unselected items get an underline only while hovered, so hover and
+ * selection remain independently readable. */
+.md-nav__link:not(.md-nav__link--active):not([aria-current]):hover {
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+}
+
+/* Footer links dimmed on hover and focus — an inverted affordance that made
+ * the hovered link less prominent than its neighbours, and bound to :focus
+ * rather than :focus-visible. Replace the opacity drop with an underline. */
+.md-footer__link:focus,
+.md-footer__link:hover {
+  opacity: 1;
+}
+
+.md-footer__link:focus .md-footer__title,
+.md-footer__link:hover .md-footer__title,
+.md-footer__link:focus-visible .md-footer__title {
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 0.2em;
+}
+
+/* No control had a pressed state. A brief translation plus a thicker
+ * underline is perceivable without relying on colour. */
+.md-typeset a:active,
+.md-nav__link:active,
+.md-footer__link:active,
+.md-header__button:active,
+.md-source:active {
+  text-decoration-thickness: 3px;
+  translate: 0 1px;
+}
+
+/* The drawer and search triggers are labels acting as buttons; give them the
+ * cursor and focus treatment a button would have. */
+#blitzy-drawer-toggle,
+#blitzy-search-toggle {
+  cursor: pointer;
+}
+
+/* ------------------------------------------------------------------------ *
+ * 4. Header layout
+ *
+ * `.md-header__ellipsis` is position:relative and its two `.md-header__topic`
+ * children are position:absolute with a ±1.25rem translation. The inactive,
+ * fully transparent topic therefore extends 20px past the container and adds
+ * 13px of horizontal document overflow at a 320px viewport — the page pans
+ * sideways with nothing to see. The container simply needs to clip.
+ * ------------------------------------------------------------------------ */
+
+.md-header__ellipsis {
+  overflow: hidden;
+}
+
+.md-header__title {
+  min-width: 0;
+}
+
+/* ------------------------------------------------------------------------ *
+ * 5. Scrollable regions
+ *
+ * The theme wraps every wide table in a `.md-typeset__scrollwrap` and lets the
+ * inner `code` element of a wide code block scroll, but neither carries a
+ * tabindex, a role, a name or any visible affordance: content is hidden with
+ * no way to reach it by keyboard and no indication that it is there.
+ * `blitzy-techdocs.js` adds the semantics; these rules add the affordance and
+ * a visible focus indicator. The class is applied only while the element
+ * actually overflows.
+ * ------------------------------------------------------------------------ */
+
+.blitzy-scroll-region {
+  /* A right-hand edge shade that says "there is more this way". `scroll`
+   * attachment pins it to the container's own box rather than to its content,
+   * so it stays at the visible edge while the content moves under it. */
+  background-attachment: scroll;
+  background-image: linear-gradient(
+    to left,
+    var(--md-default-fg-color--lightest),
+    rgba(0, 0, 0, 0)
+  );
+  background-position: right center;
+  background-repeat: no-repeat;
+  background-size: 2.5rem 100%;
+}
+
+.blitzy-scroll-region:focus-visible {
+  outline: 2px solid var(--md-accent-fg-color);
+  outline-offset: 0;
+}
+
+/* Data tables gain a visible outline while their region has focus, so the
+ * focused thing is unambiguous. */
+.md-typeset__scrollwrap.blitzy-scroll-region {
+  scrollbar-color: var(--blitzy-muted-fg-color) transparent;
+  scrollbar-width: thin;
+}
+
+.md-typeset pre > code.blitzy-scroll-region {
+  scrollbar-color: var(--blitzy-muted-fg-color) transparent;
+  scrollbar-width: thin;
+}
+
+/* The theme's search result pane keeps `overflow-y: auto` while the search is
+ * closed, at which point it measures zero pixels high. Chrome treats any
+ * overflowing scroll container as sequentially focusable, so the pane became an
+ * invisible tab stop on every page — reachable, named "Type to start
+ * searching", and nothing to see. Clipping it while closed removes it from the
+ * focus order; the theme's own rule applies again the moment it opens. */
+[data-md-toggle="search"]:not(:checked) ~ .md-header .md-search__scrollwrap {
+  overflow: hidden;
+}
+
+/* ------------------------------------------------------------------------ *
+ * 6. Task list indicators
+ *
+ * The theme's `--md-tasklist-icon` and `--md-tasklist-icon--checked` are
+ * byte-identical check-circle glyphs that differ only in fill, so an
+ * unchecked item reads as complete. The published documents no longer contain
+ * task lists, but the token is corrected so that the defect cannot reappear
+ * the moment one is added: unchecked becomes an empty circle outline, and its
+ * fill is lifted from the 7%-opacity token to a visible one.
+ * ------------------------------------------------------------------------ */
+
+:root {
+  --md-tasklist-icon: url('data:image/svg+xml;charset=utf-8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20m0 1.5a8.5 8.5 0 1 1 0 17 8.5 8.5 0 0 1 0-17"/></svg>');
+}
+
+.md-typeset .task-list-indicator::before {
+  background-color: var(--blitzy-muted-fg-color);
+}
+
+/* ------------------------------------------------------------------------ *
+ * 7. prefers-reduced-motion
+ *
+ * The theme runs transitions and animations unconditionally — the header
+ * topic swap, the drawer slide, the permalink fade, the search dialog and the
+ * table-of-contents scroll among them.
+ * ------------------------------------------------------------------------ */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-delay: 0ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-delay: 0ms !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  html,
+  body {
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ------------------------------------------------------------------------ *
+ * 8. forced-colors
+ *
+ * In a forced-colors palette every author colour is discarded, so any state
+ * carried by colour alone vanishes. The cues below are drawn with system
+ * colour keywords and with borders and text decoration, which survive.
+ * ------------------------------------------------------------------------ */
+
+@media (forced-colors: active) {
+  :focus-visible,
+  .md-header :focus-visible,
+  .md-footer :focus-visible,
+  .blitzy-scroll-region:focus-visible {
+    outline: 3px solid Highlight;
+    outline-offset: 2px;
+  }
+
+  /* Table cell boundaries are drawn with a background tint by the theme,
+   * which forced colors removes; a border keeps the grid readable. */
+  .md-typeset table:not([class]) th,
+  .md-typeset table:not([class]) td {
+    border: 1px solid CanvasText;
+  }
+
+  /* The gradient affordance is dropped in forced colors; a border replaces
+   * it so a scrollable region is still identifiable. */
+  .blitzy-scroll-region {
+    background-image: none;
+    border-inline-end: 2px solid CanvasText;
+  }
+
+  /* Selected navigation keeps its weight and underline, and gains a marker
+   * that does not depend on any author colour. */
+  .md-nav__link--active,
+  .md-nav__link[aria-current] {
+    outline: 1px solid CanvasText;
+    outline-offset: 2px;
+  }
+
+  /* Callouts lose their tinted background or accent stripe; give them a
+   * boundary. Block quotations are included because that is what the published
+   * documents actually use for their provenance and warning callouts. */
+  .md-typeset .admonition,
+  .md-typeset details,
+  .md-typeset blockquote {
+    border: 1px solid CanvasText;
+  }
+
+  /* Icons are masked backgrounds in this theme and disappear entirely. */
+  .md-nav__icon::after,
+  .md-typeset .task-list-indicator::before {
+    background-color: CanvasText;
+  }
+}
+
+/* ------------------------------------------------------------------------ *
+ * 9. prefers-color-scheme: dark
+ *
+ * `mkdocs-techdocs-core` forces `theme.palette` to an empty mapping, so the
+ * theme's own scheme switch is unreachable and `<body>` carries no
+ * `data-md-color-scheme`. A dark scheme therefore has to be expressed as an
+ * override of the theme's custom properties. Every value below was chosen to
+ * clear 4.5:1 against its own background.
+ * ------------------------------------------------------------------------ */
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+
+    --md-default-fg-color: hsla(0, 0%, 100%, 0.92);
+    --md-default-fg-color--light: hsla(0, 0%, 100%, 0.76);
+    --md-default-fg-color--lighter: hsla(0, 0%, 100%, 0.56);
+    --md-default-fg-color--lightest: hsla(0, 0%, 100%, 0.14);
+    --md-default-bg-color: #1b1c21;
+    --md-default-bg-color--light: hsla(230, 8%, 12%, 0.7);
+    --md-default-bg-color--lighter: hsla(230, 8%, 12%, 0.45);
+    --md-default-bg-color--lightest: hsla(230, 8%, 12%, 0.12);
+
+    --md-primary-fg-color: #232634;
+    --md-primary-fg-color--light: #333750;
+    --md-primary-fg-color--dark: #171a24;
+    --md-primary-bg-color: #ffffff;
+    --md-primary-bg-color--light: hsla(0, 0%, 100%, 0.78);
+
+    --md-accent-fg-color: #cdd6ff;
+    --md-accent-fg-color--transparent: hsla(230, 100%, 90%, 0.12);
+    --md-accent-bg-color: #1b1c21;
+
+    --md-typeset-color: hsla(0, 0%, 100%, 0.92);
+    --md-typeset-a-color: #a9bcff;
+    --md-typeset-mark-color: hsla(230, 90%, 70%, 0.35);
+    --md-typeset-del-color: hsla(6, 90%, 60%, 0.28);
+    --md-typeset-ins-color: hsla(150, 90%, 44%, 0.28);
+    --md-typeset-table-color: hsla(0, 0%, 100%, 0.2);
+
+    --md-code-fg-color: #d7dbe3;
+    --md-code-bg-color: #24262e;
+    --md-code-hl-color: hsla(230, 90%, 70%, 0.28);
+    --md-code-hl-number-color: #ffab8f;
+    --md-code-hl-special-color: #ff92b8;
+    --md-code-hl-function-color: #d9a7ff;
+    --md-code-hl-constant-color: #b8a6ff;
+    --md-code-hl-keyword-color: #a6b8ff;
+    --md-code-hl-string-color: #86dfb4;
+    --md-code-hl-name-color: var(--md-code-fg-color);
+    --md-code-hl-operator-color: hsla(0, 0%, 100%, 0.78);
+    --md-code-hl-punctuation-color: hsla(0, 0%, 100%, 0.78);
+    --md-code-hl-comment-color: hsla(0, 0%, 100%, 0.72);
+    --md-code-hl-generic-color: hsla(0, 0%, 100%, 0.78);
+    --md-code-hl-variable-color: hsla(0, 0%, 100%, 0.86);
+
+    --md-admonition-fg-color: var(--md-default-fg-color);
+    --md-admonition-bg-color: #22242c;
+
+    --md-footer-fg-color: #ffffff;
+    --md-footer-fg-color--light: hsla(0, 0%, 100%, 0.82);
+    --md-footer-fg-color--lighter: hsla(0, 0%, 100%, 0.62);
+    --md-footer-bg-color: #14151a;
+    --md-footer-bg-color--dark: #0e0f13;
+
+    /* 9.4:1 on the dark page background. */
+    --blitzy-muted-fg-color: hsla(0, 0%, 100%, 0.74);
+  }
+
+  /* The theme paints the page background on `body` from a literal rather than
+   * from the token in some builds; restate both. */
+  body,
+  .md-main,
+  .md-content,
+  .md-container {
+    background-color: var(--md-default-bg-color);
+    color: var(--md-typeset-color);
+  }
+
+  /* Images authored for a light background are dimmed slightly rather than
+   * inverted, which would misreport colour-coded content. */
+  .md-typeset img {
+    filter: brightness(0.92);
+  }
+}

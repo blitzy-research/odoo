@@ -1,0 +1,108 @@
+{#-
+  Repository-owned override of Material for MkDocs 9.7.6
+  `partials/header.html`.
+
+  Derived from the packaged template so that the surrounding markup stays
+  byte-compatible with the theme's own stylesheet and bundle. Exactly three
+  things differ from the vendored original, each closing a reported runtime
+  defect that cannot be reached from configuration:
+
+  1. Navigation drawer trigger. The vendored template emits a bare
+     `<label for="__drawer">` with no text, no `tabindex` and no ARIA, so the
+     only control that opens navigation below the 76.25em breakpoint is absent
+     from both the tab order and the accessibility tree. It gains an id, a
+     button role, `tabindex`, an accessible name and `aria-expanded` here;
+     `blitzy-techdocs.js` supplies Escape dismissal, a focus trap, background
+     scroll locking and back/forward-cache state reset on top of it.
+     The label element itself is deliberately retained rather than replaced by
+     a `<button>`: the label keeps working for pointer users with scripting
+     disabled, which a button could not. Adding `tabindex` to a label is safe
+     here — the theme's own `label[tabindex]` handler is scoped to elements
+     inside a `.md-sidebar`, and this label is in the header.
+
+  2. Search control. The vendored template gates the search UI on
+     `"material/search" in config.plugins`, but `mkdocs-techdocs-core`
+     registers the very same `MaterialSearchPlugin` under the key `search`.
+     The names never match, so a search index is built on every build and no
+     control is ever rendered. The condition accepts either key.
+
+  3. Repository link. The vendored template includes `partials/source.html`,
+     whose `data-md-component="source"` makes the theme bundle call
+     `api.github.com/repos/<slug>/releases/latest`. This repository publishes
+     no releases, so that call answers 404 on every cold load, and the bundle
+     stores the empty result in `sessionStorage`, which suppresses any retry
+     for the rest of the session and leaves the control's accessible name
+     flipping between "GitHub" and "GitHub 0 0". The link is rendered here
+     directly, statically and without that hook, so no request is made and the
+     name is stable.
+
+  Everything else — class names, element order, the palette, alternate and
+  tabs blocks — is the vendored template unchanged.
+-#}
+{% set class = "md-header" %}
+{% if "navigation.tabs.sticky" in features %}
+  {% set class = class ~ " md-header--shadow md-header--lifted" %}
+{% elif "navigation.tabs" not in features %}
+  {% set class = class ~ " md-header--shadow" %}
+{% endif %}
+<header class="{{ class }}" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="{{ lang.t('header') }}">
+    <a href="{{ config.extra.homepage | d(nav.homepage.url, true) | url }}" title="{{ config.site_name | e }}" class="md-header__button md-logo" aria-label="{{ config.site_name }}" data-md-component="logo">
+      {% include "partials/logo.html" %}
+    </a>
+    <label class="md-header__button md-icon" for="__drawer" id="blitzy-drawer-toggle" role="button" tabindex="0" aria-expanded="false" aria-label="Open navigation menu">
+      {% set icon = config.theme.icon.menu or "material/menu" %}
+      {% include ".icons/" ~ icon ~ ".svg" %}
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            {{ config.site_name }}
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            {% if page.meta and page.meta.title %}
+              {{ page.meta.title }}
+            {% else %}
+              {{ page.title }}
+            {% endif %}
+          </span>
+        </div>
+      </div>
+    </div>
+    {% if config.theme.palette %}
+      {% if not config.theme.palette is mapping %}
+        {% include "partials/palette.html" %}
+      {% endif %}
+    {% endif %}
+    {% if not config.theme.palette is mapping %}
+      {% include "partials/javascripts/palette.html" %}
+    {% endif %}
+    {% if config.extra.alternate %}
+      {% include "partials/alternate.html" %}
+    {% endif %}
+    {% set search_plugin = config.plugins["material/search"] | d(config.plugins["search"], true) %}
+    {% if search_plugin %}
+      {% set search = search_plugin | attr("config") %}
+      {% if search.enabled %}
+        <label class="md-header__button md-icon" for="__search" id="blitzy-search-toggle" role="button" tabindex="0" aria-expanded="false" aria-label="{{ lang.t('search.placeholder') }}">
+          {% set icon = config.theme.icon.search or "material/magnify" %}
+          {% include ".icons/" ~ icon ~ ".svg" %}
+        </label>
+        {% include "partials/search.html" %}
+      {% endif %}
+    {% endif %}
+    {% if config.repo_url %}
+      <div class="md-header__source">
+        {% include "partials/source.html" %}
+      </div>
+    {% endif %}
+  </nav>
+  {% if "navigation.tabs.sticky" in features %}
+    {% if "navigation.tabs" in features %}
+      {% include "partials/tabs.html" %}
+    {% endif %}
+  {% endif %}
+</header>

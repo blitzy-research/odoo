@@ -1,0 +1,36 @@
+{#-
+  Repository-owned override of Material for MkDocs 9.7.6
+  `partials/source.html`.
+
+  Identical to the vendored template except that `data-md-component="source"`
+  is not emitted, and the repository name is given a stable, explicit
+  accessible name.
+
+  Why: the theme bundle attaches a "repository facts" fetcher to any element
+  carrying that component attribute. It calls
+  `api.github.com/repos/<slug>/releases/latest` and `api.github.com/repos/<slug>`
+  on every cold load. This repository publishes no releases, so the first call
+  answers **404** on every fresh session — the only console error the published
+  site produces. Worse, the bundle wraps each call in a default-empty operator
+  and caches the result in `sessionStorage`, so a transient rate-limit 403 is
+  stored as an empty object and suppresses any retry for the remainder of the
+  browsing session; and the control's accessible name flips between "GitHub"
+  and "GitHub 0 0" depending on whether the calls resolved.
+
+  Removing the hook removes the requests. The link itself — the only part a
+  reader uses — is unchanged, always correct, needs no network round trip, and
+  now has one stable name.
+
+  This partial is included by both `partials/header.html` and
+  `partials/nav.html`, so overriding it here covers the header control and the
+  navigation-drawer control together.
+-#}
+<a href="{{ config.repo_url }}" title="{{ lang.t('source') }}" class="md-source" aria-label="{{ lang.t('source') }}: {{ config.repo_name }}">
+  <div class="md-source__icon md-icon">
+    {% set icon = config.theme.icon.repo or "fontawesome/brands/git-alt" %}
+    {% include ".icons/" ~ icon ~ ".svg" %}
+  </div>
+  <div class="md-source__repository">
+    {{ config.repo_name }}
+  </div>
+</a>
