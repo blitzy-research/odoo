@@ -1,0 +1,196 @@
+# CRM offline surface inventory (PART 1)
+
+This document is PART 1 of the CRM offline and mobile feature and changes no code. It lists every server-dependent entry point reachable from `addons/crm/`, including the controls of other addons that CRM extends or shows on CRM screens, and gives each one exactly one offline class. PART 2 to PART 5 implement their guards against these classes, and `crm_offline_hooks.js` freezes the lists of the "Generated sets" section. Paths are repository-relative; line numbers refer to the checkout before any PART 2 to PART 5 change.
+
+## Sweep
+
+1. **JS calls.** `grep -rnE "orm\.|\.orm\b|rpc\(|useService\(\"(orm|action)\"\)|doAction|loadAction|doActionButton|hasGroup|checkAccessRight|isAdmin|webSearchRead|searchRead|\.cache\(" addons/crm/static/src`, every hit read in context so that calls split across lines (the `ir.module.module` lookup at `lead_generation_dropdown.js:138-144`, the `crm.team` read at `crm_share_target_item.js:17-27`) are caught. `addons/crm/static/src/mobile/` is excluded (new code).
+2. **Arch walk.** In `addons/crm/views/*.xml`, `addons/crm/wizard/*_views.xml` and `addons/crm/report/*_views.xml`: every `<button>`, and every `<a>` or kanban root carrying `type="object"|"action"|"open"|"delete"|"archive"` or `action=`; in the same globs, every `ir.actions.act_window` with `binding_model_id` (five found). Also recorded: the framework's static form Action-menu items on a lead (`addons/web/static/src/views/form/form_controller.js`), the `crm.tag` colour and "Hide in Kanban" editor behind `on_tag_click: 'edit_color'` with `color_field` on `tag_ids`, the lead card menu (Edit, Delete, colour picker), the Sales Teams dashboard controls CRM extends (card click, card menu toggle, "Configuration" link, manager colour picker) and the team-form `crm_team_activate_multi_membership` probe.
+3. **Public methods.** Every `def` without a leading underscore in `addons/crm/models/crm_lead.py`, `addons/crm/models/crm_stage.py` and `addons/crm/models/crm_team.py`, kept only when a button found above names it. A button and the method it calls are two rows.
+
+## Rule order
+
+Each row is tested against these rules in order; the first match is its class.
+
+1. **QUEUE**: the call writes `crm.lead`, `crm.stage`, `crm.team` or a lead's `mail.activity`, and the client already holds every argument.
+2. **SKIP**: the call is a read that only decorates or advises.
+3. **DISABLE**: anything else. A call that depends on a server `onchange` at call time, on a transient-model wizard, or on an id that another call has to produce is DISABLE even when it writes a QUEUE model.
+
+Justifications name the rule that matched; "Rule 3" states why QUEUE and SKIP do not apply.
+
+## Swept hits that are not rows
+
+- `useService("orm")` and `useService("action")` declarations (`lead_generation_dropdown.js:27, 29`, `crm_pls_tooltip_button.js:28`): service handles, no request.
+- `user.isAdmin` (`lead_generation_dropdown.js:40, 50, 60, 70, 196`): a session flag, no request.
+- `check_rainbowman_message.js:2`: the shared `get_rainbowman_message` call, classified at its two call sites.
+- Pipeline card menu Edit `<a type="open">` (`crm_lead_views.xml:516`): it opens the lead form, whose read the framework serves from its record cache or answers with the offline action helper. It has no server side effect, stays usable offline with the card menu, and fits none of the three classes.
+- `tag_ids` with `edit_color` on kanban cards (`crm_lead_views.xml:369, 541`) and in the read-only activity report list (`report/crm_activity_report_views.xml:39`): the colour editor opens only on a record in edition, so these never reach a `crm.tag` write.
+- Wizard Cancel buttons with `special="cancel"` (`wizard/crm_lead_lost_views.xml:16`, `wizard/crm_lead_pls_update_views.xml:20`, `wizard/crm_lead_to_opportunity_mass_views.xml:56`, `wizard/crm_merge_opportunities_views.xml:35`): they close the dialog without a server call.
+- Public methods no button names: `crm_lead.py` `create`, `write`, `search_fetch`, `copy_data`, `action_set_lost`, `get_rainbowman_message`, `action_reschedule_meeting`, `redirect_lead_opportunity_view`, `get_empty_list_help`, `log_meeting`, `merge_opportunity`, `convert_opportunity`, `message_new`, `get_import_templates`, `prepare_pls_tooltip_data`; `crm_stage.py` `write`; `crm_team.py` `write`, `unlink`. They are reached through the rows' calls or from server code only.
+
+## Inventory
+
+| path | line | call | class | justification |
+|---|---|---|---|---|
+| addons/crm/models/crm_lead.py | 971 | `crm.lead.unlink` (card-menu, form and list Delete) | QUEUE | Write on crm.lead whose only argument is the record ids |
+| addons/crm/models/crm_lead.py | 1032 | `crm.lead.action_unarchive` (form and list Unarchive) | QUEUE | Write on crm.lead whose only argument is the record ids; the probability recompute runs server-side at replay |
+| addons/crm/models/crm_lead.py | 1043 | `crm.lead.action_restore` (Restore button) | DISABLE | Rule 3: the value it writes is the server-computed automated probability, so the client cannot resolve the result |
+| addons/crm/models/crm_lead.py | 1058 | `crm.lead.action_set_won` (queued by the Won button offline) | QUEUE | Write on crm.lead, args `[[resId]]`; the server picks the won stage at replay |
+| addons/crm/models/crm_lead.py | 1084 | `crm.lead.action_set_automated_probability` (AI-switch links) | DISABLE | Rule 3: writes a probability computed server-side from scoring frequencies |
+| addons/crm/models/crm_lead.py | 1090 | `crm.lead.action_set_won_rainbowman` (Won button online) | DISABLE | Rule 3: returns a server-built rainbowman effect; never queued, the offline Won queues `action_set_won` instead |
+| addons/crm/models/crm_lead.py | 1197 | `crm.lead.action_schedule_meeting` (Schedule Meeting button) | DISABLE | Rule 3: returns a server-built `calendar.event` action; calendar offline is out of scope |
+| addons/crm/models/crm_lead.py | 1307 | `crm.lead.action_show_potential_duplicates` (Similar Leads button) | DISABLE | Rule 3: returns an action whose domain holds server-computed duplicate ids |
+| addons/crm/models/crm_lead.py | 1320 | `crm.lead.action_convert_to_opportunity` (Convert button) | DISABLE | Id produced by another call: conversion may create the partner server-side |
+| addons/crm/models/crm_team.py | 211 | `crm.team.action_assign_leads` (team form Assign Leads) | DISABLE | Rule 3: server-side assignment across many leads, answered by a server notification |
+| addons/crm/models/crm_team.py | 762 | `crm.team.action_open_opportunities` (team form stat button) | DISABLE | Rule 3: returns an action with a server-rendered helper |
+| addons/crm/models/crm_team.py | 770 | `crm.team.action_open_unassigned_opportunities` (dashboard link) | DISABLE | Rule 3: returns an action whose context the server evaluates |
+| addons/crm/models/crm_team.py | 783 | `crm.team.action_primary_channel_button` (dashboard card click) | DISABLE | Rule 3: returns a server-built navigation action |
+| addons/crm/report/crm_activity_report_views.xml | 4-13 | `crm.activity.report` graph view `crm_activity_report_view_graph` | DISABLE | Rule 3: analysis read of a report model, neither a QUEUE write nor decorative |
+| addons/crm/report/crm_activity_report_views.xml | 15-24 | `crm.activity.report` pivot view `crm_activity_report_view_pivot` | DISABLE | Rule 3: analysis read of a report model |
+| addons/crm/report/crm_activity_report_views.xml | 30-33 | List root `action="action_open_lead" type="object"` (`crm.activity.report.action_open_lead`) | DISABLE | Rule 3: server-built action on a report model outside the QUEUE models |
+| addons/crm/report/crm_activity_report_views.xml | 87-106 | Action `crm.crm_activity_report_action` (graph, pivot, list) | DISABLE | Rule 3: activity analysis report action |
+| addons/crm/report/crm_activity_report_views.xml | 108-121 | Action `crm.crm_activity_report_action_team` (graph, pivot, list) | DISABLE | Rule 3: team activity analysis report action |
+| addons/crm/report/crm_opportunity_report_views.xml | 16-35 | `crm.lead` pivot view `crm_opportunity_report_view_pivot` | DISABLE | Rule 3: analysis read, blocked view type `pivot` |
+| addons/crm/report/crm_opportunity_report_views.xml | 37-55 | `crm.lead` pivot view `crm_opportunity_report_view_pivot_lead` | DISABLE | Rule 3: analysis read, blocked view type `pivot` |
+| addons/crm/report/crm_opportunity_report_views.xml | 58-76 | `crm.lead` graph view `crm_opportunity_report_view_graph` | DISABLE | Rule 3: analysis read, blocked view type `graph` |
+| addons/crm/report/crm_opportunity_report_views.xml | 78-96 | `crm.lead` graph view `crm_opportunity_report_view_graph_lead` | DISABLE | Rule 3: analysis read, blocked view type `graph` |
+| addons/crm/report/crm_opportunity_report_views.xml | 179-201 | Action `crm.crm_opportunity_report_action` (graph, pivot, list) | DISABLE | Rule 3: pipeline analysis report action |
+| addons/crm/report/crm_opportunity_report_views.xml | 203-227 | Action `crm.crm_opportunity_report_action_lead` (graph, pivot, list) | DISABLE | Rule 3: leads analysis report action |
+| addons/crm/static/src/activity_menu_patch.js | 39-49 | `openActivityGroup` for `crm.lead`: `loadAction("crm.crm_lead_action_my_activities")` then `doAction` | DISABLE | Rule 3: navigation whose action load is a server read, not decorative |
+| addons/crm/static/src/components/lead_generation_dropdown/lead_generation_dropdown.js | 138-144 | `toggleDropdown`: `orm.cache().searchRead("ir.module.module", ...)` module lookup | DISABLE | Rule 3: lookup feeding module installation, not decorative |
+| addons/crm/static/src/components/lead_generation_dropdown/lead_generation_dropdown.js | 163-168 | `toggleDropdown`: `user.checkAccessRight(model, "create")` probes | DISABLE | Rule 3: access probe gating install and import, not decorative |
+| addons/crm/static/src/components/lead_generation_dropdown/lead_generation_dropdown.js | 207-209 | `onClickAction` confirm: `ir.module.module.button_immediate_install` | DISABLE | Rule 3: write on `ir.module.module`, outside the QUEUE models |
+| addons/crm/static/src/components/lead_generation_dropdown/lead_generation_dropdown.js | 240-247 | `redirectToImport`: `doAction` of the `import` client action | DISABLE | Rule 3: server-backed file import |
+| addons/crm/static/src/components/lead_generation_dropdown/lead_generation_dropdown.js | 256-267 | `requestAccess`: `doAction` of a `base.module.install.request` form | DISABLE | Transient wizard (`base.module.install.request`) |
+| addons/crm/static/src/components/lead_generation_dropdown/lead_generation_dropdown.xml | 5 | "Generate" toggle `<button accesskey="c">` calling `toggleDropdown` | DISABLE | Rule 3: opens the lead-generation surface whose calls are all DISABLE |
+| addons/crm/static/src/views/crm_form/crm_form.js | 23-49 | `CrmFormRecord._save`: `crm.lead` `web_save [[resId], changes]`, forced `email_from`/`phone` included (38-43) | QUEUE | Write on crm.lead, args = resId plus field values the record holds |
+| addons/crm/static/src/views/crm_form/crm_form.js | 49-52 | `checkRainbowmanMessage` after a stage-changing form save: `crm.lead.get_rainbowman_message` | SKIP | Decorative read: the celebration message only |
+| addons/crm/static/src/views/crm_form/crm_pls_tooltip_button.js | 43-53 | `onClickPlsTooltipButton`: `record.save()` then `crm.lead.prepare_pls_tooltip_data` | DISABLE | Rule 3 by decision: the handler saves before the lookup and PART 2 #6 requires disabling, overriding the tooltip SKIP example |
+| addons/crm/static/src/views/crm_form/crm_pls_tooltip_button.xml | 4-9 | `.o_crm_pls_tooltip_button` `<button>` (rendered at crm_lead_views.xml:98-99, 130) | DISABLE | Rule 3: control of the DISABLE tooltip call |
+| addons/crm/static/src/views/crm_kanban/crm_column_progress.js | 12-16 | `onWillStart`: `user.hasGroup("crm.group_use_recurring_revenues")` probe | SKIP | Advisory read: it only shows or hides the recurring-revenue aggregate |
+| addons/crm/static/src/views/crm_kanban/crm_kanban_model.js | 18-19 | `moveRecord`: `crm.lead` `web_save [[resId], {stage_id}]` (kanban drag, mobile card stage `<select>`), no `web_resequence` | QUEUE | Write on crm.lead, args = resId plus the target stage id from the loaded groups |
+| addons/crm/static/src/views/crm_kanban/crm_kanban_model.js | 29 | `checkRainbowmanMessage` after a stage move: `crm.lead.get_rainbowman_message` | SKIP | Decorative read: the celebration message only |
+| addons/crm/static/src/webclient/share_target/crm_share_target_item.js | 14-27 | Share target start-up: `onWillStart` then `updateTeams`, `orm.webSearchRead("crm.team", ...)` | DISABLE | Rule 3: team list for a lead create that cannot run offline |
+| addons/crm/static/src/webclient/share_target/crm_share_target_item.js | 29-33 | Share target `onCompanyChange`: `updateTeams` re-read of `crm.team` | DISABLE | Rule 3: the same team read, triggered by the company switch |
+| addons/crm/views/crm_lead_views.xml | 7 | Lead form `crm_form`, new record: `crm.lead` `web_save [[], changes]` | QUEUE | Write on crm.lead, values from the form, defaults from the cached `onchange` |
+| addons/crm/views/crm_lead_views.xml | 9-11 | Won `<button name="action_set_won_rainbowman">`, queued as `crm.lead.action_set_won` | QUEUE | Write on crm.lead, args `[[resId]]`; `action_set_won_rainbowman` itself is never queued |
+| addons/crm/views/crm_lead_views.xml | 12-13 | Convert to Opportunity `<button name="action_convert_to_opportunity">` | DISABLE | Id produced by another call: the server may create the partner |
+| addons/crm/views/crm_lead_views.xml | 14-15 | Restore `<button name="action_restore">` | DISABLE | Rule 3: writes the server-computed automated probability |
+| addons/crm/views/crm_lead_views.xml | 16-17 | Lost `<button name="%(crm.crm_lead_lost_action)d" type="action">` | DISABLE | Transient wizard (`crm.lead.lost`) |
+| addons/crm/views/crm_lead_views.xml | 18-21 | `stage_id` `rotting_statusbar_duration`: `crm.lead` `web_save [[resId], {stage_id}]` | QUEUE | Write on crm.lead, args = resId plus a stage id from the loaded options |
+| addons/crm/views/crm_lead_views.xml | 33-41 | Schedule Meeting `<button name="action_schedule_meeting">` | DISABLE | Rule 3: server-built `calendar.event` action |
+| addons/crm/views/crm_lead_views.xml | 42-50 | Similar Leads `<button name="action_show_potential_duplicates">` | DISABLE | Rule 3: action over server-computed duplicate ids |
+| addons/crm/views/crm_lead_views.xml | 88-97 | AI switch `<a type="object" name="action_set_automated_probability">` (wide layout) | DISABLE | Rule 3: writes a server-computed probability |
+| addons/crm/views/crm_lead_views.xml | 137-146 | AI switch `<a type="object" name="action_set_automated_probability">` (small-screen layout) | DISABLE | Rule 3: writes a server-computed probability |
+| addons/crm/views/crm_lead_views.xml | 166-185 | `partner_id` `res_partner_many2one` (lead layout): create, create and edit, search-more dialog, partner_autocomplete enrichment | DISABLE | Id produced by another call (a new partner) or an uncached server search; the cached name search stays usable |
+| addons/crm/views/crm_lead_views.xml | 186-208 | `partner_id` `res_partner_many2one` (opportunity layout): create, create and edit, search-more dialog, partner_autocomplete enrichment | DISABLE | Id produced by another call (a new partner) or an uncached server search; the cached name search stays usable |
+| addons/crm/views/crm_lead_views.xml | 211-214 | `<button name="mail_action_blacklist_remove">` | DISABLE | Transient wizard (`mail.blacklist.remove`) |
+| addons/crm/views/crm_lead_views.xml | 224-227 | `<button name="phone_action_blacklist_remove">` | DISABLE | Transient wizard (`phone.blacklist.remove`) |
+| addons/crm/views/crm_lead_views.xml | 244 | Form `tag_ids` `on_tag_click: 'edit_color'` popover: `crm.tag` colour and "Hide in Kanban" saves | DISABLE | Rule 3: write on `crm.tag`, outside the QUEUE models |
+| addons/crm/views/crm_lead_views.xml | 299 | `<chatter>`: message posting and thread fetch | DISABLE | Rule 3: write on `mail.message`, outside the QUEUE models; the chatter degrades to read-only |
+| addons/crm/views/crm_lead_views.xml | 307-312 | Action `crm.act_crm_opportunity_calendar_event_new` (`calendar.event`) | DISABLE | Rule 3: calendar meeting action, `calendar.event` offline is out of scope |
+| addons/crm/views/crm_lead_views.xml | 322 | Leads list header `<button name="%(action_crm_send_mass_convert)d">` | DISABLE | Transient wizard (`crm.lead2opportunity.partner.mass`) |
+| addons/crm/views/crm_lead_views.xml | 323 | Leads list header Mark Lost `%(crm.crm_lead_lost_action)d` | DISABLE | Transient wizard (`crm.lead.lost`) |
+| addons/crm/views/crm_lead_views.xml | 352 | Leads list `tag_ids` `edit_color` popover (row in edition) | DISABLE | Rule 3: write on `crm.tag`, outside the QUEUE models |
+| addons/crm/views/crm_lead_views.xml | 373 | Leads kanban `activity_ids` `kanban_activity` popover | DISABLE | Rule 3: loads activities through `fetchStoreData`; its schedule control opens the `mail.activity` form, which needs `onchange` |
+| addons/crm/views/crm_lead_views.xml | 383-396 | `crm.lead` calendar view `crm_case_calendar_view_leads` | DISABLE | Rule 3: analysis read, blocked view type `calendar` |
+| addons/crm/views/crm_lead_views.xml | 468-495 | `crm.lead` activity view `crm_lead_view_activity` | DISABLE | Rule 3: analysis read, blocked view type `activity` |
+| addons/crm/views/crm_lead_views.xml | 502-503 | Pipeline kanban quick create (`on_create="quick_create"`, `crm.quick_create_opportunity_form`): `crm.lead` `web_save [[], vals]` | QUEUE | Write on crm.lead, values from the quick-create form, defaults from the cached `onchange` |
+| addons/crm/views/crm_lead_views.xml | 502-503 | Mobile pipeline "New" quick create: `crm.lead` `web_save [[], {name, contact_name, phone, email_from, expected_revenue, stage_id}]` | QUEUE | Write on crm.lead, args = six client inputs and the action context, no `onchange` |
+| addons/crm/views/crm_lead_views.xml | 517 | Card menu Delete `<a type="delete">`: `crm.lead` `unlink [resIds]` | QUEUE | Write on crm.lead whose only argument is the record ids |
+| addons/crm/views/crm_lead_views.xml | 519 | Card menu `color` `kanban_color_picker`: `crm.lead` `web_save [[resId], {color}]` | QUEUE | Write on crm.lead, args = resId plus a client-chosen colour index |
+| addons/crm/views/crm_lead_views.xml | 546 | Pipeline `activity_ids` `kanban_activity` popover (wide layout) | DISABLE | Rule 3: loads activities through `fetchStoreData`; its schedule control opens the `mail.activity` form, which needs `onchange` |
+| addons/crm/views/crm_lead_views.xml | 546 | Mobile activity sheet (lead card, phone lead form) Log a call and Schedule follow-up: `mail.activity` `create [[{res_model: "crm.lead", res_id, activity_type_id, summary, date_deadline, user_id}]]` | QUEUE | Write of a `mail.activity` on a lead, args = synced lead id, cached type and the inputs |
+| addons/crm/views/crm_lead_views.xml | 546 | Mobile activity sheet Mark done: `mail.activity` `action_done [[activityId]]` | QUEUE | Write of a `mail.activity` on a lead, args = the synced activity id |
+| addons/crm/views/crm_lead_views.xml | 560-601 | Forecast kanban `crm_lead_view_kanban_forecast` (`forecast_kanban`) | DISABLE | Rule 3: forecast read, forecast offline is out of scope |
+| addons/crm/views/crm_lead_views.xml | 669-679 | Bound action "Send email" `crm.action_lead_mail_compose` (`mail.compose.message`) | DISABLE | Transient wizard (`mail.compose.message`) |
+| addons/crm/views/crm_lead_views.xml | 681-691 | Bound action "Send email" (mass mail) `crm.action_lead_mass_mail` (`mail.compose.message`) | DISABLE | Transient wizard (`mail.compose.message`) |
+| addons/crm/views/crm_lead_views.xml | 705 | Opportunities list header Mark Lost `%(crm.crm_lead_lost_action)d` | DISABLE | Transient wizard (`crm.lead.lost`) |
+| addons/crm/views/crm_lead_views.xml | 706 | Opportunities list header Email `%(crm.action_lead_mass_mail)d` | DISABLE | Transient wizard (`mail.compose.message`) |
+| addons/crm/views/crm_lead_views.xml | 730 | Opportunities list `activity_ids` `list_activity` popover | DISABLE | Rule 3: loads activities through `fetchStoreData`; its schedule control opens the `mail.activity` form, which needs `onchange` |
+| addons/crm/views/crm_lead_views.xml | 748 | Opportunities list `tag_ids` `edit_color` popover (row in edition) | DISABLE | Rule 3: write on `crm.tag`, outside the QUEUE models |
+| addons/crm/views/crm_lead_views.xml | 754 | `mail_activity_mixin_list_reschedule_dropdown`: `doActionButton` `crm.lead` `action_reschedule_my_next_*` | DISABLE | Id produced by another call: the server resolves which activity is "my next" |
+| addons/crm/views/crm_lead_views.xml | 755 | Opportunities list row Email `%(crm.action_lead_mail_compose)d` | DISABLE | Transient wizard (`mail.compose.message`) |
+| addons/crm/views/crm_lead_views.xml | 760-777 | Forecast list `crm_lead_view_tree_forecast` | DISABLE | Rule 3: forecast read, forecast offline is out of scope |
+| addons/crm/views/crm_lead_views.xml | 828-844 | `crm.lead` graph view `crm_lead_view_graph` | DISABLE | Rule 3: analysis read, blocked view type `graph` |
+| addons/crm/views/crm_lead_views.xml | 846-866 | `crm.lead` graph view `crm_lead_view_graph_forecast` | DISABLE | Rule 3: forecast analysis read, blocked view type `graph` |
+| addons/crm/views/crm_lead_views.xml | 868-886 | `crm.lead` pivot view `crm_lead_view_pivot` | DISABLE | Rule 3: analysis read, blocked view type `pivot` |
+| addons/crm/views/crm_lead_views.xml | 888-909 | `crm.lead` pivot view `crm_lead_view_pivot_forecast` | DISABLE | Rule 3: forecast analysis read, blocked view type `pivot` |
+| addons/crm/views/crm_lead_views.xml | 1194-1215 | Action `crm.crm_lead_action_forecast` (kanban, graph, pivot, list) | DISABLE | Rule 3: forecast action, forecast offline is out of scope |
+| addons/crm/views/crm_lead_views.xml | 1260-1268 | Bound action "Add/Remove Followers" `crm.mail_followers_edit_action_from_lead` | DISABLE | Transient wizard (`mail.followers.edit`) |
+| addons/crm/views/crm_lost_reason_views.xml | 22-28 | `crm.lost.reason` form `<button name="action_lost_leads">` | DISABLE | Rule 3: server-built action on a model outside the QUEUE models |
+| addons/crm/views/crm_menu_views.xml | 65-70 | Menu `crm.crm_menu_forecast` | DISABLE | Rule 3: opens the DISABLE action `crm.crm_lead_action_forecast` |
+| addons/crm/views/crm_menu_views.xml | 71-76 | Menu `crm.crm_opportunity_report_menu` | DISABLE | Rule 3: opens the DISABLE action `crm.crm_opportunity_report_action` |
+| addons/crm/views/crm_menu_views.xml | 77-82 | Menu `crm.crm_opportunity_report_menu_lead` | DISABLE | Rule 3: opens the DISABLE action `crm.crm_opportunity_report_action_lead` |
+| addons/crm/views/crm_menu_views.xml | 83-88 | Menu `crm.crm_activity_report_menu` | DISABLE | Rule 3: opens the DISABLE action `crm.crm_activity_report_action` |
+| addons/crm/views/crm_menu_views.xml | 97-103 | Menu `crm.crm_config_settings_menu` | DISABLE | Rule 3: opens the DISABLE action `crm.crm_config_settings_action` |
+| addons/crm/views/crm_menu_views.xml | 142-148 | Menu `crm.crm_recurring_plan_menu_config` | DISABLE | Rule 3: opens the DISABLE action `crm.crm_recurring_plan_action` |
+| addons/crm/views/crm_recurring_plan_views.xml | 27-39 | Action `crm.crm_recurring_plan_action` (`crm.recurring.plan`) | DISABLE | Rule 3: configuration whose writes target `crm.recurring.plan`, outside the QUEUE models |
+| addons/crm/views/crm_stage_views.xml | 32-67 | `crm.stage` form `crm_stage_form` opened from `crm.crm_stage_action`: `web_save [[resId], changes]` | QUEUE | Write on crm.stage, args = resId plus the edited field values |
+| addons/crm/views/crm_team_views.xml | 80-89 | Action `crm.action_report_crm_lead_salesteam` (graph, pivot, list) | DISABLE | Rule 3: team leads analysis report action |
+| addons/crm/views/crm_team_views.xml | 109-121 | Action `crm.action_report_crm_opportunity_salesteam` (graph, pivot, list) | DISABLE | Rule 3: team pipeline analysis report action |
+| addons/crm/views/crm_team_views.xml | 144-149 | Team form `<button name="action_assign_leads">` | DISABLE | Rule 3: server-side lead assignment |
+| addons/crm/views/crm_team_views.xml | 206-215 | Team form stat `<button name="action_open_opportunities">` | DISABLE | Rule 3: server-built action from the manage-teams form |
+| addons/crm/views/crm_team_views.xml | 275-277 | Dashboard `<a type="object" name="action_open_unassigned_opportunities">` | DISABLE | Rule 3: server-built navigation on the team-selection surface |
+| addons/crm/views/crm_team_views.xml | 285 | Dashboard `<a type="action">` `crm_case_form_view_salesteams_lead` | DISABLE | Rule 3: team dashboard navigation link |
+| addons/crm/views/crm_team_views.xml | 290 | Dashboard `<a type="action">` `crm_case_form_view_salesteams_opportunity` | DISABLE | Rule 3: team dashboard navigation link |
+| addons/crm/views/crm_team_views.xml | 301 | Dashboard `<a type="action">` `crm_lead_action_open_lead_form` | DISABLE | Rule 3: team dashboard navigation link |
+| addons/crm/views/crm_team_views.xml | 306 | Dashboard `<a type="action">` `action_opportunity_form` | DISABLE | Rule 3: team dashboard navigation link |
+| addons/crm/views/crm_team_views.xml | 317 | Dashboard `<a type="action">` `action_report_crm_lead_salesteam` | DISABLE | Rule 3: link to a DISABLE report action |
+| addons/crm/views/crm_team_views.xml | 322 | Dashboard `<a type="action">` `action_report_crm_opportunity_salesteam` | DISABLE | Rule 3: link to a DISABLE report action |
+| addons/crm/views/crm_team_views.xml | 330 | Dashboard `<a type="action">` `crm.crm_activity_report_action_team` | DISABLE | Rule 3: link to a DISABLE report action |
+| addons/crm/views/res_config_settings_views.xml | 16-17 | CRM settings `<button type="action" name="crm.crm_recurring_plan_action">` | DISABLE | Rule 3: settings button of `res.config.settings` (module crm) opening a DISABLE action |
+| addons/crm/views/res_config_settings_views.xml | 53-55 | CRM settings `<button name="%(crm_lead_pls_update_action)d">` Update Probabilities | DISABLE | Transient wizard (`crm.lead.pls.update`) |
+| addons/crm/views/res_config_settings_views.xml | 70-72 | CRM settings `<button name="action_crm_assign_leads">` | DISABLE | Transient model method (`res.config.settings`) |
+| addons/crm/views/res_config_settings_views.xml | 113-119 | Action `crm.crm_config_settings_action` (`res.config.settings`, `module: crm`) | DISABLE | Transient model (`res.config.settings`) |
+| addons/crm/views/res_partner_views.xml | 12-18 | Partner form `<button name="action_view_opportunity">` (`res.partner`) | DISABLE | Rule 3: server-built action on `res.partner` |
+| addons/crm/views/utm_campaign_views.xml | 18-20 | Campaign kanban `<a type="object" name="action_redirect_to_leads_opportunities">` | DISABLE | Rule 3: server-built action on `utm.campaign` |
+| addons/crm/views/utm_campaign_views.xml | 36-40 | Campaign form `<button name="action_redirect_to_leads_opportunities">` | DISABLE | Rule 3: server-built action on `utm.campaign` |
+| addons/crm/wizard/crm_lead_lost_views.xml | 15 | `crm.lead.lost` `<button name="action_lost_reason_apply">` | DISABLE | Transient wizard (`crm.lead.lost`) |
+| addons/crm/wizard/crm_lead_lost_views.xml | 22-33 | Action and bound action "Mark Lost" `crm.crm_lead_lost_action` | DISABLE | Transient wizard (`crm.lead.lost`) |
+| addons/crm/wizard/crm_lead_pls_update_views.xml | 18-19 | `crm.lead.pls.update` `<button name="action_update_crm_lead_probabilities">` | DISABLE | Transient wizard (`crm.lead.pls.update`) |
+| addons/crm/wizard/crm_lead_pls_update_views.xml | 26-32 | Action `crm.crm_lead_pls_update_action` | DISABLE | Transient wizard (`crm.lead.pls.update`) |
+| addons/crm/wizard/crm_lead_to_opportunity_mass_views.xml | 55 | `crm.lead2opportunity.partner.mass` `<button name="action_apply">` | DISABLE | Transient wizard (`crm.lead2opportunity.partner.mass`) |
+| addons/crm/wizard/crm_lead_to_opportunity_mass_views.xml | 62-69 | Action `crm.action_crm_send_mass_convert` | DISABLE | Transient wizard (`crm.lead2opportunity.partner.mass`) |
+| addons/crm/wizard/crm_merge_opportunities_views.xml | 34 | `crm.merge.opportunity` `<button name="action_merge">` | DISABLE | Transient wizard (`crm.merge.opportunity`) |
+| addons/crm/wizard/crm_merge_opportunities_views.xml | 41-48 | Action and bound action "Merge" `crm.action_merge_opportunities` | DISABLE | Transient wizard (`crm.merge.opportunity`) |
+| addons/sales_team/static/src/js/crm_team_form.js | 25-46 | Team form `crm_team_activate_multi_membership`: `user.hasGroup("sales_team.group_sale_manager")` then `ir.config_parameter.set_bool` | DISABLE | Rule 3: write on `ir.config_parameter`, outside the QUEUE models; the probe is skipped and treated as false |
+| addons/sales_team/views/crm_team_views.xml | 132 | Dashboard card click: kanban root `action="action_primary_channel_button" type="object"` | DISABLE | Rule 3: server-built navigation on the team-selection surface |
+| addons/sales_team/views/crm_team_views.xml | 134-164 | Dashboard card menu toggle (`web.KanbanMenu` `<button>`) on `crm.team` cards | DISABLE | Rule 3: opens the team navigation menu (links and Configuration) |
+| addons/sales_team/views/crm_team_views.xml | 157 | Manager colour picker `kanban_color_picker`: `crm.team` `web_save [[resId], {color}]` | QUEUE | Write on crm.team, args = resId plus a client-chosen colour index |
+| addons/sales_team/views/crm_team_views.xml | 160 | "Configuration" `<a type="open">` to the `crm.team` form | DISABLE | Rule 3: manage-teams navigation to the team form |
+| addons/web/static/src/views/form/form_controller.js | 583-595 | Lead form Action menu "Edit Properties" | DISABLE | Rule 3: definition editing reads `ir.model` and stores the definition on the parent `crm.team` server-side |
+| addons/web/static/src/views/form/form_controller.js | 596-602 | Lead form Action menu "Duplicate" (`copy`) | DISABLE | Rule 3: server-side copy whose new id the server produces |
+| addons/web/static/src/views/form/form_controller.js | 603-612 | Lead form Action menu "Archive": `crm.lead` `action_archive [[resId]]` | QUEUE | Write on crm.lead whose only argument is the record id |
+| addons/web/static/src/views/form/form_controller.js | 613-620 | Lead form Action menu "Unarchive": `crm.lead` `action_unarchive [[resId]]` | QUEUE | Write on crm.lead whose only argument is the record id |
+| addons/web/static/src/views/form/form_controller.js | 621-630 | Lead form Action menu "Delete": `crm.lead` `unlink [[resId]]` | QUEUE | Write on crm.lead whose only argument is the record id |
+| addons/web/static/src/views/list/list_controller.js | 444-450 | Lead list Action menu "Export" | DISABLE | Rule 3: server-side export of the selection |
+| addons/web/static/src/views/list/list_controller.js | 451-457 | Lead list Action menu "Duplicate" (`copy`) | DISABLE | Rule 3: server-side copy whose new ids the server produces |
+| addons/web/static/src/views/list/list_controller.js | 458-466 | Lead list Action menu "Archive": `crm.lead` `action_archive [resIds]` | QUEUE | Write on crm.lead whose only argument is the selected record ids |
+| addons/web/static/src/views/list/list_controller.js | 467-474 | Lead list Action menu "Unarchive": `crm.lead` `action_unarchive [resIds]` | QUEUE | Write on crm.lead whose only argument is the selected record ids |
+| addons/web/static/src/views/list/list_controller.js | 475-483 | Lead list Action menu "Delete": `crm.lead` `unlink [resIds]` | QUEUE | Write on crm.lead whose only argument is the selected record ids |
+| addons/web/static/src/webclient/share_target/share_target_item.js | 58-65 | CRM share target save, step 1: `checkAndActiveIfNeededUserCompany` company switch | DISABLE | Rule 3: changes the active companies only as the first step of a create that cannot run offline |
+| addons/web/static/src/webclient/share_target/share_target_item.js | 79-83 | CRM share target save, step 2: `process()` uploads attachments, `crm.lead` `name_create` (142-163), `ir.attachment` write | DISABLE | Id produced by another call: the attachments need the server-created lead id |
+
+## Generated sets
+
+Generated from the DISABLE rows above. `crm_offline_hooks.js` freezes exactly these members.
+
+- `CRM_OFFLINE_BUTTON_MODELS`: `crm.lead`, `crm.team`, `crm.stage`, `crm.lost.reason`, `crm.lead.lost`, `crm.lead2opportunity.partner.mass`, `crm.merge.opportunity`, `crm.lead.pls.update`.
+- `CRM_OFFLINE_BUTTON_METHODS`: `res.partner` / `action_view_opportunity`; `utm.campaign` / `action_redirect_to_leads_opportunities`; `res.config.settings` with `context.module === "crm"` (any button name).
+- `CRM_OFFLINE_DISABLED_ACTIONS`: `crm.crm_lead_action_forecast`, `crm.crm_opportunity_report_action`, `crm.crm_opportunity_report_action_lead`, `crm.crm_activity_report_action`, `crm.crm_activity_report_action_team`, `crm.action_report_crm_lead_salesteam`, `crm.action_report_crm_opportunity_salesteam`, `crm.crm_lead_lost_action`, `crm.action_crm_send_mass_convert`, `crm.action_merge_opportunities`, `crm.crm_lead_pls_update_action`, `crm.action_lead_mail_compose`, `crm.action_lead_mass_mail`, `crm.mail_followers_edit_action_from_lead`, `crm.act_crm_opportunity_calendar_event_new`, `crm.crm_config_settings_action`, `crm.crm_recurring_plan_action`.
+- `CRM_OFFLINE_DISABLED_MENUS`: `crm.crm_menu_forecast`, `crm.crm_opportunity_report_menu`, `crm.crm_opportunity_report_menu_lead`, `crm.crm_activity_report_menu`, `crm.crm_config_settings_menu`, `crm.crm_recurring_plan_menu_config`.
+- Blocked view types on `crm.lead` and `crm.activity.report`: `graph`, `pivot`, `activity`, `calendar`.
+
+Never blocked: `crm.crm_lead_action_pipeline`, `crm.crm_lead_all_leads`, `crm.crm_lead_opportunities`, `sales_team.crm_team_action_pipeline` and `crm.crm_stage_action`, whose cached reads and QUEUE writes stay available offline. The targets of the DISABLE team-dashboard links (`crm.crm_case_form_view_salesteams_lead`, `crm.crm_case_form_view_salesteams_opportunity`, `crm.crm_lead_action_open_lead_form`, `crm.action_opportunity_form`) and the activity-menu target `crm.crm_lead_action_my_activities` are not set members either: those rows are stopped at their control, and the actions themselves open lead lists, kanbans and forms whose cached reads and QUEUE writes are allowed offline. The lead-generation actions are built in JS without an `xml_id` (the `import` client action and the `base.module.install.request` form), so their handler guards stop them instead of this set. Configuration menus that open framework lists of other models (lost reasons, tags, activity types and plans, teams, team members) are not sweep entry points and have no rows.
+
+## Counts
+
+Counted over the rows of the Inventory table only; the total equals its row count.
+
+| class | count |
+|---|---|
+| QUEUE | 22 |
+| SKIP | 3 |
+| DISABLE | 114 |
+| total | 139 |
