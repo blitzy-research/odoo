@@ -332,6 +332,11 @@
                             </a>
                         </div>
                     </xpath>
+                    <xpath expr="//div[hasclass('o_kanban_card_manage_settings')]//a[@type='open']" position="attributes">
+                        <attribute name="t-att-class">widget.crm_offline ? 'o_disabled_offline pe-none' : ''</attribute>
+                        <attribute name="t-att-aria-disabled">widget.crm_offline ? 'true' : false</attribute>
+                        <attribute name="t-att-tabindex">widget.crm_offline ? -1 : false</attribute>
+                    </xpath>
                 </data>
             </field>
         </record>

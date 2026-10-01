@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+    <!--
+        Bottom-sheet quick create of the CRM mobile pipeline (CrmMobileQuickCreate).
+        It captures exactly six crm.lead fields and nothing else: no "Edit" or
+        "Create and edit" flow, no onchange. Every field and both buttons carry
+        data-available-offline on the interactive element itself, so the offline
+        plugin never disables them and the sheet stays usable offline.
+        novalidate lets the component's own name check run instead of the browser
+        bubble; Save submits the form, which calls onSubmit -> onSave.
+    -->
+    <t t-name="crm.CrmMobileQuickCreate">
+        <form class="o_crm_mobile_quick_create d-flex flex-column gap-2 p-1"
+            t-att-aria-labelledby="this.fieldId('title')"
+            t-on-submit.prevent="this.onSubmit"
+            novalidate="">
+            <h4 class="o_crm_mobile_quick_create_title mb-1" t-att-id="this.fieldId('title')">New Lead</h4>
+
+            <div class="o_crm_mobile_quick_create_row">
+                <label class="form-label" t-att-for="this.fieldId('name')">Lead name</label>
+                <input type="text"
+                    class="form-control o_crm_mobile_quick_create_field"
+                    t-att-class="{ 'is-invalid o_field_invalid': this.state.invalidName }"
+                    t-att-id="this.fieldId('name')"
+                    name="name"
+                    required=""
+                    autocomplete="off"
+                    placeholder="e.g. Product Pricing"
+                    t-ref="this.nameRef"
+                    t-model.proxy="this.state.name"
+                    t-on-input="this.onNameInput"
+                    t-att-aria-invalid="this.state.invalidName ? 'true' : false"
+                    t-att-aria-describedby="this.state.invalidName ? this.fieldId('name_feedback') : false"
+                    data-available-offline="1"/>
+                <div t-if="this.state.invalidName"
+                    class="invalid-feedback d-block"
+                    t-att-id="this.fieldId('name_feedback')">A lead name is required.</div>
+            </div>
+
+            <div class="o_crm_mobile_quick_create_row">
+                <label class="form-label" t-att-for="this.fieldId('contact_name')">Contact name</label>
+                <input type="text"
+                    class="form-control o_crm_mobile_quick_create_field"
+                    t-att-id="this.fieldId('contact_name')"
+                    name="contact_name"
+                    autocomplete="name"
+                    t-model.proxy="this.state.contact_name"
+                    data-available-offline="1"/>
+            </div>
+
+            <div class="o_crm_mobile_quick_create_row">
+                <label class="form-label" t-att-for="this.fieldId('phone')">Phone</label>
+                <input type="tel"
+                    class="form-control o_crm_mobile_quick_create_field"
+                    t-att-id="this.fieldId('phone')"
+                    name="phone"
+                    inputmode="tel"
+                    autocomplete="tel"
+                    t-model.proxy="this.state.phone"
+                    data-available-offline="1"/>
+            </div>
+
+            <div class="o_crm_mobile_quick_create_row">
+                <label class="form-label" t-att-for="this.fieldId('email_from')">Email</label>
+                <input type="email"
+                    class="form-control o_crm_mobile_quick_create_field"
+                    t-att-id="this.fieldId('email_from')"
+                    name="email_from"
+                    inputmode="email"
+                    autocomplete="email"
+                    t-model.proxy="this.state.email_from"
+                    data-available-offline="1"/>
+            </div>
+
+            <div class="o_crm_mobile_quick_create_row">
+                <label class="form-label" t-att-for="this.fieldId('expected_revenue')">Expected revenue</label>
+                <input type="number"
+                    class="form-control o_crm_mobile_quick_create_field"
+                    t-att-id="this.fieldId('expected_revenue')"
+                    name="expected_revenue"
+                    inputmode="decimal"
+                    min="0"
+                    step="any"
+                    t-model.proxy="this.state.expected_revenue"
+                    data-available-offline="1"/>
+            </div>
+
+            <div class="o_crm_mobile_quick_create_row">
+                <label class="form-label" t-att-for="this.fieldId('stage_id')">Stage</label>
+                <!-- .number keeps state.stage_id a number: options are selected by strict equality with stage.id -->
+                <select class="form-select o_crm_mobile_quick_create_field"
+                    t-att-id="this.fieldId('stage_id')"
+                    name="stage_id"
+                    t-model.proxy.number="this.state.stage_id"
+                    data-available-offline="1">
+                    <option t-foreach="this.props.stages" t-as="stage" t-key="stage.id"
+                        t-att-value="stage.id"
+                        t-out="stage.display_name"/>
+                </select>
+            </div>
+
+            <div class="o_crm_mobile_quick_create_buttons d-flex gap-2 mt-2">
+                <button type="submit"
+                    class="btn btn-primary flex-grow-1 o_crm_mobile_quick_create_save"
+                    t-att-disabled="this.state.isSaving"
+                    data-available-offline="1">Save</button>
+                <button type="button"
+                    class="btn btn-secondary flex-grow-1 o_crm_mobile_quick_create_cancel"
+                    t-on-click="this.onCancel"
+                    data-available-offline="1">Cancel</button>
+            </div>
+        </form>
+    </t>
+
+</templates>
