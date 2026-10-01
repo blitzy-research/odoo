@@ -1,4 +1,4 @@
-import { Component, proxy } from "@odoo/owl";
+import { Component, proxy, usePlugin } from "@odoo/owl";
 import { Dropdown } from "@web/core/dropdown/dropdown";
 import { DropdownItem } from "@web/core/dropdown/dropdown_item";
 import { useDropdownState } from "@web/core/dropdown/dropdown_hooks";
@@ -7,6 +7,7 @@ import { useHotkey } from "@web/core/hotkeys/hotkey_hook";
 import { sprintf } from "@web/core/utils/strings";
 import { _t } from "@web/core/l10n/translation";
 import { user } from "@web/core/user";
+import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { ConfirmationDialog } from "@web/core/confirmation_dialog/confirmation_dialog";
 import { ErrorDialog } from "@web/core/errors/error_dialogs";
 import { PromoteMailPluginsDialog } from "@crm/components/promote_mail_plugins_dialog/promote_mail_plugins_dialog";
@@ -27,6 +28,7 @@ export class LeadGenerationDropdown extends Component {
         this.orm = useService("orm");
         this.dialogs = useService("dialog");
         this.action = useService("action");
+        this.offlinePlugin = usePlugin(OfflinePlugin);
         this.newContentText = {
             FAILED_TO_INSTALL: _t('Failed to install "%(module_name)s"'),
             INSTALLING: _t('Installing "%(module_name)s"'),
@@ -119,6 +121,9 @@ export class LeadGenerationDropdown extends Component {
     }
 
     async toggleDropdown() {
+        if (this.offlinePlugin.isOffline()) {
+            return;
+        }
         for (const dropdownContentElement in this.state.dropdownContentElements) {
             this.resetDescription(this.state.dropdownContentElements[dropdownContentElement]);
         }
@@ -181,6 +186,9 @@ export class LeadGenerationDropdown extends Component {
     }
 
     onClickAction(element) {
+        if (this.offlinePlugin.isOffline()) {
+            return;
+        }
         if (!element.hasAccess) {
             return this.requestAccess(
                 element.moduleName,
@@ -238,6 +246,9 @@ export class LeadGenerationDropdown extends Component {
     }
 
     redirectToImport() {
+        if (this.offlinePlugin.isOffline()) {
+            return;
+        }
         const { context, resModel } = this.env.searchModel;
         this.action.doAction({
             type: "ir.actions.client",
@@ -254,6 +265,9 @@ export class LeadGenerationDropdown extends Component {
      * present in the database (true) or request access to an already installed module (false)
      */
     requestAccess(moduleName, title, install) {
+        if (this.offlinePlugin.isOffline()) {
+            return;
+        }
         const { id } = this.modulesInfo[moduleName];
         this.action.doAction({
             type: "ir.actions.act_window",

@@ -35,6 +35,12 @@ export class CrmPlsTooltipButton extends Component {
     }
 
     async onClickPlsTooltipButton(ev) {
+        // Predictive scoring is unavailable offline: the button is disabled by the
+        // offline plugin's button selector, and this guard also stops a direct call
+        // before the save and the prepare_pls_tooltip_data lookup are issued.
+        if (this.props.record.model.offlinePlugin.isOffline()) {
+            return;
+        }
         const tooltipButtonEl = ev.currentTarget;
         if (this.popover.isOpen) {
             this.popover.close();
