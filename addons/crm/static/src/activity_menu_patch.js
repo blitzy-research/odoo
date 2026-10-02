@@ -43,6 +43,13 @@ patch(ActivityMenu.prototype, {
         // fetch the data from the button otherwise fetch the ones from the parent (.o_ActivityMenuView_activityGroup).
         const context = {};
         if (group.model === "crm.lead") {
+            // My Activities cannot be loaded without the server: offline, the CRM
+            // row is inert (no dropdown close, no action load, nothing queued).
+            // The template disables the row and its counters, and this early
+            // return also covers keyboard activation and direct calls.
+            if (this.offlinePlugin.isOffline()) {
+                return;
+            }
             this.dropdown.close();
             if (filter === "my" || filter === "all") {
                 context["search_default_activities_overdue"] = 1;
