@@ -3,16 +3,19 @@
 
     <!--
         Lead card of the CRM mobile pipeline (CrmMobileLeadCard).
-        `this.values` is the lead projected with its queued writes, or `null` while a
-        queued delete or archive hides it, in which case nothing renders. Every
-        interactive element carries data-available-offline on the element itself, so
-        the offline plugin never disables it: the card stays usable offline. The
-        `disabled` states set here are the card's own (a provisional card, created
-        offline, cannot be opened, moved or given activities until it has synced),
-        and the framework never toggles a button that is already disabled.
+        `card` is `this.cardData`, read once per render: the lead projected with its
+        queued writes (`card.values`) and what derives from it, or `null` while a
+        queued delete or archive hides it (or without record), in which case nothing
+        renders. Every interactive element carries data-available-offline on the
+        element itself, so the offline plugin never disables it: the card stays
+        usable offline. The `disabled` states set here are the card's own (a
+        provisional card, created offline, cannot be opened, moved or given
+        activities until it has synced), and the framework never toggles a button
+        that is already disabled.
     -->
     <t t-name="crm.CrmMobileLeadCard">
-        <div t-if="this.values"
+        <t t-set="card" t-value="this.cardData"/>
+        <div t-if="card"
             class="o_crm_mobile_lead_card d-flex flex-column gap-2 p-2 border rounded bg-view"
             t-att-class="{ 'o_crm_mobile_lead_card_provisional': this.isProvisional }">
             <button type="button"
@@ -20,25 +23,33 @@
                 data-available-offline="1"
                 t-att-disabled="this.isProvisional"
                 t-on-click="this.onOpenClick">
-                <span class="o_crm_mobile_lead_name fw-bold" t-out="this.values.name"/>
-                <span t-if="this.partnerLabel" class="o_crm_mobile_lead_partner text-muted" t-out="this.partnerLabel"/>
-                <span t-if="this.revenueLabel" class="o_crm_mobile_lead_revenue" t-out="this.revenueLabel"/>
+                <span class="o_crm_mobile_lead_name fw-bold" t-out="card.values.name"/>
+                <span t-if="card.partnerLabel" class="o_crm_mobile_lead_partner text-muted" t-out="card.partnerLabel"/>
+                <span t-if="card.revenueLabel" class="o_crm_mobile_lead_revenue" t-out="card.revenueLabel"/>
             </button>
             <!-- Read from the framework queue only; the text, not only the colour, tells the state. -->
-            <span t-if="this.syncState"
+            <span t-if="card.syncState"
                 class="o_crm_mobile_pending_sync badge align-self-start"
-                t-att-class="this.syncState === 'failed' ? 'text-bg-danger' : 'text-bg-warning'">
-                <t t-if="this.syncState === 'failed'">Sync failed</t><t t-else="">Pending sync</t>
+                t-att-class="card.syncState === 'failed' ? 'text-bg-danger' : 'text-bg-warning'"
+                aria-hidden="true">
+                <t t-if="card.syncState === 'failed'">Sync failed</t><t t-else="">Pending sync</t>
+            </span>
+            <!-- Always present so its text change is announced; the visible badge is hidden from assistive technology to avoid reading it twice. -->
+            <span class="o_crm_mobile_lead_sync_status visually-hidden" role="status">
+                <t t-if="card.syncState === 'failed'">Sync failed</t><t t-elif="card.syncState">Pending sync</t>
             </span>
             <div class="o_crm_mobile_lead_actions d-flex gap-2 align-items-center">
-                <select class="o_crm_mobile_lead_stage form-select"
+                <!-- No selector without a loaded stage or choices; a stage outside the choices shows as an unselectable current option. -->
+                <select t-if="card.stage"
+                    class="o_crm_mobile_lead_stage form-select"
                     data-available-offline="1"
                     aria-label="Stage"
                     t-att-disabled="this.isProvisional"
                     t-on-change="this.onStageChange">
+                    <option t-if="card.stage.missing" value="" selected="selected" disabled="disabled" t-out="card.stage.label"/>
                     <t t-foreach="this.props.stages" t-as="stage" t-key="stage.id">
                         <option t-att-value="stage.id"
-                            t-att-selected="stage.id === this.selectedStageId"
+                            t-att-selected="stage.id === card.stage.id"
                             t-out="stage.display_name"/>
                     </t>
                 </select>
@@ -72,7 +83,7 @@
                 <span t-if="this.leadRecord" class="text-muted" t-out="this.leadRecord.data.name"/>
             </header>
 
-            <ul class="o_crm_mobile_lead_activities list-unstyled d-flex flex-column gap-2 mb-0">
+            <ul class="o_crm_mobile_lead_activities list-unstyled d-flex flex-column gap-2 mb-0" aria-live="polite">
                 <li t-foreach="this.syncedRows" t-as="row" t-key="row.id"
                     class="o_crm_mobile_activity_row d-flex align-items-center gap-2"
                     t-att-class="{ 'o_crm_mobile_activity_done_pending': row.donePending }"
@@ -89,7 +100,8 @@
                     <button type="button"
                         class="o_crm_mobile_activity_done btn btn-secondary ms-auto"
                         data-available-offline="1"
-                        t-att-disabled="row.donePending"
+                        t-att-disabled="row.donePending or row.doneBusy"
+                        t-att-aria-busy="row.doneBusy ? 'true' : false"
                         t-on-click="() => this.markDone(row)">
                         <t t-if="row.donePending">Done · Pending sync</t><t t-else="">Mark done</t>
                     </button>
@@ -111,10 +123,24 @@
                 </li>
             </ul>
 
-            <!-- Desktop-variant fallback: only the next activity is known, the others have no action. -->
-            <p t-if="this.moreCount" class="o_crm_mobile_activities_more text-muted mb-0"><t t-out="this.moreCount"/> more activities after sync</p>
+            <!--
+                Activities not listed above. Online, when the opener's bounded mobile root
+                load left some out, "Show more" reloads that root with the next page. It is
+                online only, like the pipeline's "Load more", hence no data-available-offline.
+                Offline, and in the desktop-variant fallback (only the next activity is
+                known), the others have no action.
+            -->
+            <div t-if="this.canLoadMoreActivities"
+                class="o_crm_mobile_activities_more_online d-flex align-items-center gap-2">
+                <span class="o_crm_mobile_activities_more_count text-muted"><t t-out="this.moreCount"/> more activities</span>
+                <button type="button"
+                    class="o_crm_mobile_activities_load_more btn btn-secondary ms-auto"
+                    t-att-disabled="this.isLoadingMoreActivities"
+                    t-on-click="this.loadMoreActivities">Show more</button>
+            </div>
+            <p t-elif="this.moreCount" class="o_crm_mobile_activities_more text-muted mb-0" role="status"><t t-out="this.moreCount"/> more activities after sync</p>
             <!-- No activity data cached for this lead: scheduling stays available. -->
-            <p t-if="this.hasNoActivityData" class="o_crm_mobile_activities_notice text-muted mb-0">Activities load after sync</p>
+            <p t-if="this.hasNoActivityData" class="o_crm_mobile_activities_notice text-muted mb-0" role="status">Activities load after sync</p>
 
             <div t-if="!this.state.form" class="o_crm_mobile_activity_actions d-flex gap-2">
                 <button type="button"
@@ -131,14 +157,22 @@
             <!-- Both openers are disabled without cached types, so the type list is never empty here. -->
             <div t-else="" class="o_crm_mobile_activity_form d-flex flex-column gap-2">
                 <select class="o_crm_mobile_activity_type form-select"
+                    t-att-class="{ 'is-invalid o_field_invalid': this.state.invalid.activity_type_id }"
                     data-available-offline="1"
                     aria-label="Activity type"
+                    required=""
+                    t-ref="this.typeRef"
+                    t-att-aria-invalid="this.state.invalid.activity_type_id ? 'true' : false"
+                    t-att-aria-describedby="this.state.invalid.activity_type_id ? this.fieldId('activity_type_id_feedback') : false"
                     t-on-change="(ev) => this.onFormChange('activity_type_id', ev)">
                     <option t-foreach="this.state.types" t-as="type" t-key="type.id"
                         t-att-value="type.id"
                         t-att-selected="type.id == this.state.form.activity_type_id"
                         t-out="type.display_name"/>
                 </select>
+                <div t-if="this.state.invalid.activity_type_id"
+                    class="invalid-feedback d-block"
+                    t-att-id="this.fieldId('activity_type_id_feedback')">An activity type is required.</div>
                 <input type="text"
                     class="o_crm_mobile_activity_summary form-control"
                     data-available-offline="1"
@@ -148,19 +182,35 @@
                     t-on-input="(ev) => this.onFormChange('summary', ev)"/>
                 <input type="date"
                     class="o_crm_mobile_activity_date form-control"
+                    t-att-class="{ 'is-invalid o_field_invalid': this.state.invalid.date_deadline }"
                     data-available-offline="1"
                     aria-label="Due date"
+                    required=""
+                    t-ref="this.dateRef"
+                    t-att-aria-invalid="this.state.invalid.date_deadline ? 'true' : false"
+                    t-att-aria-describedby="this.state.invalid.date_deadline ? this.fieldId('date_deadline_feedback') : false"
                     t-att-value="this.state.form.date_deadline"
                     t-on-change="(ev) => this.onFormChange('date_deadline', ev)"/>
+                <div t-if="this.state.invalid.date_deadline"
+                    class="invalid-feedback d-block"
+                    t-att-id="this.fieldId('date_deadline_feedback')">A valid due date is required.</div>
                 <select class="o_crm_mobile_activity_user form-select"
+                    t-att-class="{ 'is-invalid o_field_invalid': this.state.invalid.user_id }"
                     data-available-offline="1"
                     aria-label="Assigned to"
+                    required=""
+                    t-ref="this.userRef"
+                    t-att-aria-invalid="this.state.invalid.user_id ? 'true' : false"
+                    t-att-aria-describedby="this.state.invalid.user_id ? this.fieldId('user_id_feedback') : false"
                     t-on-change="(ev) => this.onFormChange('user_id', ev)">
                     <option t-foreach="this.state.assignees" t-as="assignee" t-key="assignee.id"
                         t-att-value="assignee.id"
                         t-att-selected="assignee.id == this.state.form.user_id"
                         t-out="assignee.display_name"/>
                 </select>
+                <div t-if="this.state.invalid.user_id"
+                    class="invalid-feedback d-block"
+                    t-att-id="this.fieldId('user_id_feedback')">An assignee is required.</div>
                 <div class="d-flex gap-2">
                     <button type="button"
                         class="o_crm_mobile_activity_save btn btn-primary"
@@ -170,6 +220,7 @@
                     <button type="button"
                         class="o_crm_mobile_activity_cancel btn btn-secondary"
                         data-available-offline="1"
+                        t-att-disabled="this.state.saving"
                         t-on-click="this.cancelForm">Cancel</button>
                 </div>
             </div>

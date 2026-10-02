@@ -25,7 +25,6 @@ Justifications name the rule that matched; "Rule 3" states why QUEUE and SKIP do
 - `check_rainbowman_message.js:2`: the shared `get_rainbowman_message` call, classified at its two call sites.
 - Pipeline card menu Edit `<a type="open">` (`crm_lead_views.xml:516`): it opens the lead form, whose read the framework serves from its record cache or answers with the offline action helper. It has no server side effect, stays usable offline with the card menu, and fits none of the three classes.
 - `tag_ids` with `edit_color` on kanban cards (`crm_lead_views.xml:369, 541`) and in the read-only activity report list (`report/crm_activity_report_views.xml:39`): the colour editor opens only on a record in edition, so these never reach a `crm.tag` write.
-- Wizard Cancel buttons with `special="cancel"` (`wizard/crm_lead_lost_views.xml:16`, `wizard/crm_lead_pls_update_views.xml:20`, `wizard/crm_lead_to_opportunity_mass_views.xml:56`, `wizard/crm_merge_opportunities_views.xml:35`): they close the dialog without a server call.
 - Public methods no button names: `crm_lead.py` `create`, `write`, `search_fetch`, `copy_data`, `action_set_lost`, `get_rainbowman_message`, `action_reschedule_meeting`, `redirect_lead_opportunity_view`, `get_empty_list_help`, `log_meeting`, `merge_opportunity`, `convert_opportunity`, `message_new`, `get_import_templates`, `prepare_pls_tooltip_data`; `crm_stage.py` `write`; `crm_team.py` `write`, `unlink`. They are reached through the rows' calls or from server code only.
 
 ## Inventory
@@ -147,12 +146,16 @@ Justifications name the rule that matched; "Rule 3" states why QUEUE and SKIP do
 | addons/crm/views/utm_campaign_views.xml | 18-20 | Campaign kanban `<a type="object" name="action_redirect_to_leads_opportunities">` | DISABLE | Rule 3: server-built action on `utm.campaign` |
 | addons/crm/views/utm_campaign_views.xml | 36-40 | Campaign form `<button name="action_redirect_to_leads_opportunities">` | DISABLE | Rule 3: server-built action on `utm.campaign` |
 | addons/crm/wizard/crm_lead_lost_views.xml | 15 | `crm.lead.lost` `<button name="action_lost_reason_apply">` | DISABLE | Transient wizard (`crm.lead.lost`) |
+| addons/crm/wizard/crm_lead_lost_views.xml | 16 | `crm.lead.lost` footer Cancel `<button special="cancel">` | DISABLE | Rule 3: no write and no read; framework-disabled offline like every footer button without `data-available-offline`; `special` calls pass the `doActionButton` guard, so the dialog still closes (close control or `doActionButton({special: "cancel"})`) without a `call_button` request (the opening view then reloads as after any dialog close) |
 | addons/crm/wizard/crm_lead_lost_views.xml | 22-33 | Action and bound action "Mark Lost" `crm.crm_lead_lost_action` | DISABLE | Transient wizard (`crm.lead.lost`) |
 | addons/crm/wizard/crm_lead_pls_update_views.xml | 18-19 | `crm.lead.pls.update` `<button name="action_update_crm_lead_probabilities">` | DISABLE | Transient wizard (`crm.lead.pls.update`) |
+| addons/crm/wizard/crm_lead_pls_update_views.xml | 20 | `crm.lead.pls.update` footer Cancel `<button special="cancel">` | DISABLE | Rule 3: no write and no read; framework-disabled offline like every footer button without `data-available-offline`; `special` calls pass the `doActionButton` guard, so the dialog still closes (close control or `doActionButton({special: "cancel"})`) without a `call_button` request (the opening view then reloads as after any dialog close) |
 | addons/crm/wizard/crm_lead_pls_update_views.xml | 26-32 | Action `crm.crm_lead_pls_update_action` | DISABLE | Transient wizard (`crm.lead.pls.update`) |
 | addons/crm/wizard/crm_lead_to_opportunity_mass_views.xml | 55 | `crm.lead2opportunity.partner.mass` `<button name="action_apply">` | DISABLE | Transient wizard (`crm.lead2opportunity.partner.mass`) |
+| addons/crm/wizard/crm_lead_to_opportunity_mass_views.xml | 56 | `crm.lead2opportunity.partner.mass` footer Cancel `<button special="cancel">` | DISABLE | Rule 3: no write and no read; framework-disabled offline like every footer button without `data-available-offline`; `special` calls pass the `doActionButton` guard, so the dialog still closes (close control or `doActionButton({special: "cancel"})`) without a `call_button` request (the opening view then reloads as after any dialog close) |
 | addons/crm/wizard/crm_lead_to_opportunity_mass_views.xml | 62-69 | Action `crm.action_crm_send_mass_convert` | DISABLE | Transient wizard (`crm.lead2opportunity.partner.mass`) |
 | addons/crm/wizard/crm_merge_opportunities_views.xml | 34 | `crm.merge.opportunity` `<button name="action_merge">` | DISABLE | Transient wizard (`crm.merge.opportunity`) |
+| addons/crm/wizard/crm_merge_opportunities_views.xml | 35 | `crm.merge.opportunity` footer Cancel `<button special="cancel">` | DISABLE | Rule 3: no write and no read; framework-disabled offline like every footer button without `data-available-offline`; `special` calls pass the `doActionButton` guard, so the dialog still closes (close control or `doActionButton({special: "cancel"})`) without a `call_button` request (the opening view then reloads as after any dialog close) |
 | addons/crm/wizard/crm_merge_opportunities_views.xml | 41-48 | Action and bound action "Merge" `crm.action_merge_opportunities` | DISABLE | Transient wizard (`crm.merge.opportunity`) |
 | addons/sales_team/static/src/js/crm_team_form.js | 25-46 | Team form `crm_team_activate_multi_membership`: `user.hasGroup("sales_team.group_sale_manager")` then `ir.config_parameter.set_bool` | DISABLE | Rule 3: write on `ir.config_parameter`, outside the QUEUE models; the probe is skipped and treated as false |
 | addons/sales_team/views/crm_team_views.xml | 132 | Dashboard card click: kanban root `action="action_primary_channel_button" type="object"` | DISABLE | Rule 3: server-built navigation on the team-selection surface |
@@ -176,7 +179,7 @@ Justifications name the rule that matched; "Rule 3" states why QUEUE and SKIP do
 
 Generated from the DISABLE rows above. `crm_offline_hooks.js` freezes exactly these members.
 
-- `CRM_OFFLINE_BUTTON_MODELS`: `crm.lead`, `crm.team`, `crm.stage`, `crm.lost.reason`, `crm.lead.lost`, `crm.lead2opportunity.partner.mass`, `crm.merge.opportunity`, `crm.lead.pls.update`.
+- `CRM_OFFLINE_BUTTON_MODELS`: `crm.lead`, `crm.team`, `crm.stage`, `crm.lost.reason`, `crm.activity.report`, `crm.lead.lost`, `crm.lead2opportunity.partner.mass`, `crm.merge.opportunity`, `crm.lead.pls.update`.
 - `CRM_OFFLINE_BUTTON_METHODS`: `res.partner` / `action_view_opportunity`; `utm.campaign` / `action_redirect_to_leads_opportunities`; `res.config.settings` with `context.module === "crm"` (any button name).
 - `CRM_OFFLINE_DISABLED_ACTIONS`: `crm.crm_lead_action_forecast`, `crm.crm_opportunity_report_action`, `crm.crm_opportunity_report_action_lead`, `crm.crm_activity_report_action`, `crm.crm_activity_report_action_team`, `crm.action_report_crm_lead_salesteam`, `crm.action_report_crm_opportunity_salesteam`, `crm.crm_lead_lost_action`, `crm.action_crm_send_mass_convert`, `crm.action_merge_opportunities`, `crm.crm_lead_pls_update_action`, `crm.action_lead_mail_compose`, `crm.action_lead_mass_mail`, `crm.mail_followers_edit_action_from_lead`, `crm.act_crm_opportunity_calendar_event_new`, `crm.crm_config_settings_action`, `crm.crm_recurring_plan_action`.
 - `CRM_OFFLINE_DISABLED_MENUS`: `crm.crm_menu_forecast`, `crm.crm_opportunity_report_menu`, `crm.crm_opportunity_report_menu_lead`, `crm.crm_activity_report_menu`, `crm.crm_config_settings_menu`, `crm.crm_recurring_plan_menu_config`.
@@ -192,5 +195,5 @@ Counted over the rows of the Inventory table only; the total equals its row coun
 |---|---|
 | QUEUE | 22 |
 | SKIP | 3 |
-| DISABLE | 114 |
-| total | 139 |
+| DISABLE | 118 |
+| total | 143 |

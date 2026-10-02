@@ -6,6 +6,8 @@
  * - `useCrmOffline()`, the hook every CRM mobile component and the lead form use
  *   to read the framework queue and connection state and to queue CRM writes;
  * - the quick-create deep-link flag (`crm_quick_create` URL parameter);
+ * - the activity page size remembered per mobile root load (`getCrmActivityLimit`,
+ *   `setCrmActivityLimit`), a view preference holding no record data;
  * - the frozen DISABLE sets generated from `offline_inventory.md`;
  * - module-level, CRM-scoped guards patched into framework classes and services
  *   (view buttons, navigation, view mount, action menus, team cards, tag colours,
@@ -14,14 +16,15 @@
  * Design rules shared by every guard below:
  * - the plugin is the framework `OfflinePlugin`, resolved with `usePlugin`, or the
  *   instance a framework class already holds; this module owns no queue, cache,
- *   store or connectivity detection of its own;
+ *   record store or connectivity detection of its own;
  * - the CRM scope (model, action or component) is tested BEFORE the offline signal
  *   is read, so components outside CRM never subscribe to it and never re-render;
  * - online, and outside CRM, each guard calls the original with the same
  *   arguments and returns its result unchanged (same DOM, same requests).
  */
 
-import { proxy, untrack, useEffect, usePlugin } from "@odoo/owl";
+import { onMounted, onPatched, proxy, signal, untrack, useEffect, usePlugin } from "@odoo/owl";
+import { AutoComplete } from "@web/core/autocomplete/autocomplete";
 import { browser } from "@web/core/browser/browser";
 // The `loadState()` guard must inspect the state the action service itself falls
 // back to when called without arguments (the web client's boot): `router.current`.
@@ -30,6 +33,7 @@ import { ConnectionLostError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { registry } from "@web/core/registry";
 import { user } from "@web/core/user";
+import { mergeClasses } from "@web/core/utils/classname";
 import { useService } from "@web/core/utils/hooks";
 import { patch } from "@web/core/utils/patch";
 import { getScheduleORMExtras } from "@web/model/relational_model/utils";
@@ -38,6 +42,7 @@ import { ActionMenus } from "@web/search/action_menus/action_menus";
 import { CardRenderer } from "@web/views/card/card_renderer";
 import { Many2ManyTagsField } from "@web/views/fields/many2many_tags/many2many_tags_field";
 import { Many2XAutocomplete } from "@web/views/fields/relational_utils";
+import { KanbanDropdownMenuWrapper } from "@web/views/kanban/kanban_dropdown_menu_wrapper";
 import { KanbanRecord } from "@web/views/kanban/kanban_record";
 import { OfflineActionHelper } from "@web/views/offline_action_helper";
 import { View } from "@web/views/view";
@@ -75,6 +80,7 @@ export const CRM_OFFLINE_BUTTON_MODELS = freezeSet([
     "crm.team",
     "crm.stage",
     "crm.lost.reason",
+    "crm.activity.report",
     "crm.lead.lost",
     "crm.lead2opportunity.partner.mass",
     "crm.merge.opportunity",
@@ -169,6 +175,113 @@ const PROJECTED_FIELDS = Object.freeze([
     "stage_id",
 ]);
 const PROJECTED_OPTIONAL_FIELDS = Object.freeze(["won_status", "probability"]);
+
+/**
+ * Page size of the activity rows the mobile root load (pipeline and phone lead
+ * form) reads with each lead: the first page is loaded with the lead, and an
+ * explicit "Show more" of the activity sheet raises the limit by this step and
+ * reloads the root, so the rows stay in the (cached) root load and no separate
+ * `mail.activity` read is ever issued.
+ */
+export const CRM_MOBILE_ACTIVITY_LIMIT = 5;
+
+// -----------------------------------------------------------------------------
+// Activity page size preference
+// -----------------------------------------------------------------------------
+
+/** `localStorage` key of the remembered activity page sizes: JSON `{[scope]: limit}`. */
+const ACTIVITY_LIMITS_STORAGE_KEY = "crm.mobile_activity_limits";
+/** Most scopes whose page size is remembered: the least recently set are dropped. */
+const ACTIVITY_LIMITS_MAX_SCOPES = 50;
+
+/**
+ * Tells whether `limit` is a page size worth remembering: an integer above the
+ * default first page.
+ *
+ * @param {unknown} limit
+ * @returns {boolean}
+ */
+function isRaisedActivityLimit(limit) {
+    return Number.isInteger(limit) && limit > CRM_MOBILE_ACTIVITY_LIMIT;
+}
+
+/**
+ * Remembered page sizes, `{[scope]: limit}`, in the order they were last set.
+ * A missing or unreadable value (invalid JSON, not an object, storage throwing)
+ * reads as no preference at all.
+ *
+ * @returns {Object<string, number>}
+ */
+function readActivityLimits() {
+    try {
+        const stored = JSON.parse(browser.localStorage.getItem(ACTIVITY_LIMITS_STORAGE_KEY));
+        if (stored && typeof stored === "object" && !Array.isArray(stored)) {
+            return stored;
+        }
+    } catch {
+        // Unreadable preference: every scope uses the default page size.
+    }
+    return {};
+}
+
+/**
+ * Activity page size the mobile root load of `scope` requests: the one a "Show
+ * more" remembered for it, `CRM_MOBILE_ACTIVITY_LIMIT` otherwise.
+ *
+ * This is a view preference, persisted in `localStorage` the way the list view
+ * persists its optional columns: it stores no record data, since the rows of a
+ * page stay in the framework's RPC cache with the root load that read them. The
+ * page size is part of that root load's request, hence of its cache key: reading
+ * it from here, after a reopen or a cold start, issues the same request as the
+ * last visit of `scope`, so a page reached through "Show more" online is still
+ * served from the cache offline.
+ *
+ * A `scope` names one kind of root load whose request only differs by the page
+ * size, e.g. a pipeline action and search, or a lead form.
+ *
+ * @param {string} scope
+ * @returns {number}
+ */
+export function getCrmActivityLimit(scope) {
+    const limit = readActivityLimits()[scope];
+    return isRaisedActivityLimit(limit) ? limit : CRM_MOBILE_ACTIVITY_LIMIT;
+}
+
+/**
+ * Remembers the activity page size of `scope` (see `getCrmActivityLimit`). A
+ * limit that is not above `CRM_MOBILE_ACTIVITY_LIMIT` forgets the scope. The
+ * scope just set becomes the most recent one, and only the
+ * `ACTIVITY_LIMITS_MAX_SCOPES` most recent scopes are kept. A storage that
+ * cannot be written (quota, disabled storage) leaves the preference unchanged.
+ *
+ * @param {string} scope
+ * @param {number} limit
+ */
+export function setCrmActivityLimit(scope, limit) {
+    try {
+        const limits = {};
+        for (const [storedScope, storedLimit] of Object.entries(readActivityLimits())) {
+            if (storedScope !== scope && isRaisedActivityLimit(storedLimit)) {
+                limits[storedScope] = storedLimit;
+            }
+        }
+        if (isRaisedActivityLimit(limit)) {
+            limits[scope] = limit;
+        }
+        const scopes = Object.keys(limits);
+        const dropped = Math.max(scopes.length - ACTIVITY_LIMITS_MAX_SCOPES, 0);
+        for (const oldScope of scopes.slice(0, dropped)) {
+            delete limits[oldScope];
+        }
+        if (Object.keys(limits).length) {
+            browser.localStorage.setItem(ACTIVITY_LIMITS_STORAGE_KEY, JSON.stringify(limits));
+        } else {
+            browser.localStorage.removeItem(ACTIVITY_LIMITS_STORAGE_KEY);
+        }
+    } catch {
+        // The page size is not remembered: the next root load uses the stored one.
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Predicates
@@ -300,6 +413,35 @@ function isParked(entry) {
 }
 
 /**
+ * Tells whether a value read back from the queue is a field-value mapping (a
+ * plain object, neither `null` nor an array), the shape of a `web_save` values
+ * argument and of its display values (`extras.changes`).
+ *
+ * @param {any} value
+ * @returns {boolean}
+ */
+export function isFieldMapping(value) {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Tells whether a queued call is a record creation: a `web_save` whose target ids
+ * are an empty array and whose values are a field-value mapping.
+ *
+ * @param {{method?: string, args?: any}} value
+ * @returns {boolean}
+ */
+function isCreateSave(value) {
+    return (
+        value.method === "web_save" &&
+        Array.isArray(value.args) &&
+        Array.isArray(value.args[0]) &&
+        value.args[0].length === 0 &&
+        isFieldMapping(value.args[1])
+    );
+}
+
+/**
  * Tells whether a queued entry is a lead write that concerns `record`: its own
  * offline save (`record.offlineId`) or a lead method targeting `record.resId`,
  * possibly queued through another `Record` instance of the same lead.
@@ -323,11 +465,81 @@ function isLeadWriteOf(entry, record) {
 }
 
 /**
- * Activity types and assignees are cached once per web-client session. The
- * session is the lifetime of the framework offline plugin instance, so the flag is
- * keyed by that instance (a fresh web client, or a fresh test, warms again).
+ * Activity types are warmed once per web-client session: the flag is set when a
+ * warm-up starts, kept after a success and cleared by a failure, so a later call in
+ * the same session tries again. The session is the lifetime of the framework
+ * offline plugin instance, so the flag is keyed by that instance (a fresh web
+ * client, or a fresh test, warms again).
  */
 const warmedActivityTypes = new WeakSet();
+
+/**
+ * Per offline plugin instance (the session, as above), a counter bumped each time
+ * a warm-up has stored the activity types, so an open activity sheet reads them
+ * again from the framework cache. It is a notification only: no type is kept here.
+ *
+ * @type {WeakMap<OfflinePlugin, import("@odoo/owl").Signal<number>>}
+ */
+const activityTypesRevisions = new WeakMap();
+
+/**
+ * @param {OfflinePlugin} plugin
+ * @returns {import("@odoo/owl").Signal<number>} the plugin's revision signal,
+ *  created on first use
+ */
+function getActivityTypesRevision(plugin) {
+    let revision = activityTypesRevisions.get(plugin);
+    if (!revision) {
+        revision = signal(0);
+        activityTypesRevisions.set(plugin, revision);
+    }
+    return revision;
+}
+
+// -----------------------------------------------------------------------------
+// Asynchronous work started by effects
+// -----------------------------------------------------------------------------
+
+/** Errors `crmReportError` already handed to the framework error service. */
+const crmReportedErrors = new WeakSet();
+
+/**
+ * Reports the error of work nobody awaits. A `ConnectionLostError` means the
+ * connection dropped again meanwhile: it is expected and ignored, and the work
+ * runs again at the next trigger. Any other error is handed to the framework error
+ * service as an uncaught promise error, the way the action service shows an error
+ * of a mounted controller: the standard error dialog, no CRM-specific error UI.
+ * Work shared by several owners (merged refreshes, a shared request) rejects each
+ * of them with the same error object: that one failure is reported once.
+ *
+ * @param {unknown} error
+ */
+export function crmReportError(error) {
+    if (error instanceof ConnectionLostError) {
+        return;
+    }
+    if (Object(error) === error) {
+        if (crmReportedErrors.has(error)) {
+            return;
+        }
+        crmReportedErrors.add(error);
+    }
+    Promise.reject(error);
+}
+
+/**
+ * Takes ownership of the value returned by work an effect starts and nobody
+ * awaits (an effect itself must return nothing). A value that is not a promise is
+ * ignored; a rejection is reported by `crmReportError`.
+ *
+ * @param {unknown} result
+ */
+export function crmOwnEffectPromise(result) {
+    if (typeof result?.then !== "function") {
+        return;
+    }
+    Promise.resolve(result).catch(crmReportError);
+}
 
 // -----------------------------------------------------------------------------
 // useCrmOffline
@@ -405,10 +617,15 @@ export function useCrmOffline() {
         return { queued: true, result: queue(model, method, args, kwargs, extras) };
     };
 
-    /** Reloads `record` after an online write; a dropped connection keeps the cache. */
+    /**
+     * Reloads `record` after an online write; a dropped connection keeps the cache.
+     * The lead form's record refreshes through its `crmRefresh`, which keeps the
+     * form's unsaved edits (those made during the write included) and does not wait
+     * on the restoration of a queued save of the lead.
+     */
     const reloadRecord = async (record) => {
         try {
-            await record.load();
+            await (record.crmRefresh ? record.crmRefresh() : record.load());
         } catch (error) {
             if (!(error instanceof ConnectionLostError)) {
                 throw error;
@@ -465,6 +682,8 @@ export function useCrmOffline() {
          * stage_id}` (+ `won_status`, `probability` when loaded). Many2one values
          * are `{id, display_name}`; a field the record did not load is `undefined`.
          * Returns `null` while a pending (not parked) delete or archive hides it.
+         * A queued save whose `extras.changes` is not a field-value mapping is
+         * ignored: the values it would display are left as they were.
          *
          * @param {Object} record
          * @returns {Object|null}
@@ -482,7 +701,7 @@ export function useCrmOffline() {
             for (const entry of leadWrites(record).sort(byTimeStamp)) {
                 const { method, extras } = entry.value;
                 if (method === "web_save") {
-                    const changes = extras?.changes || {};
+                    const changes = isFieldMapping(extras?.changes) ? extras.changes : {};
                     for (const fieldName of [...PROJECTED_FIELDS, ...PROJECTED_OPTIONAL_FIELDS]) {
                         if (fieldName in changes) {
                             values[fieldName] = changes[fieldName];
@@ -504,21 +723,18 @@ export function useCrmOffline() {
 
         /**
          * Leads created offline (queued `web_save` without id) in a stage, in
-         * replay order, as provisional card data.
+         * replay order, as provisional card data. Entries that are not creations
+         * (target ids other than an empty array, values not a mapping) are ignored.
          *
          * @param {number|false} stageId
          */
         pendingCreates(stageId) {
             return queuedEntries("crm.lead")
-                .filter(
-                    ({ value }) =>
-                        value.method === "web_save" &&
-                        !value.args?.[0]?.length &&
-                        value.args?.[1]?.stage_id === stageId
-                )
+                .filter(({ value }) => isCreateSave(value) && value.args[1].stage_id === stageId)
                 .sort(byTimeStamp)
                 .map((entry) => {
-                    const source = entry.value.extras?.changes || entry.value.args[1];
+                    const { args, extras } = entry.value;
+                    const source = isFieldMapping(extras?.changes) ? extras.changes : args[1];
                     return {
                         key: entry.key,
                         name: source.name,
@@ -571,7 +787,10 @@ export function useCrmOffline() {
         /**
          * Activity rows of a lead from data already loaded with the lead:
          * - `variant: "mobile"`: `activity_ids` loaded with its mobile sub-fields
-         *   (pipeline or form mobile specification), one row per activity;
+         *   (pipeline or form mobile specification), one row per loaded activity.
+         *   That load is bounded (`CRM_MOBILE_ACTIVITY_LIMIT` per page), so
+         *   `moreCount` is the number of the lead's activities beyond the loaded
+         *   rows: the relation still lists every activity id;
          * - `variant: "desktop"`: `activity_ids` loaded without sub-fields (offline
          *   fallback to a wide-layout cache): one row built from the lead-level
          *   `activity_*` fields (first activity), `moreCount` for the others;
@@ -588,9 +807,11 @@ export function useCrmOffline() {
             }
             const records = record.data.activity_ids?.records || [];
             if (activeField.related?.activeFields?.summary) {
+                // `records` is the loaded page, `count` every activity id of the lead.
+                const total = record.data.activity_ids?.count ?? records.length;
                 return {
                     variant: "mobile",
-                    moreCount: 0,
+                    moreCount: Math.max(total - records.length, 0),
                     rows: records.map((activity) => ({
                         id: activity.resId,
                         summary: activity.data.summary,
@@ -624,9 +845,12 @@ export function useCrmOffline() {
         },
 
         /**
-         * Online only, once per session: caches the lead activity types in the
-         * framework relational-field cache so the activity sheet works offline.
-         * Failures are ignored (the next session tries again).
+         * Online only: caches the lead activity types in the framework
+         * relational-field cache so the activity sheet works offline, then bumps
+         * `activityTypesRevision()` so an open sheet reads them. After a success it
+         * does nothing more in this session. A failure is ignored and clears the
+         * session flag, so the next eligible call in the same session (a later
+         * visit, or the connection coming back) tries again.
          */
         async warmActivityTypes() {
             if (isOffline() || warmedActivityTypes.has(plugin)) {
@@ -640,9 +864,22 @@ export function useCrmOffline() {
                     { specification: { display_name: {} } }
                 );
                 await plugin.cacheMany2XSearch("mail.activity.type", result.records);
+                const revision = getActivityTypesRevision(plugin);
+                revision.set(untrack(revision) + 1);
             } catch {
                 warmedActivityTypes.delete(plugin);
             }
+        },
+
+        /**
+         * Revision of the cached activity types: it grows each time a warm-up has
+         * stored them. An effect reading it runs again when types reach the cache
+         * after its component read them (`getActivityTypes()`).
+         *
+         * @returns {number}
+         */
+        activityTypesRevision() {
+            return getActivityTypesRevision(plugin)();
         },
 
         /** @returns {Promise<{id: number, display_name: string}[]>} cached activity types */
@@ -780,9 +1017,11 @@ export function useCrmOffline() {
 
         /**
          * Runs `callback` (untracked) each time a replay of the queue finishes while
-         * online. Setup only.
+         * online. Setup only. A promise `callback` returns is owned by the hook
+         * (`crmOwnEffectPromise`): a lost connection is ignored, any other error
+         * reaches the framework error service.
          *
-         * @param {Function} callback
+         * @param {() => (Promise<unknown>|void)} callback
          */
         onReplayed(callback) {
             let wasSyncing = false;
@@ -792,7 +1031,7 @@ export function useCrmOffline() {
                 const finished = wasSyncing && !syncing;
                 wasSyncing = syncing;
                 if (finished && !offline) {
-                    untrack(callback);
+                    untrack(() => crmOwnEffectPromise(callback()));
                 }
             });
         },
@@ -802,10 +1041,12 @@ export function useCrmOffline() {
          * queue outside a replay, i.e. when the user discards them. Removals seen
          * while a replay runs, or in the batch where it ends (owl batches effects:
          * the last replayed entry and the end of the replay land in the same run),
-         * are replays and only refresh the remembered keys. Setup only.
+         * are replays and only refresh the remembered keys. Setup only. A promise
+         * `callback` returns is owned by the hook (`crmOwnEffectPromise`): a lost
+         * connection is ignored, any other error reaches the framework error service.
          *
          * @param {string} model
-         * @param {(keys: string[]) => void} callback
+         * @param {(keys: string[]) => (Promise<unknown>|void)} callback
          */
         onEntriesDiscarded(model, callback) {
             let knownKeys = null;
@@ -822,7 +1063,7 @@ export function useCrmOffline() {
                 }
                 const removedKeys = [...previousKeys].filter((key) => !keys.has(key));
                 if (removedKeys.length) {
-                    untrack(() => callback(removedKeys));
+                    untrack(() => crmOwnEffectPromise(callback(removedKeys)));
                 }
             });
         },
@@ -1144,10 +1385,17 @@ patch(View.prototype, {
         this.crmOfflinePlugin = usePlugin(OfflinePlugin);
         // OWL 3 components have no `render()`: the template re-renders from this proxy.
         this.crmViewState = proxy({ loadPending: false });
-        this.crmReloadingView = false;
+        /** @type {Promise<void>|null} the running `crmLoadPendingView` load */
+        this.crmPendingViewLoad = null;
         useEffect(() => {
             if (this.crmLoadPending && !this.crmOfflinePlugin.isOffline()) {
-                untrack(() => this.crmLoadPendingView());
+                untrack(() => {
+                    // A reconnection while the load runs shares it: only the run that
+                    // starts it observes it, so its outcome is reported once.
+                    if (!this.crmPendingViewLoad) {
+                        crmOwnEffectPromise(this.crmLoadPendingView());
+                    }
+                });
             }
         });
     },
@@ -1204,21 +1452,27 @@ patch(View.prototype, {
         return super.onWillUpdateProps(...arguments);
     },
 
-    /** Loads, once, a view whose load was skipped offline; retried at the next reconnection. */
+    /**
+     * Loads, once, a view whose load was skipped offline; a call made while that load
+     * runs returns the same promise. A load lost to a dropped connection resolves and
+     * leaves the view pending, so the next reconnection retries it; any other error
+     * rejects.
+     *
+     * @returns {Promise<void>}
+     */
     crmLoadPendingView() {
-        if (this.crmReloadingView) {
-            return;
+        if (!this.crmPendingViewLoad) {
+            this.crmPendingViewLoad = this.loadView(this.props)
+                .catch((error) => {
+                    if (!(error instanceof ConnectionLostError)) {
+                        throw error;
+                    }
+                })
+                .finally(() => {
+                    this.crmPendingViewLoad = null;
+                });
         }
-        this.crmReloadingView = true;
-        this.loadView(this.props)
-            .catch((error) => {
-                if (!(error instanceof ConnectionLostError)) {
-                    throw error;
-                }
-            })
-            .finally(() => {
-                this.crmReloadingView = false;
-            });
+        return this.crmPendingViewLoad;
     },
 });
 
@@ -1274,6 +1528,39 @@ patch(CardRenderer.prototype, {
                 );
             },
         };
+    },
+});
+
+/**
+ * Menu items a CRM guard disables offline: the team card "Configuration" link
+ * (`widget.crm_offline`) is the only `.dropdown-item` that gets this state.
+ */
+const CRM_OFFLINE_DISABLED_MENU_ITEM = ".dropdown-item.o_disabled_offline[aria-disabled='true']";
+
+patch(KanbanDropdownMenuWrapper.prototype, {
+    /**
+     * The open card menu's dropdown navigates (Tab, Shift+Tab, arrows, Home, End)
+     * through every `.o-navigable` item and focuses it programmatically, whatever
+     * its `tabindex` or `aria-disabled`; the wrapper marks every `.dropdown-item`
+     * so on each mount and patch. Registered after the wrapper's own callbacks,
+     * these run after them and take the mark back from the items disabled offline,
+     * so a menu opened online never navigates to them. DOM only: no signal is
+     * read, so other kanban menus neither subscribe nor change, and online the
+     * wrapper marks the re-enabled item again.
+     */
+    setup() {
+        super.setup(...arguments);
+        const excludeOfflineDisabledItems = () => {
+            const rootEl = this.rootRef();
+            if (!rootEl) {
+                return;
+            }
+            for (const el of rootEl.querySelectorAll(CRM_OFFLINE_DISABLED_MENU_ITEM)) {
+                el.classList.remove("o-navigable");
+            }
+        };
+        onMounted(excludeOfflineDisabledItems);
+        onPatched(excludeOfflineDisabledItems);
     },
 });
 
@@ -1335,6 +1622,13 @@ function isLeadAutocomplete(autocomplete) {
 }
 
 /**
+ * Marks the options built by `guardAutocompleteOption`. Object spread copies it,
+ * so it reaches the option AutoComplete normalizes and renders, which the
+ * AutoComplete patch below recognizes by it.
+ */
+const CRM_OFFLINE_GUARDED_OPTION = Symbol("crmOfflineGuardedOption");
+
+/**
  * Makes a non-record option (enrichment suggestion, Create, Create and edit,
  * Search more) inert once the connection drops after it was loaded. Record
  * suggestions are returned unchanged. `onSelect` is only wrapped when the option
@@ -1350,6 +1644,7 @@ function guardAutocompleteOption(autocomplete, option) {
     }
     const guarded = {
         ...option,
+        [CRM_OFFLINE_GUARDED_OPTION]: true,
         get unselectable() {
             return option.unselectable || autocomplete.crmOfflineInlineSearch;
         },
@@ -1419,6 +1714,73 @@ patch(Many2XAutocomplete.prototype, {
             return Promise.resolve();
         }
         return super.onBarcodeSearch(...arguments);
+    },
+});
+
+/**
+ * @param {Object} [option] an option normalized by AutoComplete
+ * @returns {boolean} whether it is a guarded lead option that is inert now
+ */
+function isInertGuardedOption(option) {
+    return Boolean(option?.[CRM_OFFLINE_GUARDED_OPTION] && option.unselectable);
+}
+
+patch(AutoComplete.prototype, {
+    /**
+     * `makeOption` replaces `unselectable` with a plain boolean (`!option.onSelect`)
+     * computed once, which would leave a guarded lead option selectable after the
+     * connection drops. A guarded option gets a live accessor instead: unselectable
+     * when the framework says so or while its guard holds. While the guard alone
+     * makes it inert, its row also carries the framework's offline-disabled styling
+     * (`o_disabled_offline`); informational options ("No records", "Start
+     * typing...") keep their look. Both are read during render, so the dropdown
+     * re-renders when the connection changes. Other options are returned unchanged.
+     */
+    makeOption(option) {
+        const made = super.makeOption(...arguments);
+        if (!option?.[CRM_OFFLINE_GUARDED_OPTION]) {
+            return made;
+        }
+        const { cssClass, unselectable } = made;
+        const isDisabledOffline = () => !unselectable && Boolean(option.unselectable);
+        Object.defineProperties(made, {
+            unselectable: {
+                configurable: true,
+                enumerable: true,
+                get: () => unselectable || isDisabledOffline(),
+            },
+            cssClass: {
+                configurable: true,
+                enumerable: true,
+                get: () =>
+                    isDisabledOffline() ? mergeClasses(cssClass, "o_disabled_offline") : cssClass,
+            },
+        });
+        return made;
+    },
+
+    /**
+     * The framework only ever activates selectable options. A guarded option
+     * highlighted online is no longer shown active once it turns inert.
+     */
+    isActiveSourceOption([sourceIndex, optionIndex]) {
+        const active = super.isActiveSourceOption(...arguments);
+        if (active && isInertGuardedOption(this.sources[sourceIndex]?.options[optionIndex])) {
+            return false;
+        }
+        return active;
+    },
+
+    /**
+     * No `aria-activedescendant` (nor scroll target) for an inert guarded option,
+     * as in `isActiveSourceOption`.
+     */
+    get activeSourceOptionId() {
+        const id = super.activeSourceOptionId;
+        if (id === undefined || isInertGuardedOption(this.activeOption)) {
+            return undefined;
+        }
+        return id;
     },
 });
 

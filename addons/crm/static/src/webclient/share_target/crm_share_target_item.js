@@ -3,6 +3,7 @@ import { ShareTargetItem } from "@web/webclient/share_target/share_target_item";
 import { onWillStart, untrack, useEffect, usePlugin } from "@odoo/owl";
 import { _t } from "@web/core/l10n/translation";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
+import { crmOwnEffectPromise } from "@crm/mobile/crm_offline_hooks";
 
 export class CrmShareTargetItem extends ShareTargetItem {
     static template = "crm.ShareTargetItem";
@@ -18,11 +19,13 @@ export class CrmShareTargetItem extends ShareTargetItem {
         // connection comes back. Only the offline signal is tracked: updateTeams reads reactive
         // state synchronously (this.context), hence the untrack. The first, immediate run never
         // reloads, so an online start-up still issues a single team read, from onWillStart.
+        // A read lost to the connection dropping again keeps the teams and the selection and is
+        // retried at the next reconnection; any other error goes to the framework error service.
         let wasOffline = false;
         useEffect(() => {
             const offline = this.offlinePlugin.isOffline();
             if (wasOffline && !offline) {
-                untrack(() => this.updateTeams());
+                untrack(() => crmOwnEffectPromise(this.updateTeams()));
             }
             wasOffline = offline;
         });

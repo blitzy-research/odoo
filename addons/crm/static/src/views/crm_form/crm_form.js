@@ -28,7 +28,13 @@ import {
 } from "@mail/js/rotting_mixin/rotting_statusbar";
 import { Chatter } from "@mail/chatter/web_portal_project/chatter";
 import { Composer } from "@mail/core/common/composer";
-import { useCrmOffline } from "@crm/mobile/crm_offline_hooks";
+import {
+    CRM_MOBILE_ACTIVITY_LIMIT,
+    crmReportError,
+    getCrmActivityLimit,
+    setCrmActivityLimit,
+    useCrmOffline,
+} from "@crm/mobile/crm_offline_hooks";
 import { CrmMobileLeadActivities } from "@crm/mobile/crm_mobile_lead_card/crm_mobile_lead_card";
 
 /**
@@ -55,6 +61,9 @@ const OFFLINE_WON_VALUES = Object.freeze({ won_status: "won", probability: 100 }
 
 /** `crm.lead` methods whose queued call puts the lead in its archived/unarchived state. */
 const ARCHIVE_METHODS = Object.freeze(["action_archive", "action_unarchive"]);
+
+/** Field types whose record value is a list (its change is a list of commands). */
+const X2MANY_TYPES = Object.freeze(["one2many", "many2many"]);
 
 /**
  * Orders queue entries as the framework replays them (`extras.timeStamp`).
@@ -128,6 +137,12 @@ class CrmFormRecord extends formView.Model.Record {
      * and `probability` is readonly once the lead is won. Because they are in the
      * record's values, a later offline save of other fields keeps them. Fields the
      * form does not load are skipped.
+     *
+     * The record shows its changes over its values, so a change of these fields
+     * (such as a probability restored from the lead's queued save when the lead is
+     * reopened) would hide the won values: it is dropped from the form's changes.
+     * The queued save is left as it is (the won call replays after it), and nothing
+     * is saved.
      */
     applyOfflineWon() {
         const values = {};
@@ -136,9 +151,16 @@ class CrmFormRecord extends formView.Model.Record {
                 values[fieldName] = value;
             }
         }
-        if (Object.keys(values).length) {
-            this._applyValues(values);
+        if (!Object.keys(values).length) {
+            return;
         }
+        for (const fieldName in values) {
+            delete this._changes[fieldName];
+        }
+        if (!Object.keys(this._changes).length) {
+            this.dirty = false;
+        }
+        this._applyValues(values);
     }
 
     /**
@@ -161,6 +183,267 @@ class CrmFormRecord extends formView.Model.Record {
             this._applyValues({ active: !isArchive });
         }
         return res;
+    }
+
+    /**
+     * Whether a `crmRefresh` load of this record runs: the root reload must not
+     * restore the lead's queued save into the form again, because the form kept
+     * its changes (restoring them would overwrite later edits of the same fields).
+     *
+     * @returns {boolean}
+     */
+    get crmRefreshing() {
+        return Boolean(this._crmRefreshState) && !this._crmRefreshState.saving;
+    }
+
+    /**
+     * Refreshes the lead with the server values (the cache offline) through the
+     * model's own root-load machinery (the controller's load variant, the RPC cache
+     * and `onRootLoaded`), keeping the form's unsaved changes. It runs in the model
+     * mutex and replaces no record, so an edit or a save made meanwhile waits behind
+     * it and applies to the refreshed record. Nothing happens once the model shows
+     * another record.
+     *
+     * - `dropRestored`: the changes still holding the value the form restored from
+     *   the record's queued save are dropped instead of kept (that save left the
+     *   queue: replayed, its values are the server's; discarded, they must not be
+     *   queued again by a later save);
+     * - `save` (online, a lead with an id): once the lead is refreshed, the changes
+     *   it kept, when there are any, are saved. The save starts from the refreshed
+     *   values, so what the CRM save adds from them (the email and phone to
+     *   synchronize with the partner) is the server's current state, never a value
+     *   from before the refresh. When the save does not happen (invalid record), the
+     *   changes stay in the form, unsaved.
+     *
+     * A request made while another one waits to start is merged into it.
+     *
+     * @param {{dropRestored?: boolean, save?: boolean}} [options]
+     * @returns {Promise<void>}
+     */
+    crmRefresh({ dropRestored = false, save = false } = {}) {
+        const waiting = this._crmWaitingRefresh;
+        if (waiting) {
+            waiting.dropRestored ||= dropRestored;
+            waiting.save ||= save;
+            return waiting.promise;
+        }
+        const request = markRaw({ dropRestored, save, promise: null });
+        const start = () => {
+            if (this._crmWaitingRefresh === request) {
+                this._crmWaitingRefresh = null;
+            }
+        };
+        this._crmWaitingRefresh = request;
+        // `_askChanges` (pending field values) waits until the mutex is free, so it is
+        // awaited before entering it: inside, it would never resolve.
+        request.promise = this.model._askChanges().then(
+            () =>
+                this.model.mutex.exec(() => {
+                    start();
+                    return this._crmRefresh(request);
+                }),
+            (error) => {
+                start();
+                throw error;
+            }
+        );
+        return request.promise;
+    }
+
+    /**
+     * Fields of the form's changes that still hold the value restored from the
+     * record's queued save (`setOfflineChanges`): edited since, a field holds an
+     * edit of the user instead.
+     *
+     * @returns {string[]}
+     */
+    crmRestoredUnmodifiedFields() {
+        const restored = this._crmRestored;
+        // The record replaces its changes object whenever it resets its changes
+        // (load, save, discard): the restored values are then gone.
+        if (!restored || restored.changes !== this._changes) {
+            return [];
+        }
+        return Object.keys(restored.signatures).filter(
+            (fieldName) =>
+                fieldName in this._changes &&
+                this._crmChangeSignature(fieldName) === restored.signatures[fieldName]
+        );
+    }
+
+    /**
+     * Makes the changes restored from the record's queued save the form's own
+     * unsaved edits (the offline systray handed that save over to the form).
+     */
+    crmAdoptRestoredChanges() {
+        this._crmRestored = null;
+    }
+
+    /**
+     * @override
+     * Remembers the changes the restoration of the lead's queued save put in the
+     * form (with the values an onchange derived from them), so a reconciliation
+     * can tell them from edits made afterwards.
+     */
+    setOfflineChanges() {
+        const restoration = super.setOfflineChanges(...arguments);
+        if (!restoration) {
+            return restoration;
+        }
+        return restoration.then((result) => {
+            const signatures = {};
+            for (const fieldName in this._changes) {
+                signatures[fieldName] = this._crmChangeSignature(fieldName);
+            }
+            this._crmRestored = markRaw({ changes: this._changes, signatures });
+            return result;
+        });
+    }
+
+    /**
+     * @override
+     * An offline save made after the record's previous one left the queue
+     * (replayed or discarded) queues its own changes only, at its own time.
+     */
+    _offlineSave() {
+        this._crmForgetUnqueuedOfflineSave();
+        return super._offlineSave(...arguments);
+    }
+
+    /**
+     * @override
+     * During a `crmRefresh` load, the loaded values replace the record's values
+     * while its unsaved changes are kept, except those the refresh drops. Values an
+     * offline save of this record committed stay while that save is still queued
+     * (pending or parked), as neither the server nor the cache has them yet. Every
+     * other call (the record's creation, other loads, a save's reload) is the
+     * parent's.
+     */
+    _setData(data, options = {}) {
+        const refresh = this._crmRefreshState;
+        if (!refresh || refresh.saving) {
+            super._setData(...arguments);
+            return;
+        }
+        for (const fieldName of refresh.dropFields) {
+            delete this._changes[fieldName];
+        }
+        const queuedValues = this._crmQueuedSaveValues();
+        super._setData(data, { ...options, keepChanges: true });
+        Object.assign(this._values, queuedValues);
+        const queuedTextValues = this._getTextValues(queuedValues);
+        Object.assign(this._initialTextValues, queuedTextValues);
+        Object.assign(this._textValues, queuedTextValues, this._getTextValues(this._changes));
+        this.dirty = Object.keys(this._changes).length > 0;
+        this.data = { ...this._values, ...this._changes };
+        this._setEvalContext();
+    }
+
+    /**
+     * Body of `crmRefresh`, run in the model mutex.
+     *
+     * @param {{dropRestored: boolean, save: boolean}} request
+     */
+    async _crmRefresh({ dropRestored, save }) {
+        if (toRaw(this.model.root) !== toRaw(this)) {
+            return;
+        }
+        this._crmForgetUnqueuedOfflineSave();
+        const refresh = markRaw({
+            dropFields: dropRestored ? this.crmRestoredUnmodifiedFields() : [],
+            saving: false,
+        });
+        this._crmRefreshState = refresh;
+        try {
+            await this._load();
+            if (save) {
+                await this._crmSaveRefreshedChanges(refresh);
+            }
+        } finally {
+            this._crmRefreshState = null;
+        }
+    }
+
+    /**
+     * Saves the changes the refresh load kept (`refresh.dropFields` were dropped),
+     * through the CRM save, which starts from the refreshed values. It happens while
+     * the model still shows this record, the lead has an id (a record without one
+     * would be created again), the connection is still up after the load and at
+     * least one change is written. A save that does not happen (invalid record)
+     * leaves the changes in the form.
+     *
+     * @param {{dropFields: string[], saving: boolean}} refresh
+     * @returns {Promise<void>}
+     */
+    async _crmSaveRefreshedChanges(refresh) {
+        if (
+            toRaw(this.model.root) !== toRaw(this) ||
+            !this.resId ||
+            this.model.offlinePlugin.isOffline()
+        ) {
+            return;
+        }
+        const toWrite = this._getChanges();
+        delete toWrite.id;
+        if (!Object.keys(toWrite).length) {
+            return;
+        }
+        refresh.saving = true;
+        await this._save();
+    }
+
+    /**
+     * Comparable form of the change of `fieldName`: its commands for an x2many
+     * field (the list object stays the same when edited), the value otherwise.
+     *
+     * @param {string} fieldName
+     */
+    _crmChangeSignature(fieldName) {
+        const value = this._changes[fieldName];
+        return X2MANY_TYPES.includes(this.fields[fieldName].type) && value
+            ? JSON.stringify(value._getCommands())
+            : value;
+    }
+
+    /** Whether the record's own offline save (`offlineId`) is queued (pending or parked). */
+    _crmIsOwnSaveQueued() {
+        return Boolean(this._offlineId) && this._offlineId in this.model.offlinePlugin._ormToSync();
+    }
+
+    /**
+     * Forgets the changes and time stamp of the record's own offline save once it
+     * left the queue, so they are neither queued again nor ordered at its old time
+     * by a later offline save. The key is kept: the framework reuses it.
+     */
+    _crmForgetUnqueuedOfflineSave() {
+        if (this._offlineChanges && !this._crmIsOwnSaveQueued()) {
+            this._offlineChanges = undefined;
+            this._offlineTimeStamp = undefined;
+        }
+    }
+
+    /**
+     * Values of the record's own still-queued offline save for the fields that
+     * are not changes of the form: the queued value of a scalar field (a value the
+     * form shows instead, such as the won probability, is applied again with the
+     * queued state), the current list of an x2many field.
+     *
+     * @returns {Object}
+     */
+    _crmQueuedSaveValues() {
+        const values = {};
+        if (!this._offlineChanges || !this._crmIsOwnSaveQueued()) {
+            return values;
+        }
+        for (const fieldName in this._offlineChanges) {
+            if (fieldName in this._changes || !(fieldName in this.activeFields)) {
+                continue;
+            }
+            values[fieldName] = X2MANY_TYPES.includes(this.fields[fieldName].type)
+                ? this._values[fieldName]
+                : this._offlineChanges[fieldName];
+        }
+        return values;
     }
 }
 
@@ -242,10 +525,10 @@ function crmActivityRelated() {
  * Offline it is the execution boundary of the lead form's buttons: "Won" is queued
  * as `action_set_won` (never `action_set_won_rainbowman`) and every other
  * `object`/`action` button is inert. It keeps the local state of the lead's queued
- * won, archive and delete while their calls wait, and reloads the lead from the
- * server (or the cache offline) when they leave the queue by replay or discard;
- * parked (rejected) entries stay queued, so their local state stays and the
- * offline systray shows the error.
+ * won, archive and delete while their calls wait, and refreshes the lead from the
+ * server (or the cache offline), keeping the form's unsaved edits, when they leave
+ * the queue by replay or discard; parked (rejected) entries stay queued, so their
+ * local state stays and the offline systray shows the error.
  *
  * On a phone the root load also requests the lead's activity rows ("mobile
  * variant"); otherwise it requests exactly what the arch declares ("desktop
@@ -264,8 +547,19 @@ export class CrmFormController extends formView.Controller {
         this.crmDesktopFallback = false;
         /** @type {"mobile"|"desktop"} variant applied to the last root load */
         this.crmLastVariant = "desktop";
-        /** Queue keys of this lead's writes (own offline save, won, archive, delete). */
+        /**
+         * Queue keys of the displayed lead's calls (its own offline save, won, archive,
+         * delete and activity calls), tracked for the lead `crmOwnLead` (its id, or the
+         * record of a new lead): another lead displayed (pager) starts a new set.
+         */
         this.crmOwnKeys = new Set();
+        this.crmOwnLead = null;
+        /**
+         * Queued save this form was opened with from the offline systray. Online, the
+         * systray removes it from the queue once the form shows its changes: its
+         * removal hands them over to the form, as unsaved edits, and is no discard.
+         */
+        this.crmHandOverKey = this.props.offlineId || null;
         this.crmMounted = false;
         this.crmPendingHistoryBack = false;
         this.crmHistoryBackDone = false;
@@ -282,11 +576,13 @@ export class CrmFormController extends formView.Controller {
                 // before that would read a stack without this form, leaving it mounted
                 // behind the restored view (where a later reload reads the deleted
                 // lead), so the form is left once the mount has completed.
-                Promise.resolve().then(() => {
-                    if (status(this) === "mounted") {
-                        this.crmLeaveDeletedLead();
-                    }
-                });
+                this.crmOwn(
+                    Promise.resolve().then(() => {
+                        if (status(this) === "mounted") {
+                            return this.crmLeaveDeletedLead();
+                        }
+                    })
+                );
             }
             this.crmWarmActivityTypes();
         });
@@ -299,6 +595,13 @@ export class CrmFormController extends formView.Controller {
                 untrack(() => this.crmWarmActivityTypes());
             }
         });
+        // Mobile UI exists only on small screens: the activity sheet does not stay
+        // over the desktop form. The form keeps its record and unsaved edits.
+        useEffect(() => {
+            if (!this.crmOffline.isSmall) {
+                untrack(() => this.crmActivitiesSheet.close());
+            }
+        });
 
         // Remember the queue keys concerning the displayed lead whenever the queue
         // changes. The queue is read first: it is the signal this effect follows (the
@@ -309,46 +612,84 @@ export class CrmFormController extends formView.Controller {
             untrack(() => this.crmTrackOwnKeys());
         });
 
-        // After a replay that left none of them queued, the server values replace the
-        // local presentation (won, archived).
+        // Replayed keys leave the set, parked ones stay. After a replay that removed
+        // some of the lead's calls and left none of them queued, the server values
+        // replace the local presentation (won, archived): edits made since the form
+        // restored the lead's queued save are saved, while the replayed values it
+        // restored are not sent again. A parked call keeps the local presentation.
         this.crmOffline.onReplayed(() => {
-            if (
-                this.crmOwnKeys.size &&
-                [...this.crmOwnKeys].every((key) => !this.crmOffline.isQueued(key))
-            ) {
-                this.crmOwnKeys.clear();
-                this.crmReload({ edits: "save" });
+            if (this.crmHandOverKey && !this.crmOffline.isQueued(this.crmHandOverKey)) {
+                this.crmHandOverKey = null;
+            }
+            const ownKeys = this.crmCurrentOwnKeys();
+            let replayed = false;
+            for (const key of ownKeys) {
+                if (!this.crmOffline.isQueued(key)) {
+                    ownKeys.delete(key);
+                    replayed = true;
+                }
+            }
+            if (replayed && !ownKeys.size) {
+                return this.crmOwn(this.crmReconcile({ dropRestored: true, save: true }));
             }
         });
-        // A discarded won, archive or edit reverts (from the cache when offline).
+        // A discarded call of the lead reverts its presentation (from the cache when
+        // offline). Discarding the lead's own queued save drops the changes the form
+        // restored from it (so a later save does not queue them again); edits made
+        // since are kept, as are all changes when another call is discarded.
         this.crmOffline.onEntriesDiscarded("crm.lead", (keys) => {
-            const ownKeys = keys.filter((key) => this.crmOwnKeys.has(key));
-            if (ownKeys.length) {
-                for (const key of ownKeys) {
-                    this.crmOwnKeys.delete(key);
+            const ownKeys = this.crmCurrentOwnKeys();
+            let discarded = keys.filter((key) => ownKeys.has(key));
+            for (const key of discarded) {
+                ownKeys.delete(key);
+            }
+            const handOverKey = this.crmHandOverKey;
+            if (handOverKey && keys.includes(handOverKey)) {
+                this.crmHandOverKey = null;
+                if (!this.crmOffline.isOffline()) {
+                    discarded = discarded.filter((key) => key !== handOverKey);
+                    const root = this.model.root;
+                    if (root?.offlineId === handOverKey) {
+                        root.crmAdoptRestoredChanges();
+                    }
                 }
-                this.crmReload();
+            }
+            if (!discarded.length) {
+                return;
+            }
+            const offlineId = this.model.root?.offlineId;
+            const dropRestored = Boolean(offlineId) && discarded.includes(offlineId);
+            return this.crmOwn(this.crmReconcile({ dropRestored }));
+        });
+        // A discarded activity call of the lead only leaves the set: its sheet follows
+        // the queue itself.
+        this.crmOffline.onEntriesDiscarded("mail.activity", (keys) => {
+            const ownKeys = this.crmCurrentOwnKeys();
+            for (const key of keys) {
+                ownKeys.delete(key);
             }
         });
 
         // Back online while the desktop-variant fallback is active: load the mobile
-        // variant again.
+        // variant again, keeping the form's changes.
         useEffect(() => {
             const isOffline = this.crmOffline.isOffline();
             if (!isOffline && this.crmDesktopFallback) {
                 this.crmDesktopFallback = false;
-                untrack(() => this.crmReload({ edits: "keep" }));
+                untrack(() => this.crmOwn(this.crmReconcile()));
             }
         });
     }
 
     /**
      * @override
-     * Adds `crmUseDesktopSpec`, consumed by `CrmFormModel.load`, to the parent's hooks.
+     * Adds `crmUseDesktopSpec`, consumed by `CrmFormModel.load`, and the activity
+     * sheet's "Show more" hook `crmLoadMoreActivities` to the parent's hooks.
      */
     get modelParams() {
         const params = super.modelParams;
         params.hooks.crmUseDesktopSpec = () => this.crmUseDesktopSpec();
+        params.hooks.crmLoadMoreActivities = (resId) => this.crmLoadMoreActivities(resId);
         return params;
     }
 
@@ -387,42 +728,73 @@ export class CrmFormController extends formView.Controller {
     }
 
     /**
-     * Reloads the lead (from the cache when offline). A load lost to the connection
-     * resolves: CRM code adds no uncaught error offline.
+     * Owns a promise this controller starts without a caller awaiting it (effects,
+     * queue callbacks, the deferred restoration of a queued save, the mount
+     * microtask). A lost connection is the sanctioned offline outcome (the cache or
+     * the next reconnection takes over) and ends there; any other error goes to the
+     * framework error handling, the way the action service shows an error of a
+     * mounted controller (`Promise.reject(error)` in its `onError`), once even when
+     * merged reconciliations share it (`crmReportError`).
      *
-     * Unsaved edits of the form (`edits`):
-     * - `"drop"` (discard reconciliation): reloaded anyway, so the changes of a
-     *   discarded queued save, restored into the form on reopening, are not kept
-     *   and queued again by a later save;
-     * - `"save"` (replay reconciliation, online): saved instead, which reloads the
-     *   lead with the server values without losing what the user typed meanwhile;
-     * - `"keep"` (end of the offline fallback): left as they are; the next load
-     *   applies the phone variant.
-     *
-     * @param {{edits?: "drop"|"save"|"keep"}} [options]
+     * @param {any} promise
+     * @returns {Promise<void>} resolved once `promise` settled
      */
-    async crmReload({ edits = "drop" } = {}) {
+    crmOwn(promise) {
+        return Promise.resolve(promise).then(() => {}, crmReportError);
+    }
+
+    /**
+     * Refreshes the displayed lead after its queued calls left the queue, or at the
+     * end of the offline fallback (from the cache when offline), keeping the form's
+     * unsaved changes as `CrmFormRecord.crmRefresh` describes; then shows its name
+     * and the state of its still-queued calls.
+     *
+     * Asked for while the form's first root load runs (the model is not ready yet),
+     * it runs once that load has completed, unless the controller is destroyed by
+     * then: that load may have read the lead, or chosen its load variant, before the
+     * replay, the discard or the reconnection. Requests made meanwhile then start
+     * together and are merged into one refresh (`crmRefresh`); none runs when the
+     * first load never completes.
+     *
+     * @param {{dropRestored?: boolean, save?: boolean}} [options]
+     * @returns {Promise<void>}
+     */
+    async crmReconcile(options) {
         if (!this.model.isReady()) {
-            return;
+            await this.model.whenReady.promise;
+            if (status(this) === "destroyed") {
+                return;
+            }
         }
         const root = this.model.root;
-        if (edits !== "drop" && root && (await root.isDirty())) {
-            if (edits === "save") {
-                await root.save();
-            }
+        if (!root) {
             return;
         }
-        try {
-            await this.model.load();
-        } catch (e) {
-            if (!(e instanceof ConnectionLostError)) {
-                throw e;
-            }
+        await root.crmRefresh(options);
+        if (status(this) !== "destroyed" && toRaw(this.model.root) === toRaw(root)) {
+            this.env.config.setDisplayName(this.displayName());
+            this.crmApplyQueuedState();
         }
     }
 
     /**
-     * Adds to `crmOwnKeys` the queued calls concerning the displayed lead:
+     * The tracked queue keys (`crmOwnKeys`) of the displayed lead: a new, empty set
+     * when the form displays another lead than the one they were tracked for.
+     *
+     * @returns {Set<string>}
+     */
+    crmCurrentOwnKeys() {
+        const root = this.model.root;
+        const lead = root ? root.resId || toRaw(root) : null;
+        if (lead !== this.crmOwnLead) {
+            this.crmOwnLead = lead;
+            this.crmOwnKeys = new Set();
+        }
+        return this.crmOwnKeys;
+    }
+
+    /**
+     * Adds to the displayed lead's `crmOwnKeys` its queued calls:
      * - its own offline save (`offlineId`) and every `crm.lead` call targeting its id;
      * - the `mail.activity` calls of its activity sheet: a create on the lead, and
      *   "mark done" of one of its loaded activities. Their replay reloads the lead,
@@ -433,10 +805,11 @@ export class CrmFormController extends formView.Controller {
         if (this.props.resModel !== "crm.lead" || !root) {
             return;
         }
+        const ownKeys = this.crmCurrentOwnKeys();
         const { offlineId, resId } = root;
         for (const { key, value } of this.crmOffline.queuedEntries("crm.lead")) {
             if ((offlineId && key === offlineId) || (resId && value.args?.[0]?.includes?.(resId))) {
-                this.crmOwnKeys.add(key);
+                ownKeys.add(key);
             }
         }
         if (!resId) {
@@ -453,7 +826,7 @@ export class CrmFormController extends formView.Controller {
                 value.method === "action_done" &&
                 activityIds.some((id) => value.args?.[0]?.includes?.(id));
             if (isLeadCreate || isLeadDone) {
-                this.crmOwnKeys.add(key);
+                ownKeys.add(key);
             }
         }
     }
@@ -481,14 +854,18 @@ export class CrmFormController extends formView.Controller {
         );
     }
 
-    /** Leaves the form of a lead whose delete is queued (once). */
+    /**
+     * Leaves the form of a lead whose delete is queued (once).
+     *
+     * @returns {any} what leaving started, for its caller to own
+     */
     crmLeaveDeletedLead() {
         this.crmPendingHistoryBack = false;
         if (this.crmHistoryBackDone) {
             return;
         }
         this.crmHistoryBackDone = true;
-        this.env.config.historyBack();
+        return this.env.config.historyBack();
     }
 
     /**
@@ -543,7 +920,7 @@ export class CrmFormController extends formView.Controller {
             { context: root.context },
             { extras }
         );
-        this.crmOwnKeys.add(key);
+        this.crmCurrentOwnKeys().add(key);
         root.applyOfflineWon();
         return false;
     }
@@ -571,8 +948,8 @@ export class CrmFormController extends formView.Controller {
                 }
                 const entry = this.crmFindPending(root.resId, ["unlink"]);
                 if (entry) {
-                    this.crmOwnKeys.add(entry.key);
-                    this.crmLeaveDeletedLead();
+                    this.crmCurrentOwnKeys().add(entry.key);
+                    this.crmOwn(this.crmLeaveDeletedLead());
                 }
             },
         };
@@ -580,15 +957,50 @@ export class CrmFormController extends formView.Controller {
 
     /**
      * @override
-     * Re-applies the local state of the lead's queued calls after every root load,
-     * so it survives reopening the lead while they wait:
+     * Re-applies the local state of the lead's queued calls after every root load
+     * (`crmApplyQueuedState`), so it survives reopening the lead while they wait,
+     * once the parent restored the lead's queued save into the form and set the
+     * display name. Two root loads differ:
+     * - a `crmRefresh` load kept the form's changes, and restoring the queued save
+     *   again would overwrite later edits of the same fields: only the display name
+     *   and the queued state are applied;
+     * - a reload run inside the model mutex (`Record.load`, an online archive, a
+     *   delete or duplicate opening another record) awaits this hook while holding
+     *   the mutex, and the restoration's update waits for that mutex, so awaiting it
+     *   would never resolve. The restoration then runs once the mutex is free, and
+     *   the queued state is applied now and again after it.
+     */
+    async onRootLoaded() {
+        const root = this.model.root;
+        if (root?.crmRefreshing) {
+            this.env.config.setDisplayName(this.displayName());
+            this.crmApplyQueuedState();
+            return;
+        }
+        if (this.model.mutex._queueSize > 0) {
+            const restoration = super.onRootLoaded(...arguments);
+            this.crmApplyQueuedState();
+            this.crmOwn(
+                restoration.then(() => {
+                    if (status(this) !== "destroyed" && toRaw(this.model.root) === toRaw(root)) {
+                        this.crmApplyQueuedState();
+                    }
+                })
+            );
+            return;
+        }
+        await super.onRootLoaded(...arguments);
+        this.crmApplyQueuedState();
+    }
+
+    /**
+     * Applies the local state of the displayed lead's queued calls:
      * - a queued `action_set_won` (pending or parked) shows the lead as won;
      * - the latest queued archive/unarchive sets `active` to the value it will set;
      * - a pending (not parked) `unlink` leaves the form (lead reached by URL or
      *   breadcrumb), once it is mounted.
      */
-    async onRootLoaded() {
-        await super.onRootLoaded(...arguments);
+    crmApplyQueuedState() {
         const root = this.model.root;
         if (this.props.resModel !== "crm.lead" || !root?.resId) {
             return;
@@ -609,7 +1021,7 @@ export class CrmFormController extends formView.Controller {
         if (!this.env.inDialog && this.crmFindPending(root.resId, ["unlink"])) {
             this.crmPendingHistoryBack = true;
             if (this.crmMounted) {
-                this.crmLeaveDeletedLead();
+                this.crmOwn(this.crmLeaveDeletedLead());
             }
         }
     }
@@ -665,24 +1077,108 @@ export class CrmFormController extends formView.Controller {
                     readonly: true,
                 },
             ]);
+            // Each lead has its own page size, read from the remembered preference,
+            // never from this controller: the lead's form opened again, even cold
+            // and offline, then issues the request of its last visit, whose cache
+            // key holds the page "Show more" reached. A new record has none.
             activeFields.activity_ids = {
                 ...activeFields.activity_ids,
                 related: crmActivityRelated(),
+                limit: config.resId
+                    ? getCrmActivityLimit(this.crmActivityScope(config.resId))
+                    : CRM_MOBILE_ACTIVITY_LIMIT,
             };
         }
         config.activeFields = markRaw(activeFields);
     }
 
     /**
+     * Scope of the activity page size remembered for the phone root load of the
+     * lead `resId`: the lead and the form's action, whose context is part of
+     * that load's request, hence of its cache key, like the page size.
+     *
+     * @param {number} resId
+     * @returns {string}
+     */
+    crmActivityScope(resId) {
+        return `lead:${this.env.config?.actionId ?? ""}:${resId}`;
+    }
+
+    /**
+     * `crmLoadMoreActivities` model hook, the activity sheet's "Show more": online
+     * on a phone, with the phone variant applied to the displayed lead `resId`,
+     * raises the activity rows it loads by one page (`CRM_MOBILE_ACTIVITY_LIMIT`)
+     * and refreshes the lead in place (`CrmFormRecord.crmRefresh`), so the larger
+     * page lands in the form's own (cached) root load. It never issues a separate
+     * `mail.activity` read. The refresh runs in the model mutex, replaces no
+     * record and keeps the form's unsaved changes: nothing is saved first, and an
+     * edit made while it runs waits behind it and applies to the refreshed lead.
+     *
+     * The lead's raised page size is remembered (`setCrmActivityLimit`) before the
+     * refresh, which reads it, so that the lead's form opened again issues the same
+     * request and is served the cached larger page offline. The previous page size
+     * is remembered again when the displayed lead did not load that page: the
+     * refresh failed (a lost connection resolves, any other error propagates), or
+     * it did not apply the phone variant with that page to this lead (the form
+     * moved to another record, or the screen widened, meanwhile).
+     *
+     * @param {number} resId lead whose sheet asks for more activities
+     * @returns {Promise<void>}
+     */
+    async crmLoadMoreActivities(resId) {
+        const root = this.model.root;
+        if (
+            !this.crmOffline.isSmall ||
+            this.crmOffline.isOffline() ||
+            this.crmLastVariant !== "mobile" ||
+            !this.model.isReady() ||
+            !root?.resId ||
+            root.resId !== resId
+        ) {
+            return;
+        }
+        const scope = this.crmActivityScope(resId);
+        const previousLimit = getCrmActivityLimit(scope);
+        const limit = previousLimit + CRM_MOBILE_ACTIVITY_LIMIT;
+        setCrmActivityLimit(scope, limit);
+        try {
+            await root.crmRefresh();
+        } catch (error) {
+            setCrmActivityLimit(scope, previousLimit);
+            if (!(error instanceof ConnectionLostError)) {
+                throw error;
+            }
+            return;
+        }
+        // A refresh that loaded gave the record its configuration, page size
+        // included. The lead lacks the larger page when the refresh did not run
+        // (another record shown), loaded another lead (a save moving the pager
+        // reuses the record) or applied the desktop variant (no activity rows).
+        const loadedLimit = toRaw(root.activeFields).activity_ids?.limit || 0;
+        if (toRaw(this.model.root) !== toRaw(root) || root.resId !== resId || loadedLimit < limit) {
+            setCrmActivityLimit(scope, previousLimit);
+        }
+    }
+
+    /**
      * Opens the mobile activity sheet of the displayed lead (phone "Activities"
      * button). The sheet reads the form's current root on every render, so it
-     * follows reloads; it closes when the form shows another record.
+     * follows reloads; it closes when the form shows another record, and when the
+     * screen widens.
+     *
+     * A direct call opens nothing unless the screen is small, the form is not in a
+     * dialog and it shows a synced `crm.lead` (one with a server id).
      *
      * @param {MouseEvent} ev
      */
     openMobileActivities(ev) {
-        const leadId = this.model.root.resId;
-        if (!leadId) {
+        const leadId = this.model.root?.resId;
+        if (
+            !this.crmOffline.isSmall ||
+            this.env.inDialog ||
+            this.props.resModel !== "crm.lead" ||
+            !leadId
+        ) {
             return;
         }
         this.crmActivitiesSheet.open(ev.currentTarget, {

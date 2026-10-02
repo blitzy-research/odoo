@@ -4,26 +4,29 @@ import { ConnectionLostError } from "@web/core/network/rpc";
 import { RelationalModel } from "@web/model/relational_model/relational_model";
 
 /**
- * Records, into the model's server-value snapshot, the server stage and expected
+ * Records, into the server-value snapshot of `list`, the server stage and expected
  * revenue of raw records just received from the server, for the ids it does not
  * hold yet. The first value kept for an id is therefore the one the group
  * aggregates were computed from: a record moved or edited locally is never
  * re-read, and a later non-root load returning post-save values for it cannot
  * overwrite that value.
  *
- * The target is the map being built by the running root load, or else the
- * current snapshot (a later group toggle or "load more"). Sample data is never
- * recorded: while sample records are displayed (`useSampleModel`) or loaded
- * through the sample ORM, which happens before `useSampleModel` is set.
+ * The target is the map the list was bound to when it was built: the snapshot of
+ * its root (see `CrmKanbanModel`). A later group toggle or "load more" therefore
+ * extends the snapshot of the root holding that group, never the one of another
+ * root. Sample data is never recorded: while sample records are displayed
+ * (`useSampleModel`) or loaded through the sample ORM, which happens before
+ * `useSampleModel` is set.
  *
- * @param {CrmKanbanModel} model
+ * @param {CrmKanbanDynamicRecordList} list the list receiving the records
  * @param {Object[]} records raw server records (`data.records` of a list)
  */
-function recordCrmServerValues(model, records) {
+function recordCrmServerValues(list, records) {
+    const { model } = list;
     if (model.useSampleModel || model.orm?.isSample) {
         return;
     }
-    const target = model._crmLoadingServerValues || model.crmServerValues;
+    const target = list._crmServerValues;
     if (!target || !Array.isArray(records)) {
         return;
     }
@@ -77,15 +80,28 @@ async function removeRecordsDeletedOffline(list, records) {
  * CRM kanban model, also used by `crm_mobile_pipeline` and, through
  * `ForecastKanbanModel`, by the forecast kanban.
  *
- * - `crmServerValues` is a `Map<number, {stageId: number|false, revenue: number|undefined}>`
- *   holding, per lead id, the server stage and expected revenue from the last
- *   successful root load, plus the leads of later group loads. It is an in-memory
- *   arithmetic snapshot, not a cache: it persists nothing and serves no read.
- *   `CrmMobilePipeline` reads it to compute the header revenue delta of the
- *   leads moved or edited since the server computed the group aggregates.
- * - `_crmLoadingServerValues` is the map being filled while a root load runs
- *   (`null` otherwise); it becomes `crmServerValues` only if that load succeeds,
- *   so a failed offline load keeps the previous snapshot.
+ * - `crmServerValues` is the server-value snapshot of the current root, a
+ *   `Map<number, {stageId: number|false, revenue: number|undefined}>` holding, per
+ *   lead id, the server stage and expected revenue as that root first received
+ *   them: from the root load that built it, then from its later group loads
+ *   (toggle, "load more"). It is an in-memory arithmetic snapshot, not a cache: it
+ *   persists nothing and serves no read. `CrmMobilePipeline` reads the snapshot
+ *   of the root it displays (its `_crmServerValues`, see below) to compute the
+ *   header revenue delta of the leads moved or edited since the server computed
+ *   that root's group aggregates: until a root load ends, the view may still
+ *   display the previous root while the new one is installed.
+ * - Each root owns its snapshot: the map is created with the root, and the root
+ *   and every list it holds keep it as `_crmServerValues`. The snapshot is
+ *   therefore the current one exactly when its root is installed as `root`, a
+ *   superseded load (one whose root was replaced, even while it still awaits its
+ *   progress bar) only ever fills its own root's map, and a failed load builds no
+ *   root, so the previous root keeps its snapshot. Fresh server data set on the
+ *   current root outside a root load (disk-cache update, root reload, leaving
+ *   sample mode) gives that root a new map.
+ * - `_crmLoadingServerValues` is the map that the lists being built synchronously
+ *   right now bind to (`null` otherwise). `_crmBuildWith` sets it around the
+ *   creation of a root and of each group, so that every list records into the map
+ *   of the root it belongs to.
  * - `crmUseDesktopSpec` is an optional model hook (`params.hooks`), supplied by
  *   `CrmMobilePipelineController`: when a root load fails with a lost connection
  *   and the hook returns `true`, the load is retried once, and the controller's
@@ -97,68 +113,85 @@ export class CrmKanbanModel extends RelationalModel {
     setup(params, { effect }) {
         super.setup(...arguments);
         this.effect = effect;
-        // Assigned here rather than as class fields: `Model`'s constructor runs
+        // Assigned here rather than as a class field: `Model`'s constructor runs
         // `setup` (including subclasses' such as ForecastKanbanModel) before any
         // class field of this class would be initialised.
-        this.crmServerValues = new Map();
         this._crmLoadingServerValues = null;
+    }
+
+    /**
+     * Server-value snapshot of the current root (see the class description), or
+     * `undefined` while no root exists.
+     *
+     * @returns {Map<number, {stageId: number|false, revenue: number|undefined}>|undefined}
+     */
+    get crmServerValues() {
+        return this.root?._crmServerValues;
     }
 
     /**
      * @override
      *
-     * Fills a fresh server-value snapshot during the root load and makes it the
-     * current one only when the load succeeds. Offline, a root load of the mobile
-     * variant that could not be served is retried once when the
-     * `crmUseDesktopSpec` hook asks for it (the hook switches to the desktop
-     * variant); the error of that retry propagates as the framework raises it.
+     * Offline, a root load of the mobile variant that could not be served is
+     * retried once when the `crmUseDesktopSpec` hook asks for it (the hook switches
+     * to the desktop variant); the error of that retry, like any other error,
+     * propagates as the framework raises it. The server-value snapshot needs no
+     * handling here: it belongs to the root the load builds.
      */
     async load(params = {}) {
-        const next = new Map();
-        this._crmLoadingServerValues = next;
         try {
-            try {
-                await super.load(...arguments);
-            } catch (error) {
-                if (!(error instanceof ConnectionLostError) || !this.hooks.crmUseDesktopSpec?.()) {
-                    throw error;
-                }
-                next.clear();
-                await super.load(...arguments);
+            await super.load(...arguments);
+        } catch (error) {
+            if (!(error instanceof ConnectionLostError) || !this.hooks.crmUseDesktopSpec?.()) {
+                throw error;
             }
-            this.crmServerValues = next;
-        } finally {
-            // An overlapping, more recent load owns the loading map: leave it alone.
-            // Compared raw, as the model may be called through a reactive proxy.
-            if (toRaw(this._crmLoadingServerValues) === next) {
-                this._crmLoadingServerValues = null;
-            }
+            await super.load(...arguments);
         }
     }
 
     /**
-     * Runs `fn`, which sets fresh server data on the current root outside a root
-     * load (the disk-cache update of a load that already resolved, or a root
-     * `_updateConfig` reload), with a fresh snapshot map, then makes that map the
-     * current snapshot. The loading map of an in-flight `load()` is restored, so
-     * that load still swaps its own map in when it succeeds.
+     * @override
      *
-     * @param {() => void} fn
+     * Every root, including the empty one of the first load, is built with a
+     * fresh server-value snapshot of its own.
      */
-    _crmWithFreshServerValues(fn) {
+    _createRoot(config, data) {
+        return this._crmBuildWith(new Map(), () => super._createRoot(...arguments));
+    }
+
+    /**
+     * Runs `fn`, which builds datapoints synchronously, with `map` as the snapshot
+     * the lists it creates bind to, then restores the previous binding (that of an
+     * enclosing build, or `null`).
+     *
+     * @template T
+     * @param {Map<number, Object>} map
+     * @param {() => T} fn
+     * @returns {T} the result of `fn`
+     */
+    _crmBuildWith(map, fn) {
         const previous = this._crmLoadingServerValues;
-        const next = new Map();
-        this._crmLoadingServerValues = next;
+        this._crmLoadingServerValues = map;
         try {
-            fn();
+            return fn();
         } finally {
             this._crmLoadingServerValues = previous;
         }
-        this.crmServerValues = next;
     }
 }
 
 export class CrmKanbanDynamicGroupList extends RelationalModel.DynamicGroupList {
+    /**
+     * @override
+     *
+     * Binds the list to the server-value snapshot of the root being built (see
+     * `CrmKanbanModel`) before `super` sets its data.
+     */
+    setup(config, data) {
+        this._crmServerValues = this.model._crmLoadingServerValues || new Map();
+        super.setup(...arguments);
+    }
+
     /**
      * @override
      *
@@ -187,16 +220,29 @@ export class CrmKanbanDynamicGroupList extends RelationalModel.DynamicGroupList 
     /**
      * @override
      *
-     * Fresh server data set on the current grouped root outside a root load
-     * replaces the server-value snapshot: the groups, and with them every group's
-     * record list, are built synchronously by `super`.
+     * Fresh server data set on the current grouped root outside a root load gives
+     * the root a new server-value snapshot: the groups, and with them every
+     * group's record list, are then built by `super` bound to that map. Any other
+     * list keeps the snapshot it was built with.
      */
     _setData(data) {
         if (this.config.isRoot && isCurrentRoot(this)) {
-            this.model._crmWithFreshServerValues(() => super._setData(...arguments));
-        } else {
-            super._setData(...arguments);
+            this._crmServerValues = new Map();
         }
+        super._setData(...arguments);
+    }
+
+    /**
+     * @override
+     *
+     * Builds the group, and with it the group's list, bound to this list's
+     * server-value snapshot, so that the lists of a root all record into that
+     * root's map.
+     */
+    _createGroupDatapoint(data) {
+        return this.model._crmBuildWith(this._crmServerValues, () =>
+            super._createGroupDatapoint(...arguments)
+        );
     }
 
     /**
@@ -217,21 +263,28 @@ export class CrmKanbanDynamicRecordList extends RelationalModel.DynamicRecordLis
     /**
      * @override
      *
-     * Records the server stage and revenue of the received records (see
-     * `recordCrmServerValues`) before `super` builds the record datapoints. Fresh
-     * server data set on the current ungrouped root outside a root load replaces
-     * the snapshot.
+     * Binds the list to the server-value snapshot of the root being built (see
+     * `CrmKanbanModel`) before `super` sets its data.
+     */
+    setup(config, data) {
+        this._crmServerValues = this.model._crmLoadingServerValues || new Map();
+        super.setup(...arguments);
+    }
+
+    /**
+     * @override
+     *
+     * Records the server stage and revenue of the received records into the
+     * list's snapshot (see `recordCrmServerValues`) before `super` builds the
+     * record datapoints. Fresh server data set on the current ungrouped root
+     * outside a root load first gives the root a new snapshot.
      */
     _setData(data) {
         if (this.config.isRoot && isCurrentRoot(this)) {
-            this.model._crmWithFreshServerValues(() => {
-                recordCrmServerValues(this.model, data.records);
-                super._setData(...arguments);
-            });
-        } else {
-            recordCrmServerValues(this.model, data.records);
-            super._setData(...arguments);
+            this._crmServerValues = new Map();
         }
+        recordCrmServerValues(this, data.records);
+        super._setData(...arguments);
     }
 
     /**

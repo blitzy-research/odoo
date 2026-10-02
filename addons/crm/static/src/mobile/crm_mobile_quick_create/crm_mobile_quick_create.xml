@@ -35,6 +35,7 @@
                     data-available-offline="1"/>
                 <div t-if="this.state.invalidName"
                     class="invalid-feedback d-block"
+                    role="alert"
                     t-att-id="this.fieldId('name_feedback')">A lead name is required.</div>
             </div>
 

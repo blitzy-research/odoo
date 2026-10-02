@@ -132,7 +132,11 @@
         // the flow instead and fills the height left in the body, so its help box is
         // centred below the "Back" button rather than over it. On a screen too short
         // for both, the view scrolls: the help box can never swallow a tap on "Back".
-        > .o_view_nocontent {
+        // The uncached-lead helper sits in a `d-contents` wrapper, which carries the
+        // id describing "Back" and generates no box: the helper is a flex item of
+        // the body all the same.
+        > .o_view_nocontent,
+        > .o_crm_mobile_pipeline_lead_helper > .o_view_nocontent {
             position: relative;
             flex: 1 1 auto;
         }

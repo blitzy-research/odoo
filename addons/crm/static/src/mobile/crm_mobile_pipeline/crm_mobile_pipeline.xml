@@ -30,9 +30,13 @@
             class="o_kanban_renderer o_renderer o_crm_mobile_pipeline"
             t-att-class="{ o_crm_mobile_pipeline_ungrouped: !this.props.list.isGrouped }"
             t-ref="this.rootRef">
+            <!-- Stage choices built once per render: every card receives the same array. -->
+            <t t-set="stageChoices" t-value="this.stages"/>
             <t t-if="this.isStagePipeline">
                 <t t-set="group" t-value="this.activeGroup"/>
                 <t t-if="group">
+                    <!-- One projection of the loaded leads and one read of the pending creates per render, shared by the header and the cards. -->
+                    <t t-set="stageView" t-value="this.crmStageView(group)"/>
                     <div class="o_crm_mobile_pipeline_header">
                         <!-- Navigation reads the clamped index: a stale `mobile.activeIndex` past the last stage never blocks it. -->
                         <button type="button"
@@ -45,15 +49,18 @@
                             <i class="oi oi-chevron-left" aria-hidden="true"/>
                         </button>
                         <div class="o_crm_mobile_pipeline_stage">
-                            <div class="o_crm_mobile_pipeline_stage_name fw-bold" aria-live="polite" t-out="group.displayName"/>
+                            <!-- A heading by role, so heading navigation reaches the displayed stage; a <h2> would bring Bootstrap's heading size and margin. -->
+                            <div class="o_crm_mobile_pipeline_stage_name fw-bold" role="heading" aria-level="2" aria-live="polite" t-out="group.displayName"/>
                             <div class="o_crm_mobile_pipeline_summary">
-                                <span class="o_crm_mobile_pipeline_count" t-out="this.getStageCount(group)"/>
+                                <span class="o_crm_mobile_pipeline_count" t-out="stageView.count"/>
                                 <!-- `null` while a progress-bar filter is active or no server sum was loaded. -->
-                                <t t-set="revenue" t-value="this.getStageRevenue(group)"/>
+                                <t t-set="revenue" t-value="stageView.revenue"/>
                                 <span t-if="revenue" class="o_crm_mobile_pipeline_revenue">
                                     <AnimatedNumber value="revenue.value" duration="1000" currencies="revenue.currencies"/>
                                 </span>
                             </div>
+                            <!-- Reads out the final count and revenue when queued writes, a replay or a stage change update them; the animated number itself stays out of any live region. -->
+                            <span class="visually-hidden o_crm_mobile_pipeline_status" role="status" aria-atomic="true" t-out="this.crmStageStatus(stageView)"/>
                         </div>
                         <button type="button"
                             class="btn btn-light o_crm_mobile_pipeline_next"
@@ -74,41 +81,52 @@
                     <div class="o_crm_mobile_pipeline_body"
                         t-on-touchstart="this.onTouchStart"
                         t-on-touchend="this.onTouchEnd">
-                        <!-- A lead whose form was never visited online cannot open offline. -->
+                        <!-- A lead whose form was never visited online cannot open offline. "Back" takes the focus, described by the helper's text. -->
                         <t t-if="this.mobile.helperLeadId">
                             <button type="button"
                                 class="btn btn-link o_crm_mobile_pipeline_helper_back"
                                 data-available-offline="1"
+                                t-att-aria-describedby="this.crmLeadHelperId"
+                                t-ref="this.crmHelperBackRef"
                                 t-on-click="() => this.closeLeadHelper()"><i class="oi oi-arrow-left me-1" aria-hidden="true"/>Back</button>
-                            <OfflineActionHelper/>
+                            <!-- Generates no box: the helper is laid out in the body as the stage helper is. -->
+                            <div class="o_crm_mobile_pipeline_lead_helper d-contents" t-att-id="this.crmLeadHelperId">
+                                <OfflineActionHelper/>
+                            </div>
                         </t>
                         <!-- Offline, a stage with leads none of which was ever loaded. -->
                         <OfflineActionHelper t-elif="this.isStageUnavailableOffline(group)"/>
                         <t t-else="">
                             <!-- The card calls onOpen(record) and onMoveStage(record, stageId). -->
-                            <t t-foreach="this.getStageRecords(group)" t-as="record" t-key="record.resId">
+                            <t t-foreach="stageView.records" t-as="record" t-key="record.resId">
                                 <CrmMobileLeadCard
                                     record="record"
-                                    stages="this.stages"
+                                    stages="stageChoices"
                                     archInfo="this.props.archInfo"
                                     getRecord.bind="this.getRecord"
                                     onOpen.bind="this.openLead"
                                     onMoveStage.bind="this.moveLead"/>
                             </t>
                             <!-- Leads created offline: the card itself never opens or moves a provisional card. -->
-                            <t t-foreach="this.crmOffline.pendingCreates(group.value)" t-as="pending" t-key="pending.key">
+                            <t t-foreach="stageView.pending" t-as="pending" t-key="pending.key">
                                 <CrmMobileLeadCard
                                     provisional="pending"
-                                    stages="this.stages"
+                                    stages="stageChoices"
                                     archInfo="this.props.archInfo"
                                     getRecord.bind="this.getRecord"
                                     onOpen.bind="this.openLead"
                                     onMoveStage.bind="this.moveLead"/>
                             </t>
-                            <div t-if="this.showLoadMore(group)" class="o_crm_mobile_pipeline_load_more">
+                            <!-- A filtered count of 0 leaves nothing to load, as the header shows. -->
+                            <t t-set="unloadedCount" t-value="this.crmGetUnloadedCount(group)"/>
+                            <div t-if="this.showLoadMore(unloadedCount)" class="o_crm_mobile_pipeline_load_more">
+                                <!-- Disabled and busy while its load runs: a repeat click starts no other load. -->
+                                <t t-set="loadingMore" t-value="this.crmLoadingMore.has(group.id)"/>
                                 <button type="button"
                                     class="btn btn-outline-primary w-100"
-                                    t-on-click="() => this.loadMore(group)">Load more... (<t t-out="this.getGroupUnloadedCount(group)"/> remaining)</button>
+                                    t-att-disabled="loadingMore"
+                                    t-att-aria-busy="loadingMore ? 'true' : false"
+                                    t-on-click="() => this.crmLoadMore(group)"><i t-if="loadingMore" class="fa fa-circle-o-notch fa-spin me-1" aria-hidden="true"/>Load more... (<t t-out="unloadedCount"/> remaining)</button>
                             </div>
                         </t>
                     </div>
@@ -120,14 +138,18 @@
                         <button type="button"
                             class="btn btn-link o_crm_mobile_pipeline_helper_back"
                             data-available-offline="1"
+                            t-att-aria-describedby="this.crmLeadHelperId"
+                            t-ref="this.crmHelperBackRef"
                             t-on-click="() => this.closeLeadHelper()"><i class="oi oi-arrow-left me-1" aria-hidden="true"/>Back</button>
-                        <OfflineActionHelper/>
+                        <div class="o_crm_mobile_pipeline_lead_helper d-contents" t-att-id="this.crmLeadHelperId">
+                            <OfflineActionHelper/>
+                        </div>
                     </t>
                     <t t-else="">
                         <t t-foreach="this.getUngroupedRecords()" t-as="record" t-key="record.resId">
                             <CrmMobileLeadCard
                                 record="record"
-                                stages="this.stages"
+                                stages="stageChoices"
                                 archInfo="this.props.archInfo"
                                 getRecord.bind="this.getRecord"
                                 onOpen.bind="this.openLead"
