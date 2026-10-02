@@ -1,8 +1,29 @@
+import { usePlugin } from "@odoo/owl";
 import { Domain } from "@web/core/domain";
 import { ActivityMenu } from "@mail/core/web/activity_menu";
+import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { patch } from "@web/core/utils/patch";
 
 patch(ActivityMenu.prototype, {
+    setup() {
+        super.setup(...arguments);
+        this.offlinePlugin = usePlugin(OfflinePlugin);
+    },
+
+    /**
+     * Read during render by the CRM `mail.ActivityMenu` extension template
+     * (crm_mobile_pipeline.xml) to give the CRM row and its counters their
+     * offline disabled state. Reading the offline signal during render
+     * subscribes the menu, so one opened online re-renders when the
+     * connectivity changes; the signal is read for the CRM row only.
+     *
+     * @param {Object} group activity group of the systray menu
+     * @returns {boolean} whether the group is the CRM one and the connection is lost
+     */
+    isCrmGroupOffline(group) {
+        return group.model === "crm.lead" && this.offlinePlugin.isOffline();
+    },
+
     availableViews(group) {
         if (group.model === "crm.lead") {
             return [

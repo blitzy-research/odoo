@@ -1,0 +1,151 @@
+// Mobile CRM lead card (`crm.CrmMobileLeadCard`), its activity bottom sheet
+// (`crm.CrmMobileLeadActivities`) and the lead form's small-screen "Activities"
+// control-panel button (`crm.CrmFormView`).
+//
+// These classes exist only in markup rendered on small screens, so every rule is
+// nested under one of them and nothing here can match a desktop screen. The look of
+// a control disabled offline belongs to the framework
+// (`web/static/src/core/offline/offline.scss`) and that of a disabled one to
+// Bootstrap's `.btn:disabled` and `.form-select:disabled`: no rule here sets the
+// dimming, the cursor or the pointer events of a control.
+//
+// Every button, select and input is a touch target of at least 44 x 44 px. Spacing
+// is a multiple of Bootstrap's `$spacer`; the 44 px minimums are the only px values.
+// Block-axis properties are logical: in the horizontal writing mode of these
+// components `padding-block` and `border-block-end` are the top/bottom padding and
+// the bottom border.
+
+.o_crm_mobile_lead_card,
+.o_crm_mobile_lead_activities_sheet,
+.o_crm_mobile_activities_button {
+    // Minimum width and height of every interactive element: the touch target.
+    --CrmMobileLeadCard-touchTarget: 44px;
+}
+
+// Lead card -----------------------------------------------------------------------
+
+.o_crm_mobile_lead_card {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+
+    button,
+    select,
+    input {
+        min-width: var(--CrmMobileLeadCard-touchTarget);
+        min-height: var(--CrmMobileLeadCard-touchTarget);
+    }
+
+    // The name, partner and revenue block opens the lead: a full-width touch target.
+    .o_crm_mobile_lead_open {
+        width: 100%;
+        min-height: var(--CrmMobileLeadCard-touchTarget);
+        text-align: start;
+    }
+
+    // Long names and partners end with an ellipsis instead of widening the card.
+    .o_crm_mobile_lead_name,
+    .o_crm_mobile_lead_partner {
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .o_crm_mobile_lead_actions {
+        // The stage select takes the free width of the row...
+        .o_crm_mobile_lead_stage {
+            flex: 1 1 auto;
+            // Replaces the flex item's automatic minimum (the width of the longest
+            // stage name), so the select shrinks instead of overflowing the card. The
+            // floor is the touch target, not 0: the select is an interactive element
+            // of the card and must stay at least 44 px wide.
+            min-width: var(--CrmMobileLeadCard-touchTarget);
+        }
+
+        // ...while the icon-only activities button keeps its 44 px square.
+        .o_crm_mobile_lead_activities_button {
+            flex: 0 0 auto;
+        }
+    }
+
+    // "Pending sync" / "Sync failed" badge. Its colour comes from the `text-bg-*`
+    // utility set by the template, and its wording, not only the colour, tells the
+    // state. Aligned to the start because the card's column stretches its items.
+    .o_crm_mobile_pending_sync {
+        align-self: flex-start;
+        white-space: nowrap;
+    }
+
+    // A lead created offline and not synced yet. The dashed border is a visual cue
+    // only: the card is not dimmed, which would read as a control disabled offline.
+    // The template's `.border` utility builds its shorthand from Bootstrap's border
+    // style custom property and wins with `!important`, so that property carries the
+    // dashed style; `border-style` covers a card rendered without the utility.
+    &.o_crm_mobile_lead_card_provisional {
+        --#{$prefix}border-style: dashed;
+        border-style: dashed;
+    }
+}
+
+// Activity bottom sheet -----------------------------------------------------------
+
+.o_crm_mobile_lead_activities_sheet {
+    button,
+    select,
+    input {
+        min-width: var(--CrmMobileLeadCard-touchTarget);
+        min-height: var(--CrmMobileLeadCard-touchTarget);
+    }
+
+    // Synced and pending activities share one list, separated by a divider.
+    .o_crm_mobile_activity_row {
+        padding-block: $spacer * 0.5;
+        border-block-end: $border-width solid $border-color;
+
+        // No divider after the last row, whichever kind it is.
+        &:last-child {
+            border-block-end: 0;
+        }
+
+        // The summary, type, deadline and assignee block absorbs a narrow row: its
+        // title is truncated by the template's `text-truncate`.
+        .o_crm_mobile_activity_info {
+            flex: 1 1 auto;
+            min-width: 0;
+        }
+
+        // "Mark done" (or "Done · Pending sync") and the pending badge keep their
+        // label in one piece; the text block beside them shrinks instead.
+        .o_crm_mobile_activity_done,
+        .o_crm_mobile_pending_sync {
+            flex: 0 0 auto;
+        }
+
+        .o_crm_mobile_pending_sync {
+            white-space: nowrap;
+        }
+    }
+
+    // "Log a call" and "Schedule follow-up" share the width of the sheet: a zero flex
+    // basis splits the row equally, whatever the length of each label.
+    .o_crm_mobile_activity_actions > .btn {
+        flex: 1 1 0;
+    }
+
+    // Type, summary, due date and assignee fill the width of the inline form.
+    .o_crm_mobile_activity_form {
+        .form-control,
+        .form-select {
+            width: 100%;
+        }
+    }
+}
+
+// Lead form "Activities" button ---------------------------------------------------
+
+// Rendered in the form's control panel on small screens only.
+.o_crm_mobile_activities_button {
+    min-width: var(--CrmMobileLeadCard-touchTarget);
+    min-height: var(--CrmMobileLeadCard-touchTarget);
+}
