@@ -1,0 +1,61 @@
+// Bottom-sheet quick create of the CRM mobile pipeline (`crm.CrmMobileQuickCreate`).
+//
+// The form is rendered only inside the small-screen bottom sheet, so every rule is
+// nested under its root class and nothing here can match a desktop screen. The sheet
+// itself (`.o_bottom_sheet`) and the look of offline-disabled controls
+// (`.o_disabled_offline`) keep the framework's styling and are never overridden here.
+//
+// Block-axis spacing is written with logical properties: in the sheet's horizontal
+// writing mode `margin-block-start`, `margin-block-end` and `padding-block-end` are
+// `margin-top`, `margin-bottom` and `padding-bottom`. All spacing is a multiple of
+// Bootstrap's `$spacer`.
+
+.o_crm_mobile_quick_create {
+    // Spacing between the rows, between the two buttons, and around the button row.
+    --CrmMobileQuickCreate-gap: #{$spacer * 0.5};
+    // Minimum width and height of every field and button: the 44 x 44 px touch target.
+    --CrmMobileQuickCreate-touchTarget: 44px;
+
+    display: flex;
+    flex-direction: column;
+    gap: var(--CrmMobileQuickCreate-gap);
+    width: 100%;
+
+    // One label above its control.
+    .o_crm_mobile_quick_create_row {
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+
+        .form-label {
+            margin-block-end: $spacer * 0.25;
+        }
+    }
+
+    // The six fields: five inputs and the stage select.
+    .o_crm_mobile_quick_create_field {
+        width: 100%;
+        min-width: var(--CrmMobileQuickCreate-touchTarget);
+        min-height: var(--CrmMobileQuickCreate-touchTarget);
+        // At least 16px, so iOS Safari does not zoom the page into a focused control
+        // (the backend base font size is 14px). Interpolated because LibSass cannot
+        // evaluate `max()` across rem and px.
+        font-size: #{"max(1rem, 16px)"};
+    }
+
+    // Save and Cancel, side by side across the full width of the sheet.
+    .o_crm_mobile_quick_create_buttons {
+        display: flex;
+        gap: var(--CrmMobileQuickCreate-gap);
+        margin-block-start: var(--CrmMobileQuickCreate-gap);
+        padding-block-end: var(--CrmMobileQuickCreate-gap);
+
+        .btn {
+            // A zero flex basis splits the row into two equal halves; with the
+            // default `auto` basis each button would be sized by its own label.
+            flex: 1 1 0;
+            min-width: var(--CrmMobileQuickCreate-touchTarget);
+            min-height: var(--CrmMobileQuickCreate-touchTarget);
+        }
+    }
+}
