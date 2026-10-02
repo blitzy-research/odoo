@@ -2,7 +2,16 @@ import { checkRainbowmanMessage } from "@crm/views/check_rainbowman_message";
 import { registry } from "@web/core/registry";
 import { formView } from "@web/views/form/form_view";
 
-import { computed, markRaw, onMounted, toRaw, untrack, useEffect, usePlugin } from "@odoo/owl";
+import {
+    computed,
+    markRaw,
+    onMounted,
+    status,
+    toRaw,
+    untrack,
+    useEffect,
+    usePlugin,
+} from "@odoo/owl";
 import { _t } from "@web/core/l10n/translation";
 import { ConnectionLostError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
@@ -268,7 +277,16 @@ export class CrmFormController extends formView.Controller {
         onMounted(() => {
             this.crmMounted = true;
             if (this.crmPendingHistoryBack) {
-                this.crmLeaveDeletedLead();
+                // The action service commits its controller stack in the `onMounted` of
+                // the action's wrapper component, which runs after this one. Going back
+                // before that would read a stack without this form, leaving it mounted
+                // behind the restored view (where a later reload reads the deleted
+                // lead), so the form is left once the mount has completed.
+                Promise.resolve().then(() => {
+                    if (status(this) === "mounted") {
+                        this.crmLeaveDeletedLead();
+                    }
+                });
             }
             this.crmWarmActivityTypes();
         });

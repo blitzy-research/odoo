@@ -378,11 +378,13 @@ export function useCrmOffline() {
 
     /**
      * Adds a call to the framework queue (replayed in `extras.timeStamp` order)
-     * and returns its key. The options object is required by `scheduleORM`.
+     * and returns its key. The options object is required by `scheduleORM`. A
+     * later `extras.timeStamp` given by the caller (a write that must replay after
+     * others queued in the same millisecond) is kept.
      */
     const queue = (model, method, args, kwargs, extras) =>
         plugin.scheduleORM(model, method, args, kwargs, {
-            extras: { ...extras, timeStamp: Date.now() },
+            extras: { ...extras, timeStamp: Math.max(Date.now(), extras?.timeStamp || 0) },
         });
 
     /**
@@ -602,9 +604,12 @@ export function useCrmOffline() {
             if (!records.length) {
                 return { variant: "desktop", moreCount: 0, rows: [] };
             }
+            // Loaded without sub-fields, the framework keeps a single record in the
+            // x2many list (its limit is 1), while `count` holds every activity id.
+            const count = record.data.activity_ids.count ?? records.length;
             return {
                 variant: "desktop",
-                moreCount: records.length - 1,
+                moreCount: Math.max(count - 1, 0),
                 rows: [
                     {
                         id: records[0].resId,

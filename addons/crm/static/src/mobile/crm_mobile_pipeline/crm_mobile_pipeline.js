@@ -25,6 +25,7 @@ import { usePopover } from "@web/core/popover/popover_hook";
 import {
     addFieldDependencies,
     extractFieldsFromArchInfo,
+    getScheduleORMExtras,
     makeActiveField,
 } from "@web/model/relational_model/utils";
 import { OfflineActionHelper } from "@web/views/offline_action_helper";
@@ -887,6 +888,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * @returns {Promise|undefined}
      */
     moveLead(record, stageId) {
+        let holder;
         if (this.isStagePipeline) {
             const groups = this.stageGroups;
             const source = groups.find((group) => group.list.records.includes(record));
@@ -897,18 +899,49 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             if (source !== target) {
                 return this.props.list.moveRecord(record.id, source.id, null, target.id);
             }
-            if (this.crmProjectedStage(record, source) === stageId) {
-                return;
-            }
-            // The lead is still listed in its server stage while a queued write
-            // shows it elsewhere: choosing that server stage again saves it, so the
-            // later write wins on replay instead of the choice being ignored.
+            holder = source;
+        }
+        if (this.crmProjectedStage(record, holder) === stageId) {
+            return;
         }
         const stage = this.stages.find((s) => s.id === stageId);
-        return record.update(
-            { stage_id: { id: stageId, display_name: stage?.display_name ?? "" } },
-            { save: true }
+        const stageValue = { id: stageId, display_name: stage?.display_name ?? "" };
+        if (many2oneId(record.data.stage_id) === stageId) {
+            // The lead still has this (server) stage while a queued write of another
+            // `Record` of it (e.g. its form) shows it elsewhere. The record already
+            // holds the value, so `record.update` would register no change and save
+            // nothing: the choice is written as its own lead write instead, so it
+            // wins on replay rather than being ignored.
+            return this.crmWriteStage(record, stageValue);
+        }
+        return record.update({ stage_id: stageValue }, { save: true });
+    }
+
+    /**
+     * Writes a stage on a lead through its own `web_save`: online it is saved and
+     * the root reloaded; offline (or when the connection drops) it is queued after
+     * every queued lead write, with the display values `projectLead` reads.
+     *
+     * @param {Object} record
+     * @param {{id: number, display_name: string}} stageValue
+     */
+    async crmWriteStage(record, stageValue) {
+        const extras = getScheduleORMExtras(record.model, [record]);
+        // Replay follows `extras.timeStamp`: after the writes it overrides, even when
+        // the clock has not moved since they were queued.
+        for (const { value } of this.crmOffline.queuedEntries("crm.lead")) {
+            extras.timeStamp = Math.max(extras.timeStamp, (value.extras?.timeStamp || 0) + 1);
+        }
+        const result = await this.crmOffline.schedule(
+            "crm.lead",
+            "web_save",
+            [[record.resId], { stage_id: stageValue.id }],
+            { context: record.context, specification: {} },
+            { ...extras, changes: { stage_id: stageValue } }
         );
+        if (!this.crmOffline.isQueued(result)) {
+            await this.crmReloadIfMobile();
+        }
     }
 
     /**
