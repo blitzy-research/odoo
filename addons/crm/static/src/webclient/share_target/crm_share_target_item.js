@@ -57,7 +57,9 @@ export class CrmShareTargetItem extends ShareTargetItem {
     /**
      * The lead share target is DISABLE offline (crm/static/src/mobile/offline_inventory.md):
      * the attachments need the id of a lead created on the server, so nothing is uploaded,
-     * created, written or opened while offline.
+     * created, written or opened while offline. This entry guard covers a save started
+     * offline; a save started online stops at the create and open steps below when the
+     * connection drops meanwhile.
      *
      * @override
      */
@@ -66,6 +68,21 @@ export class CrmShareTargetItem extends ShareTargetItem {
             return;
         }
         return super.process(...arguments);
+    }
+
+    /**
+     * DISABLE offline (crm/static/src/mobile/offline_inventory.md): a save started online
+     * whose upload ends after the connection is lost stops here, as does a direct call. The
+     * lead is not created, so the uploaded attachments are not relinked. Returns null, the
+     * "record wasn't saved" value of the base contract.
+     *
+     * @override
+     */
+    async createRecordWithFile(attachments) {
+        if (this.offlinePlugin.isOffline()) {
+            return null;
+        }
+        return super.createRecordWithFile(...arguments);
     }
 
     /**
@@ -80,6 +97,19 @@ export class CrmShareTargetItem extends ShareTargetItem {
             return null;
         }
         return super._createRecord(...arguments);
+    }
+
+    /**
+     * DISABLE offline (crm/static/src/mobile/offline_inventory.md): a save stopped by the
+     * connection loss, like a direct call, opens no record.
+     *
+     * @override
+     */
+    async openCreatedRecord(resId) {
+        if (this.offlinePlugin.isOffline()) {
+            return;
+        }
+        return super.openCreatedRecord(...arguments);
     }
 
     /**

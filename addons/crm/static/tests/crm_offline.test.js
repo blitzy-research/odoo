@@ -4918,6 +4918,100 @@ test("[Offline] share target team read on reconnection: retried when lost, repor
     expect.verifyErrors([]);
 });
 
+test("[Offline] share target save started online stops when the connection drops during the upload", async () => {
+    const sharedFile = new File([new Uint8Array(1)], "card.png", { type: "image/png" });
+    patchWithCleanup(shareTargetService, { _getShareTargetFiles: async () => [sharedFile] });
+    const { env } = await makeMockServer();
+    const attachmentId = env["ir.attachment"].create({ name: "card.png" });
+    /** Holds each upload until the test releases it, once the connection has dropped. */
+    let heldUpload = null;
+    onRpc("/web/binary/upload_attachment", async () => {
+        expect.step("upload_attachment");
+        await heldUpload.promise;
+        return [{ id: attachmentId, filename: "card.png" }];
+    });
+    let leadItem = null;
+    patchWithCleanup(CrmShareTargetItem.prototype, {
+        setup() {
+            super.setup(...arguments);
+            leadItem = this;
+        },
+    });
+    const setOffline = mockOffline();
+    stepRoutes(
+        (route) =>
+            route.includes("/crm.team/") ||
+            route.includes("/crm.lead/") ||
+            route.includes("/ir.attachment/")
+    );
+    const attachmentLink = () => {
+        const [{ res_id, res_model }] = MockServer.env["ir.attachment"].browse(attachmentId);
+        return { res_id, res_model };
+    };
+    const unlinked = attachmentLink();
+    const sharedLeads = () => MockServer.env["crm.lead"].search([["name", "=", "card.png"]]);
+    const expectNothingSaved = () => {
+        expect.verifySteps([]);
+        expect(".o_form_view").toHaveCount(0);
+        expect(attachmentLink()).toEqual(unlinked);
+        expect(sharedLeads()).toEqual([]);
+        expect(queued("crm.lead")).toEqual([]);
+        expect(queued("ir.attachment")).toEqual([]);
+    };
+    // A file is shared online: the dialog opens on the lead item, which reads the teams.
+    await makeTestApp();
+    await mountWithCleanup(WebClient);
+    await expect.waitForSteps(["/web/dataset/call_kw/crm.team/web_search_read"]);
+    await animationFrame();
+    const offlinePlugin = getService(OfflinePlugin);
+
+    // A save started online, whose upload ends once the offline signal is set while the
+    // mock server still answers: a stale signal, which only an RPC response clears (the
+    // upload is a plain fetch and clears nothing). `mockOffline()` would also answer 502
+    // to any later request, so only the signal is set here.
+    heldUpload = Promise.withResolvers();
+    const processing = leadItem.process();
+    await expect.waitForSteps(["upload_attachment"]);
+    offlinePlugin.setOffline(true);
+    await animationFrame();
+    heldUpload.resolve();
+    await processing;
+    await animationFrame();
+    expect(offlinePlugin.isOffline()).toBe(true);
+    expect(".o_dialog").toHaveCount(1);
+    expectNothingSaved();
+
+    // Direct calls offline: no lead is created, no attachment relinked, no record opened.
+    const uploaded = [{ id: attachmentId, filename: "card.png" }];
+    expect(await leadItem.createRecordWithFile(uploaded)).toBe(null);
+    await leadItem.openCreatedRecord(1);
+    await animationFrame();
+    expectNothingSaved();
+
+    // The connection comes back: the teams are read again, the stopped save is not resumed.
+    await setOffline(false);
+    await expect.waitForSteps(["/web/dataset/call_kw/crm.team/web_search_read"]);
+    await settle();
+    expectNothingSaved();
+
+    // A save started online by the dialog's Create button, whose upload ends after the
+    // connection is lost (signal and network): nothing is saved, and the save ends, so the
+    // dialog closes as after any save.
+    heldUpload = Promise.withResolvers();
+    await contains(".o_dialog footer .btn-primary").click();
+    await expect.waitForSteps(["upload_attachment"]);
+    await setOffline(true);
+    heldUpload.resolve();
+    await settle();
+    expect(".o_dialog").toHaveCount(0);
+    expectNothingSaved();
+
+    // Back online, nothing of the stopped save is replayed.
+    await setOffline(false);
+    await settle();
+    expectNothingSaved();
+});
+
 /** Marketing campaigns (`utm.utm_campaign_action`) with the CRM lead counters. */
 const CAMPAIGN_ACTION = {
     id: 43,

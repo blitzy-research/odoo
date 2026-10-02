@@ -23,7 +23,7 @@
  * checks run in the desktop preset.
  */
 
-import { beforeEach, expect, test } from "@odoo/hoot";
+import { after, beforeEach, expect, test } from "@odoo/hoot";
 import {
     advanceTime,
     animationFrame,
@@ -1017,6 +1017,138 @@ test("mobile pipeline header keeps the displayed root's server values while a se
     await animationFrame();
     await animationFrame();
     expect(headerTexts()).toEqual(["New", "3", "$ 1,400"]);
+});
+
+/**
+ * Answers the grouped (`web_read_group`) and group (`web_search_read`) lead loads
+ * with every set `stage_id` of their raw records as `[id, display_name]`, a
+ * many2one representation the relational model also accepts. A lead without
+ * stage keeps `false`.
+ */
+function sendStagesAsPairs() {
+    const toPairs = (records) => {
+        for (const record of records || []) {
+            const stage = record.stage_id;
+            if (stage && typeof stage === "object" && !Array.isArray(stage)) {
+                record.stage_id = [stage.id, stage.display_name];
+            }
+        }
+    };
+    onRpc("crm.lead", "web_read_group", async ({ parent }) => {
+        const result = await parent();
+        for (const group of result.groups) {
+            toPairs(group.__records);
+        }
+        return result;
+    });
+    onRpc("crm.lead", "web_search_read", async ({ parent }) => {
+        const result = await parent();
+        toPairs(result.records);
+        return result;
+    });
+}
+
+test.tags("mobile");
+test("mobile pipeline header counts once the revenue of leads whose stage arrives as an id and name pair", async () => {
+    let controller = null;
+    patchWithCleanup(CrmMobilePipelineController.prototype, {
+        setup() {
+            super.setup(...arguments);
+            controller = this;
+        },
+    });
+    sendStagesAsPairs();
+    onRpc("crm.lead", "get_rainbowman_message", () => false);
+    const setOffline = mockOffline();
+    // Two leads loaded per stage: both unfolded stages hold more leads than loaded.
+    await mountPipeline({ arch: limitedPipelineArch });
+
+    // The snapshot holds the numeric server stage of each loaded lead, and each
+    // unchanged lead counts its revenue once: the headers equal the server sums.
+    expect([...controller.model.crmServerValues]).toEqual([
+        [1, { stageId: NEW, revenue: 100 }],
+        [2, { stageId: NEW, revenue: 200 }],
+        [4, { stageId: QUALIFIED, revenue: 400 }],
+        [5, { stageId: QUALIFIED, revenue: 50 }],
+    ]);
+    expect(headerTexts()).toEqual(["New", "3", "$ 600"]);
+    expect(cardNames()).toEqual(["Office Design", "Quote for Chairs"]);
+    await contains(".o_crm_mobile_pipeline_next").click();
+    expect(headerTexts()).toEqual(["Qualified", "3", "$ 700"]);
+    await contains(".o_crm_mobile_pipeline_prev").click();
+
+    // Online move out of the partially loaded "New": the amount leaves the source
+    // and joins the target once. The source reload brings "Desk Upgrade", whose
+    // server stage is recorded; the moved lead keeps its first server values.
+    await contains(`${card("Quote for Chairs")} .o_crm_mobile_lead_stage`).select(
+        String(QUALIFIED)
+    );
+    expect(cardNames()).toEqual(["Office Design", "Desk Upgrade"]);
+    expect(headerTexts()).toEqual(["New", "2", "$ 400"]);
+    expect(controller.model.crmServerValues.get(2)).toEqual({ stageId: NEW, revenue: 200 });
+    expect(controller.model.crmServerValues.get(3)).toEqual({ stageId: NEW, revenue: 300 });
+    await contains(".o_crm_mobile_pipeline_next").click();
+    expect(headerTexts()).toEqual(["Qualified", "4", "$ 900"]);
+
+    // Offline move out of the partially loaded "Qualified" (three of its four leads
+    // loaded): the same, queued.
+    await setOffline(true);
+    await contains(`${card("Lamps")} .o_crm_mobile_lead_stage`).select(String(NEW));
+    expect(headerTexts()).toEqual(["Qualified", "3", "$ 850"]);
+    await contains(".o_crm_mobile_pipeline_prev").click();
+    expect(headerTexts()).toEqual(["New", "3", "$ 450"]);
+    expect(queued("crm.lead").map(({ method, args }) => ({ method, args }))).toEqual([
+        { method: "web_save", args: [[5], { stage_id: NEW }] },
+    ]);
+
+    // After the replay and the reload, the header shows the server values.
+    await reconnect(setOffline);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(headerTexts()).toEqual(["New", "3", "$ 450"]);
+    await contains(".o_crm_mobile_pipeline_next").click();
+    expect(headerTexts()).toEqual(["Qualified", "3", "$ 850"]);
+    expect(controller.model.crmServerValues.get(2)).toEqual({ stageId: QUALIFIED, revenue: 200 });
+});
+
+test.tags("mobile");
+test("mobile pipeline header counts once the revenue of a lead without stage", async () => {
+    let controller = null;
+    patchWithCleanup(CrmMobilePipelineController.prototype, {
+        setup() {
+            super.setup(...arguments);
+            controller = this;
+        },
+    });
+    await makeMockServer();
+    const leadId = MockServer.env["crm.lead"].create({
+        name: "Stageless Deal",
+        stage_id: false,
+        expected_revenue: 75,
+        company_currency: 1,
+        user_id: serverState.userId,
+        team_id: 1,
+    });
+    // The other leads' stages arrive as `[id, name]`, this one's as `false`.
+    sendStagesAsPairs();
+    const setOffline = mockOffline();
+    await mountPipeline();
+    expect(controller.model.crmServerValues.get(leadId)).toEqual({
+        stageId: false,
+        revenue: 75,
+    });
+    expect(controller.model.crmServerValues.get(1)).toEqual({ stageId: NEW, revenue: 100 });
+    expect(headerTexts()).toEqual(["None", "1", "$ 75"]);
+    expect(cardNames()).toEqual(["Stageless Deal"]);
+    await contains(".o_crm_mobile_pipeline_next").click();
+    expect(headerTexts()).toEqual(["New", "3", "$ 600"]);
+    await contains(".o_crm_mobile_pipeline_prev").click();
+
+    // Moved offline to a stage: its amount leaves the "None" group for the stage once.
+    await setOffline(true);
+    await contains(`${card("Stageless Deal")} .o_crm_mobile_lead_stage`).select(String(NEW));
+    expect(headerTexts()).toEqual(["None", "0", "$ 0"]);
+    await contains(".o_crm_mobile_pipeline_next").click();
+    expect(headerTexts()).toEqual(["New", "4", "$ 675"]);
 });
 
 test.tags("mobile");
@@ -3103,16 +3235,17 @@ test("mobile quick create keeps the values on a server error and queues on a dro
     expect(MockServer.env["crm.lead"].search_count([["name", "=", "Saved Lead"]])).toBe(1);
     expect(queued("crm.lead")).toEqual([]);
 
-    // A server error on that reload is not a lost connection: it reaches the error
-    // handling and the sheet keeps its values, the lead being created on the server.
+    // A server error on that reload is not a lost connection: it is reported once,
+    // and, the lead being created on the server, the sheet closes, so its values
+    // cannot be saved a second time.
     await reconnect(setOffline);
     failRootReload = true;
     await quickCreateLead({ name: "Reloaded Lead", revenue: 6 });
     await animationFrame();
     expect(failRootReload).toBe(false);
+    expect(".o_bottom_sheet").toHaveCount(0);
     expect(MockServer.env["crm.lead"].search_count([["name", "=", "Reloaded Lead"]])).toBe(1);
     expect(queued("crm.lead")).toEqual([]);
-    expect("form.o_crm_mobile_quick_create input[name=name]").toHaveValue("Reloaded Lead");
     expect.verifyErrors(["Pipeline reload failed"]);
 });
 
@@ -3311,6 +3444,173 @@ test("mobile activities: the lead form sheet closes when the screen widens", asy
     await animationFrame();
     expect(".o_bottom_sheet").toHaveCount(0);
     expect(document.body).not.toHaveClass("bottom-sheet-open");
+});
+
+test.tags("mobile");
+test("lead form widened from a phone saves and runs onchanges with the desktop specification", async () => {
+    // An edit of the contact runs an onchange, whose result the form shows.
+    CrmLead._onChanges = {
+        contact_name(record) {
+            record.probability = 55;
+        },
+    };
+    const reads = [];
+    const onchanges = [];
+    const saves = [];
+    onRpc("crm.lead", "web_read", ({ kwargs }) => {
+        reads.push(kwargs.specification);
+    });
+    onRpc("crm.lead", "onchange", ({ args }) => {
+        onchanges.push(args[3]);
+    });
+    onRpc("crm.lead", "web_save", ({ kwargs }) => {
+        saves.push(kwargs.specification);
+    });
+    const serverLead = () =>
+        MockServer.env["crm.lead"].search_read(
+            [["id", "=", 1]],
+            ["name", "contact_name", "probability"]
+        )[0];
+    await mountWithCleanup(WebClient);
+    const openLeadForm = () =>
+        getService("action").doAction(ACTION_ID, {
+            clearBreadcrumbs: true,
+            viewType: "form",
+            props: { resId: 1 },
+        });
+
+    // On the phone, the root load carries the lead's activity rows.
+    await openLeadForm();
+    expect(reads).toHaveLength(1);
+    expect(Object.keys(reads[0].activity_ids.fields)).toEqual(ACTIVITY_SUBFIELDS);
+
+    // An edit without onchange made on the phone, then widened (no reload): the edit
+    // is saved with the desktop specification, and so is the next save.
+    await contains(".o_field_widget[name=name] input").edit("Office Design, wide");
+    await resize({ width: 1366, height: 768 });
+    await animationFrame();
+    expect(".o_field_widget[name=name] input").toHaveValue("Office Design, wide");
+    await contains(".o_form_button_save").click();
+    expect(reads).toHaveLength(1);
+    expect(saves).toHaveLength(1);
+    expect(saves[0]).not.toInclude("activity_ids");
+    expect(".o_field_widget[name=name] input").toHaveValue("Office Design, wide");
+    expect(serverLead().name).toBe("Office Design, wide");
+    await contains(".o_field_widget[name=name] input").edit("Office Design, saved twice");
+    await contains(".o_form_button_save").click();
+    expect(saves).toHaveLength(2);
+    expect(saves[1]).toEqual(saves[0]);
+    expect(".o_field_widget[name=name] input").toHaveValue("Office Design, saved twice");
+    expect(serverLead().name).toBe("Office Design, saved twice");
+
+    // Back on the phone, the next root load has the activity rows again. Widened, an
+    // onchange before any save is requested with the desktop specification, and so is
+    // the save that follows it.
+    await resize({ width: 375, height: 667 });
+    await openLeadForm();
+    expect(reads).toHaveLength(2);
+    expect(Object.keys(reads[1].activity_ids.fields)).toEqual(ACTIVITY_SUBFIELDS);
+    await resize({ width: 1366, height: 768 });
+    await animationFrame();
+    await contains(".o_field_widget[name=contact_name] input").edit("Ann Example");
+    expect(onchanges).toHaveLength(1);
+    expect(onchanges[0]).not.toInclude("activity_ids");
+    expect(".o_field_widget[name=probability] input").toHaveValue("55.00");
+    await contains(".o_form_button_save").click();
+    expect(saves).toHaveLength(3);
+    expect(saves[2]).toEqual(saves[0]);
+    expect(".o_field_widget[name=contact_name] input").toHaveValue("Ann Example");
+    expect(serverLead()).toEqual({
+        id: 1,
+        name: "Office Design, saved twice",
+        contact_name: "Ann Example",
+        probability: 55,
+    });
+
+    // The desktop reference: the same form opened at desktop size requests the same.
+    await openLeadForm();
+    expect(reads).toHaveLength(3);
+    expect(reads[2]).not.toInclude("activity_ids");
+    expect(saves[0]).toEqual(reads[2]);
+    await contains(".o_field_widget[name=contact_name] input").edit("Bob Example");
+    expect(onchanges).toHaveLength(2);
+    expect(onchanges[1]).toEqual(onchanges[0]);
+    await contains(".o_form_button_save").click();
+    expect(saves).toHaveLength(4);
+    expect(saves[3]).toEqual(saves[0]);
+});
+
+test.tags("mobile");
+test("new lead form widened from a phone sends the desktop onchange and create", async () => {
+    CrmLead._onChanges = {
+        contact_name(record) {
+            record.probability = 55;
+        },
+    };
+    // Copies of the requests: the mock server completes the values it creates in place.
+    const onchanges = [];
+    const saves = [];
+    onRpc("crm.lead", "onchange", ({ args }) => {
+        const [, changes, fieldNames, specification] = structuredClone(args);
+        onchanges.push({ changes, fieldNames, specification });
+    });
+    onRpc("crm.lead", "web_save", ({ args, kwargs }) => {
+        const [ids, changes] = structuredClone(args);
+        saves.push({ ids, changes, specification: structuredClone(kwargs.specification) });
+    });
+    await mountWithCleanup(WebClient);
+    const openNewLeadForm = () =>
+        getService("action").doAction(ACTION_ID, { clearBreadcrumbs: true, viewType: "form" });
+    const editAndSave = async () => {
+        await contains(".o_field_widget[name=contact_name] input").edit("Ann Example");
+        await contains(".o_field_widget[name=name] input").edit("Wide Lead");
+        await contains(".o_form_button_save").click();
+    };
+
+    // On the phone, the new lead's default values are requested with the activity rows.
+    await openNewLeadForm();
+    expect(onchanges).toHaveLength(1);
+    expect(onchanges[0].fieldNames).toEqual([]);
+    expect(Object.keys(onchanges[0].specification.activity_ids.fields)).toEqual(ACTIVITY_SUBFIELDS);
+
+    // Widened (no reload), neither the onchange nor the create sends the activities.
+    await resize({ width: 1366, height: 768 });
+    await animationFrame();
+    await editAndSave();
+    expect(onchanges).toHaveLength(2);
+    expect(saves).toHaveLength(1);
+    const [, widenedOnchange] = onchanges;
+    const [widenedSave] = saves;
+    expect(widenedOnchange.fieldNames).toEqual(["contact_name"]);
+    expect(widenedOnchange.specification).not.toInclude("activity_ids");
+    expect(widenedOnchange.changes).not.toInclude("activity_ids");
+    expect(widenedSave.ids).toEqual([]);
+    expect(widenedSave.specification).not.toInclude("activity_ids");
+    expect(widenedSave.changes).not.toInclude("activity_ids");
+    expect(widenedSave.changes).toInclude("name");
+    expect(".o_field_widget[name=name] input").toHaveValue("Wide Lead");
+    expect(".o_field_widget[name=probability] input").toHaveValue("55.00");
+    const created = MockServer.env["crm.lead"].search_read(
+        [["name", "=", "Wide Lead"]],
+        ["contact_name", "probability", "type"]
+    );
+    expect(created).toHaveLength(1);
+    expect(created[0]).toEqual({
+        id: created[0].id,
+        contact_name: "Ann Example",
+        probability: 55,
+        type: "opportunity",
+    });
+
+    // The desktop reference: a new lead form opened at desktop size, edited the same way.
+    await openNewLeadForm();
+    expect(onchanges).toHaveLength(3);
+    expect(onchanges[2].specification).toEqual(widenedOnchange.specification);
+    await editAndSave();
+    expect(onchanges).toHaveLength(4);
+    expect(saves).toHaveLength(2);
+    expect(onchanges[3]).toEqual(widenedOnchange);
+    expect(saves[1]).toEqual(widenedSave);
 });
 
 test.tags("mobile");
@@ -3615,8 +3915,9 @@ test("mobile activities online: actions reach the server and reload the lead", a
     expect(queued("mail.activity")).toEqual([]);
 
     // A server error on the lead reload after an online write is not a lost
-    // connection: it reaches the error handling, the write stands, nothing is
-    // queued and the form stays open.
+    // connection: it is reported once, the write stands, nothing is queued, and the
+    // submitted form closes, so it cannot create the activity a second time, while
+    // the sheet stays open.
     failLeadReload = true;
     await contains(".o_crm_mobile_log_call").click();
     await contains(".o_crm_mobile_activity_save").click();
@@ -3628,9 +3929,57 @@ test("mobile activities online: actions reach the server and reload the lead", a
             ["summary", "=", "Call"],
         ])
     ).toBe(1);
+    expect(calls.filter((call) => call === "mail.activity/create")).toHaveLength(3);
     expect(queued("mail.activity")).toEqual([]);
-    expect(".o_crm_mobile_activity_form").toHaveCount(1);
+    expect(".o_crm_mobile_activity_form").toHaveCount(0);
+    expect(".o_bottom_sheet .o_crm_mobile_lead_activities_sheet").toHaveCount(1);
     expect.verifyErrors(["Lead reload failed"]);
+});
+
+test.tags("mobile");
+test("mobile activities online: a failed lead reload after Mark done is reported once and sends no second action_done", async () => {
+    expect.errors(1);
+    let failLeadReload = false;
+    onRpc("crm.lead", "web_read", () => {
+        if (failLeadReload) {
+            failLeadReload = false;
+            throw makeServerError({ message: "Lead reload failed" });
+        }
+    });
+    const calls = trackCalls();
+    await mountPipeline();
+    await openActivities("Office Design");
+    expect(activityTitles()).toEqual(["Follow-up call", "Send brochure"]);
+
+    // Done on the server, then the lead reload is refused: "Mark done" resolves, the
+    // error is reported once, nothing is queued, and the row leaves the list as the
+    // reload would have shown it, while the sheet stays open.
+    failLeadReload = true;
+    const button = queryFirst(`${activityRow(1)} .o_crm_mobile_activity_done`);
+    button.click();
+    await animationFrame();
+    expect(failLeadReload).toBe(false);
+    expect(MockServer.env["mail.activity"].search_count([["id", "=", 1]])).toBe(0);
+    expect(queued("mail.activity")).toEqual([]);
+    expect.verifyErrors(["Lead reload failed"]);
+    expect(".o_bottom_sheet .o_crm_mobile_lead_activities_sheet").toHaveCount(1);
+    expect(activityRow(1)).toHaveCount(0);
+    expect(activityTitles()).toEqual(["Send brochure"]);
+    expect(`${activityRow(2)} .o_crm_mobile_activity_done`).toBeEnabled();
+
+    // The button of the row's last render activated again sends nothing.
+    button.click();
+    await animationFrame();
+    expect(calls.filter((call) => call === "mail.activity/action_done")).toHaveLength(1);
+    expect(queued("mail.activity")).toEqual([]);
+
+    // The other activity is still marked done online, and the lead reloads.
+    await contains(`${activityRow(2)} .o_crm_mobile_activity_done`).click();
+    await animationFrame();
+    expect(MockServer.env["mail.activity"].search_count([["id", "=", 2]])).toBe(0);
+    expect(activityTitles()).toEqual([]);
+    expect(calls.filter((call) => call === "mail.activity/action_done")).toHaveLength(2);
+    expect.verifyErrors([]);
 });
 
 test.tags("mobile");
@@ -4124,6 +4473,54 @@ test("mobile activities: a card sheet closed with its lead is closed once", asyn
     await reconnect(setOffline);
     expect(".o_bottom_sheet").toHaveCount(0);
     expect(document.body).not.toHaveClass("bottom-sheet-open");
+
+    // Closed once: the bottom-sheet service still flags the next sheet it opens.
+    await openActivities("Office Design");
+    expect(document.body).toHaveClass("bottom-sheet-open");
+    await closeSheet();
+    expect(document.body).not.toHaveClass("bottom-sheet-open");
+});
+
+test.tags("mobile");
+test("mobile activities: Save on a sheet whose lead is gone closes it once", async () => {
+    let controller = null;
+    patchWithCleanup(CrmMobilePipelineController.prototype, {
+        setup() {
+            super.setup(...arguments);
+            controller = this;
+        },
+    });
+    const calls = trackCalls();
+    await mountPipeline();
+    await openActivities("Quote for Chairs");
+    await contains(".o_crm_mobile_schedule_followup").click();
+    expect(document.body).toHaveClass("bottom-sheet-open");
+
+    // Save is activated as soon as the sheet has closed for its lead, while the
+    // sheet is still displayed: the sheet is removed from the page only at the
+    // next render, and the body class is dropped by its close.
+    let saveOnClosingSheet = null;
+    const observer = new MutationObserver(() => {
+        if (!saveOnClosingSheet && !document.body.classList.contains("bottom-sheet-open")) {
+            const save = queryFirst(".o_crm_mobile_activity_save");
+            saveOnClosingSheet = { displayed: Boolean(save) };
+            save?.click();
+        }
+    });
+    observer.observe(document.body, { attributeFilter: ["class"] });
+    after(() => observer.disconnect());
+
+    // The lead is deleted on the server: the pipeline reload drops it, and its
+    // sheet closes. The Save that follows schedules nothing and closes nothing more.
+    MockServer.env["crm.lead"].unlink([2]);
+    await controller.model.load();
+    await animationFrame();
+    await animationFrame();
+    observer.disconnect();
+    expect(saveOnClosingSheet).toEqual({ displayed: true });
+    expect(".o_bottom_sheet").toHaveCount(0);
+    expect(document.body).not.toHaveClass("bottom-sheet-open");
+    expect(calls).not.toInclude("mail.activity/create");
 
     // Closed once: the bottom-sheet service still flags the next sheet it opens.
     await openActivities("Office Design");

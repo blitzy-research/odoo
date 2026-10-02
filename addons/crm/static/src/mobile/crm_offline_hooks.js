@@ -8,6 +8,8 @@
  * - the quick-create deep-link flag (`crm_quick_create` URL parameter);
  * - the activity page size remembered per mobile root load (`getCrmActivityLimit`,
  *   `setCrmActivityLimit`), a view preference holding no record data;
+ * - the activity sub-fields both mobile root loads read (`CRM_ACTIVITY_SUBFIELDS`,
+ *   `getCrmActivitySubfields`);
  * - the frozen DISABLE sets generated from `offline_inventory.md`;
  * - module-level, CRM-scoped guards patched into framework classes and services
  *   (view buttons, navigation, view mount, action menus, team cards, tag colours,
@@ -17,8 +19,20 @@
  * - the plugin is the framework `OfflinePlugin`, resolved with `usePlugin`, or the
  *   instance a framework class already holds; this module owns no queue, cache,
  *   record store or connectivity detection of its own;
- * - the CRM scope (model, action or component) is tested BEFORE the offline signal
- *   is read, so components outside CRM never subscribe to it and never re-render;
+ * - a guard whose CRM scope is known from the call or the component itself (the
+ *   record, view or current action model, button params, an action `xml_id` string
+ *   or action object, a menu `xmlid`, a view type, component props) tests that
+ *   scope BEFORE the offline signal is read, so components outside CRM never
+ *   subscribe to it and never re-render;
+ * - the two action-service entry points that cannot know their action without
+ *   loading it, `doAction` with a numeric id and `loadState` (a URL or router
+ *   state), read the offline signal first. Online they call the original at once.
+ *   Offline they resolve the action from the sources the original reads itself,
+ *   the session's stored `current_action` (`loadState` only) and the disk-cached
+ *   `loadAction`, so they issue no request the action service would not issue;
+ *   they stop only for a disabled CRM action or, in a state, a blocked CRM view
+ *   type, and pass any other request, including an action they cannot identify
+ *   (a client action, or one not cached), to the original with the same arguments;
  * - online, and outside CRM, each guard calls the original with the same
  *   arguments and returns its result unchanged (same DOM, same requests).
  */
@@ -184,6 +198,52 @@ const PROJECTED_OPTIONAL_FIELDS = Object.freeze(["won_status", "probability"]);
  * `mail.activity` read is ever issued.
  */
 export const CRM_MOBILE_ACTIVITY_LIMIT = 5;
+
+/**
+ * The single definition of the `mail.activity` sub-fields the mobile root loads
+ * (pipeline and phone lead form) read with each lead's `activity_ids`, so that
+ * the activity sheet has its rows in the (cached) root load. The definitions
+ * match `addons/mail/models/mail_activity.py`. Deeply frozen: consumers build
+ * their own definitions from it with `getCrmActivitySubfields`.
+ *
+ * @type {ReadonlyArray<Readonly<{name: string, type: string, relation?: string, selection?: ReadonlyArray<ReadonlyArray<string>>}>>}
+ */
+export const CRM_ACTIVITY_SUBFIELDS = Object.freeze([
+    Object.freeze({ name: "summary", type: "char" }),
+    Object.freeze({ name: "activity_type_id", type: "many2one", relation: "mail.activity.type" }),
+    Object.freeze({ name: "date_deadline", type: "date" }),
+    Object.freeze({ name: "user_id", type: "many2one", relation: "res.users" }),
+    Object.freeze({
+        name: "state",
+        type: "selection",
+        selection: Object.freeze([
+            Object.freeze(["overdue", "Overdue"]),
+            Object.freeze(["today", "Today"]),
+            Object.freeze(["planned", "Planned"]),
+            Object.freeze(["done", "Done"]),
+        ]),
+    }),
+]);
+
+/**
+ * Fresh, mutable field definitions of `CRM_ACTIVITY_SUBFIELDS`, keyed by name in
+ * their declaration order, each with `extraProps` added (e.g. `readonly`). Every
+ * call returns new objects, selection pairs included: the model owns the
+ * definitions it is given.
+ *
+ * @param {Object} [extraProps]
+ * @returns {Object<string, Object>}
+ */
+export function getCrmActivitySubfields(extraProps = {}) {
+    const fields = {};
+    for (const field of CRM_ACTIVITY_SUBFIELDS) {
+        fields[field.name] = { ...field, ...extraProps };
+        if (field.selection) {
+            fields[field.name].selection = field.selection.map((option) => [...option]);
+        }
+    }
+    return fields;
+}
 
 // -----------------------------------------------------------------------------
 // Activity page size preference
@@ -504,11 +564,13 @@ function getActivityTypesRevision(plugin) {
 const crmReportedErrors = new WeakSet();
 
 /**
- * Reports the error of work nobody awaits. A `ConnectionLostError` means the
- * connection dropped again meanwhile: it is expected and ignored, and the work
- * runs again at the next trigger. Any other error is handed to the framework error
- * service as an uncaught promise error, the way the action service shows an error
- * of a mounted controller: the standard error dialog, no CRM-specific error UI.
+ * Reports the error of work nobody awaits, or whose failure must not reject its
+ * caller (the reload after a committed write). A `ConnectionLostError` means the
+ * connection dropped again meanwhile: it is expected and ignored (work an effect
+ * started runs again at its next trigger; a reload keeps the data already
+ * loaded). Any other error is handed to the framework error service as an
+ * uncaught promise error, the way the action service shows an error of a mounted
+ * controller: the standard error dialog, no CRM-specific error UI.
  * Work shared by several owners (merged refreshes, a shared request) rejects each
  * of them with the same error object: that one failure is reported once.
  *
@@ -618,18 +680,19 @@ export function useCrmOffline() {
     };
 
     /**
-     * Reloads `record` after an online write; a dropped connection keeps the cache.
-     * The lead form's record refreshes through its `crmRefresh`, which keeps the
-     * form's unsaved edits (those made during the write included) and does not wait
-     * on the restoration of a queued save of the lead.
+     * Reloads `record` after an online write. The write is committed, so the reload
+     * never rejects: its caller completes as for a successful write and offers no
+     * second one. A dropped connection keeps the cache; any other error is reported
+     * once through the framework error handling (`crmReportError`). The lead form's
+     * record refreshes through its `crmRefresh`, which keeps the form's unsaved
+     * edits (those made during the write included) and does not wait on the
+     * restoration of a queued save of the lead.
      */
     const reloadRecord = async (record) => {
         try {
             await (record.crmRefresh ? record.crmRefresh() : record.load());
         } catch (error) {
-            if (!(error instanceof ConnectionLostError)) {
-                throw error;
-            }
+            crmReportError(error);
         }
     };
 
@@ -929,7 +992,9 @@ export function useCrmOffline() {
         /**
          * Schedules an activity on a lead. The user context is used (not the
          * action context) so no `default_*` key of the lead action becomes a
-         * `mail.activity` default; `res_model_id` is resolved server-side.
+         * `mail.activity` default; `res_model_id` is resolved server-side. Online,
+         * only a server error of the create rejects; once the activity is created,
+         * the lead reload does not (`reloadRecord`).
          *
          * @param {Object} record the lead
          * @param {{activity_type_id: number, summary: string, date_deadline: string, user_id: number}} vals
@@ -961,7 +1026,8 @@ export function useCrmOffline() {
 
         /**
          * Marks an activity done (state change only: no feedback, attachment or
-         * next-activity wizard).
+         * next-activity wizard). Online, only a server error of the call rejects;
+         * once the activity is done, the lead reload does not (`reloadRecord`).
          *
          * @param {Object} record the lead
          * @param {number} activityId
@@ -984,8 +1050,11 @@ export function useCrmOffline() {
          * Creates a lead from the mobile quick-create sheet. Online it saves and
          * reloads the pipeline; offline (or when the connection drops) it queues a
          * `web_save` whose `extras` carry the display values of the provisional card
-         * (`{actionId, actionName, viewType, displayName, changes}`). An online
-         * server error propagates so the sheet keeps the entered values.
+         * (`{actionId, actionName, viewType, displayName, changes}`). Online, only
+         * a server error of the save rejects, so the sheet keeps the entered
+         * values. Once the lead is saved, a failed pipeline reload is reported once
+         * (`crmReportError`) and the create resolves, so the sheet closes and does
+         * not offer to create the lead a second time.
          *
          * @param {Object} list the pipeline root list
          * @param {Object} vals server values (`stage_id` is an id)
@@ -1005,13 +1074,12 @@ export function useCrmOffline() {
                 return queue("crm.lead", "web_save", [[], vals], kwargs, extras);
             }
             try {
-                // The lead exists now: a reload lost to a dropped connection must
-                // not reject, or the sheet would offer to create it twice.
+                // The lead exists now: a failed reload must not reject, or the sheet
+                // would offer to create it twice. A lost connection keeps the
+                // pipeline as loaded; any other error is reported once.
                 await list.model.load();
             } catch (error) {
-                if (!(error instanceof ConnectionLostError)) {
-                    throw error;
-                }
+                crmReportError(error);
             }
         },
 

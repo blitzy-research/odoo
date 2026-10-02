@@ -141,13 +141,17 @@ export class CrmMobileLeadActivities extends Component {
             // Activity ids whose "mark done" request is running (transient, unlike
             // the queue-derived pending state): `{[activityId]: true}`.
             doneBusy: {},
+            // Activity ids this sheet marked done on the server (online, not
+            // queued): `{[activityId]: true}`. Their rows leave the list at once, as
+            // the lead's reload shows them, even when that reload fails.
+            doneOnline: {},
             // A "Show more" reload of the opener's root is running.
             loadingMore: false,
         });
         // The template reads the activity data and the synced rows several times
         // per render: each is computed once, and again only after something it
         // read changes (the lead record through `state.version`, the queue, the
-        // cached options, `state.doneBusy`).
+        // cached options, `state.doneBusy`, `state.doneOnline`).
         this.activityDataMemo = computed(() => this.computeActivityData());
         this.syncedRowsMemo = computed(() => this.computeSyncedRows());
         /** Set once `closeIfLeadGone()` has closed the sheet. */
@@ -277,12 +281,15 @@ export class CrmMobileLeadActivities extends Component {
      * (`donePending`) and whether its "mark done" request is running
      * (`doneBusy`). The queue is read once for all rows: one set of the activity
      * ids a queued `action_done` targets, matched as `isActivityDonePending()`
-     * does. Run by `syncedRowsMemo` only.
+     * does. Activities this sheet marked done online (`state.doneOnline`) are
+     * left out. Run by `syncedRowsMemo` only.
      *
      * @returns {Object[]}
      */
     computeSyncedRows() {
-        const rows = this.activityData?.rows || [];
+        const rows = (this.activityData?.rows || []).filter(
+            (row) => !this.state.doneOnline[row.id]
+        );
         const donePendingIds = new Set();
         for (const { value } of this.crmOffline.queuedEntries("mail.activity")) {
             const ids = value.args?.[0];
@@ -506,7 +513,9 @@ export class CrmMobileLeadActivities extends Component {
      * the lead record, so no reload happens here. Invalid values (see
      * `validateForm`) schedule nothing and keep the form open with the failing
      * fields flagged. A server error keeps the form open with its values and
-     * reaches the framework error handling.
+     * reaches the framework error handling. When the opener no longer has the
+     * lead, nothing is scheduled and the sheet closes through `closeIfLeadGone()`,
+     * so a Save reaching a sheet already closed for its lead closes nothing more.
      */
     async saveForm() {
         const { form } = this.state;
@@ -515,7 +524,7 @@ export class CrmMobileLeadActivities extends Component {
         }
         const record = this.leadRecord;
         if (!record) {
-            this.props.close?.();
+            this.closeIfLeadGone();
             return;
         }
         const vals = this.validateForm(form);
@@ -539,21 +548,33 @@ export class CrmMobileLeadActivities extends Component {
     /**
      * Marks a synced activity done (queued offline; online the hooks reload the
      * lead record). It is sent at most once: nothing happens while a request for
-     * the same activity runs (`state.doneBusy`, set before the first await) or
-     * once its "mark done" waits in the queue, read live rather than from the
-     * row, which may come from an earlier render.
+     * the same activity runs (`state.doneBusy`, set before the first await), once
+     * it is done on the server (`state.doneOnline`: its row leaves the list then,
+     * even when the lead reload that follows fails or is lost) or once its "mark
+     * done" waits in the queue, read live rather than from the row, which may come
+     * from an earlier render.
      *
      * @param {{id: number}} row
      */
     async markDone(row) {
         const record = this.leadRecord;
         const { id } = row;
-        if (!record || this.state.doneBusy[id] || this.crmOffline.isActivityDonePending(id)) {
+        if (
+            !record ||
+            this.state.doneBusy[id] ||
+            this.state.doneOnline[id] ||
+            this.crmOffline.isActivityDonePending(id)
+        ) {
             return;
         }
         this.state.doneBusy[id] = true;
         try {
             await this.crmOffline.markActivityDone(record, id);
+            // Not queued (the call is queued offline, or when the connection drops
+            // during it): the server has done it.
+            if (!this.crmOffline.isActivityDonePending(id)) {
+                this.state.doneOnline[id] = true;
+            }
             this.state.version++;
         } finally {
             delete this.state.doneBusy[id];

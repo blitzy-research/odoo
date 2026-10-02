@@ -51,6 +51,7 @@ import {
     consumeQuickCreateDeepLink,
     crmOwnEffectPromise,
     getCrmActivityLimit,
+    getCrmActivitySubfields,
     isFieldMapping,
     setCrmActivityLimit,
     useCrmOffline,
@@ -82,32 +83,6 @@ const ACTIVITY_FIELD = Object.freeze({
     name: "activity_ids",
     type: "one2many",
     relation: "mail.activity",
-});
-
-/**
- * Activity sub-fields loaded with every lead of the mobile variant, so that the
- * activity sheet has its rows in the (cached) root load. Same structure as the
- * relational model builds for x2many sub-fields: `{activeFields, fields}`.
- */
-const ACTIVITY_SUBFIELDS = Object.freeze({
-    summary: Object.freeze({ name: "summary", type: "char" }),
-    activity_type_id: Object.freeze({
-        name: "activity_type_id",
-        type: "many2one",
-        relation: "mail.activity.type",
-    }),
-    date_deadline: Object.freeze({ name: "date_deadline", type: "date" }),
-    user_id: Object.freeze({ name: "user_id", type: "many2one", relation: "res.users" }),
-    state: Object.freeze({
-        name: "state",
-        type: "selection",
-        selection: Object.freeze([
-            Object.freeze(["overdue", "Overdue"]),
-            Object.freeze(["today", "Today"]),
-            Object.freeze(["planned", "Planned"]),
-            Object.freeze(["done", "Done"]),
-        ]),
-    }),
 });
 
 /** Aggregate behind the mobile stage header revenue (server sum of every group). */
@@ -290,15 +265,13 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
         const activityField = mobile.activeFields[ACTIVITY_FIELD.name];
         if (activityField) {
             const related = activityField.related || { activeFields: {}, fields: {} };
+            // The activity sheet's rows, in the (cached) root load, with the same
+            // `{activeFields, fields}` structure the relational model builds for
+            // x2many sub-fields. Fresh definitions: the model owns what it is given.
+            const subFields = getCrmActivitySubfields();
             const subActiveFields = {};
-            const subFields = {};
-            for (const [name, field] of Object.entries(ACTIVITY_SUBFIELDS)) {
+            for (const name of Object.keys(subFields)) {
                 subActiveFields[name] = makeActiveField();
-                // Mutable copies: the model owns the definitions it is given.
-                subFields[name] = { ...field };
-                if (field.selection) {
-                    subFields[name].selection = field.selection.map((option) => [...option]);
-                }
             }
             activityField.related = {
                 activeFields: { ...related.activeFields, ...subActiveFields },

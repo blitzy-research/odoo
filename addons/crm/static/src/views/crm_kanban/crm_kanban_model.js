@@ -34,8 +34,10 @@ function recordCrmServerValues(list, records) {
         if (!rec?.id || target.has(rec.id)) {
             continue;
         }
-        // A many2one value arrives as `{ id, display_name }`, a bare id or `false`.
-        const stage = rec.stage_id;
+        // A many2one value arrives as `{ id, display_name }`, `[id, display_name]`
+        // (which the relational model's `parseServerValue` also accepts), a bare id
+        // or `false`.
+        const stage = Array.isArray(rec.stage_id) ? rec.stage_id[0] : rec.stage_id;
         target.set(rec.id, {
             stageId: typeof stage === "object" && stage ? stage.id : stage || false,
             revenue: rec.expected_revenue,

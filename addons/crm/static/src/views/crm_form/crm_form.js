@@ -32,6 +32,7 @@ import {
     CRM_MOBILE_ACTIVITY_LIMIT,
     crmReportError,
     getCrmActivityLimit,
+    getCrmActivitySubfields,
     setCrmActivityLimit,
     useCrmOffline,
 } from "@crm/mobile/crm_offline_hooks";
@@ -183,6 +184,46 @@ class CrmFormRecord extends formView.Model.Record {
             this._applyValues({ active: !isArchive });
         }
         return res;
+    }
+
+    /**
+     * @override
+     * Before the onchange request of the form's root is built (its changes, which
+     * hold every value of a new record, and its specification), the controller's
+     * `crmLeaveMobileVariant` hook gives the root the desktop variant when the
+     * screen widened since its phone load. Other records and forms without the hook
+     * are unaffected.
+     */
+    _getOnchangeValues() {
+        if (toRaw(this.model.root) === toRaw(this)) {
+            this.model.hooks.crmLeaveMobileVariant?.(this.config);
+        }
+        return super._getOnchangeValues(...arguments);
+    }
+
+    /**
+     * Forgets the loaded value of `fieldName`, a field the record's configuration
+     * stops loading (`CrmFormController.crmLeaveMobileVariant`), so that the record
+     * holds the values of its loaded fields only, as after a load: the values of a
+     * new record are part of its changes, and each x2many value needs its field in
+     * `activeFields` to build the evaluation context. Unsaved changes are kept: a
+     * field with a change is not forgotten.
+     *
+     * @param {string} fieldName
+     * @returns {boolean} whether the record no longer holds a value of `fieldName`
+     */
+    crmForgetLoadedValue(fieldName) {
+        if (fieldName in this._changes) {
+            return false;
+        }
+        delete this._values[fieldName];
+        delete this.data[fieldName];
+        delete this._textValues[fieldName];
+        delete this._initialTextValues[fieldName];
+        delete this.evalContext[fieldName];
+        delete this.evalContextWithVirtualIds[fieldName];
+        this._removeInvalidFields(fieldName);
+        return true;
     }
 
     /**
@@ -477,43 +518,20 @@ class CrmFormModel extends formView.Model {
 }
 
 /**
- * `mail.activity` sub-fields loaded with `activity_ids` by the phone variant of the
- * lead form, the same ones the mobile pipeline loads, so the activity sheet lists
- * the lead's rows from the form's own (cached) root load.
- */
-const ACTIVITY_SUBFIELDS = Object.freeze([
-    Object.freeze({ name: "summary", type: "char" }),
-    Object.freeze({ name: "activity_type_id", type: "many2one", relation: "mail.activity.type" }),
-    Object.freeze({ name: "date_deadline", type: "date" }),
-    Object.freeze({ name: "user_id", type: "many2one", relation: "res.users" }),
-    Object.freeze({
-        name: "state",
-        type: "selection",
-        selection: Object.freeze([
-            Object.freeze(["overdue", "Overdue"]),
-            Object.freeze(["today", "Today"]),
-            Object.freeze(["planned", "Planned"]),
-            Object.freeze(["done", "Done"]),
-        ]),
-    }),
-]);
-
-/**
  * Builds a fresh `related` structure (`{activeFields, fields}`, the shape the
- * relational model uses for x2many sub-fields) for the lead's `activity_ids`.
- * Every call returns new, mutable objects: the model owns what it is given.
+ * relational model uses for x2many sub-fields) for the lead's `activity_ids`
+ * loaded by the phone variant of the lead form: the sub-fields the mobile pipeline
+ * loads (`CRM_ACTIVITY_SUBFIELDS`), readonly, so the activity sheet lists the
+ * lead's rows from the form's own (cached) root load. Every call returns new,
+ * mutable objects: the model owns what it is given.
  *
  * @returns {{activeFields: Object, fields: Object}}
  */
 function crmActivityRelated() {
     const activeFields = {};
-    const fields = {};
-    for (const field of ACTIVITY_SUBFIELDS) {
-        activeFields[field.name] = makeActiveField({ readonly: true });
-        fields[field.name] = { ...field, readonly: true };
-        if (field.selection) {
-            fields[field.name].selection = field.selection.map((option) => [...option]);
-        }
+    const fields = getCrmActivitySubfields({ readonly: true });
+    for (const name of Object.keys(fields)) {
+        activeFields[name] = makeActiveField({ readonly: true });
     }
     return { activeFields, fields };
 }
@@ -532,8 +550,10 @@ function crmActivityRelated() {
  *
  * On a phone the root load also requests the lead's activity rows ("mobile
  * variant"); otherwise it requests exactly what the arch declares ("desktop
- * variant", the current specification). Offline, when the mobile variant was never
- * cached, the load is retried once with the desktop variant.
+ * variant", the current specification). A root loaded on a phone takes the desktop
+ * variant before its next save or onchange once the screen widened. Offline, when
+ * the mobile variant was never cached, the load is retried once with the desktop
+ * variant.
  */
 export class CrmFormController extends formView.Controller {
     static template = "crm.CrmFormView";
@@ -683,13 +703,15 @@ export class CrmFormController extends formView.Controller {
 
     /**
      * @override
-     * Adds `crmUseDesktopSpec`, consumed by `CrmFormModel.load`, and the activity
-     * sheet's "Show more" hook `crmLoadMoreActivities` to the parent's hooks.
+     * Adds `crmUseDesktopSpec`, consumed by `CrmFormModel.load`, the activity
+     * sheet's "Show more" hook `crmLoadMoreActivities` and `crmLeaveMobileVariant`,
+     * consumed by `CrmFormRecord._getOnchangeValues`, to the parent's hooks.
      */
     get modelParams() {
         const params = super.modelParams;
         params.hooks.crmUseDesktopSpec = () => this.crmUseDesktopSpec();
         params.hooks.crmLoadMoreActivities = (resId) => this.crmLoadMoreActivities(resId);
+        params.hooks.crmLeaveMobileVariant = (config) => this.crmLeaveMobileVariant(config);
         return params;
     }
 
@@ -1048,16 +1070,10 @@ export class CrmFormController extends formView.Controller {
             this.crmDesktopFallback = false;
         }
         const currentActiveFields = toRaw(config.activeFields);
-        // An arch declaring `activity_ids` itself keeps its own declaration.
-        const hasField =
-            !this.crmArchHasActivities &&
-            Boolean(currentActiveFields) &&
-            config.fields?.activity_ids?.type === "one2many";
         const mobile =
             this.crmOffline.isSmall &&
             !this.crmDesktopFallback &&
-            hasField &&
-            config.resModel === "crm.lead";
+            this.crmHasActivityVariant(config);
         this.crmLastVariant = mobile ? "mobile" : "desktop";
         if (this.crmArchHasActivities || !currentActiveFields) {
             return;
@@ -1090,6 +1106,88 @@ export class CrmFormController extends formView.Controller {
             };
         }
         config.activeFields = markRaw(activeFields);
+    }
+
+    /**
+     * Whether the load variants apply to `config`: a `crm.lead` configuration with
+     * active fields and a one2many `activity_ids` the arch does not declare (an
+     * arch declaring it keeps its own declaration). The phone variant adds that
+     * field on a small screen without the offline fallback; the desktop variant
+     * leaves it out.
+     *
+     * @param {Object} config root configuration
+     * @returns {boolean}
+     */
+    crmHasActivityVariant(config) {
+        return (
+            !this.crmArchHasActivities &&
+            Boolean(toRaw(config.activeFields)) &&
+            config.fields?.activity_ids?.type === "one2many" &&
+            config.resModel === "crm.lead"
+        );
+    }
+
+    /**
+     * @override
+     * Before the `web_save` of the form's root builds its specification from the
+     * root's fields, the root leaves the phone variant when the screen widened since
+     * its phone load (`crmLeaveMobileVariant`), so the save requests, and then
+     * parses, the desktop fields.
+     *
+     * @param {Object} record record about to be saved
+     */
+    async onWillSaveRecord(record) {
+        if (toRaw(record) === toRaw(this.model.root)) {
+            this.crmLeaveMobileVariant(record.config);
+        }
+        return super.onWillSaveRecord(...arguments);
+    }
+
+    /**
+     * `crmLeaveMobileVariant` model hook, run before a request is built from the
+     * root's own configuration (`onWillSaveRecord`, and the root's onchange in
+     * `CrmFormRecord._getOnchangeValues`). The root keeps the variant of its last
+     * root load until the next one, and widening the screen does not reload it, so
+     * a root loaded on a phone still holds the `activity_ids` the phone variant
+     * added. On a wide screen, `config.activeFields` is then replaced by a fresh
+     * object without that field (never mutated; `config.fields` is left as it is)
+     * and the root forgets the field's loaded value: the request is the desktop
+     * one, and its result is parsed with the fields it asked for. The form keeps
+     * its unsaved changes; the activity sheet is closed on a wide screen.
+     *
+     * Nothing changes on a small screen (the phone variant, or the offline fallback
+     * that keeps the loaded rows of the displayed lead), for another configuration
+     * than the root's, for an arch declaring `activity_ids`, when the root already
+     * has the desktop variant, or when it holds a change of `activity_ids`. The
+     * phone variant is never applied here: the next root load on a small screen
+     * applies it (`onWillLoadRoot`).
+     *
+     * @param {Object} config configuration a request is about to be built from
+     */
+    crmLeaveMobileVariant(config) {
+        const root = this.model.root;
+        if (
+            this.crmOffline.isSmall ||
+            !config ||
+            !root ||
+            toRaw(config) !== toRaw(root.config) ||
+            !this.crmHasActivityVariant(config)
+        ) {
+            return;
+        }
+        const currentActiveFields = toRaw(config.activeFields);
+        // The arch declares no `activity_ids`, so an entry present was added by the
+        // phone variant.
+        if (!("activity_ids" in currentActiveFields)) {
+            return; // desktop variant already
+        }
+        if (!root.crmForgetLoadedValue("activity_ids")) {
+            return;
+        }
+        const activeFields = { ...currentActiveFields };
+        delete activeFields.activity_ids;
+        config.activeFields = markRaw(activeFields);
+        this.crmLastVariant = "desktop";
     }
 
     /**
