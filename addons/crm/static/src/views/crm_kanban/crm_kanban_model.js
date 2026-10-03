@@ -82,34 +82,11 @@ async function removeRecordsDeletedOffline(list, records) {
  * CRM kanban model, also used by `crm_mobile_pipeline` and, through
  * `ForecastKanbanModel`, by the forecast kanban.
  *
- * - `crmServerValues` is the server-value snapshot of the current root, a
- *   `Map<number, {stageId: number|false, revenue: number|undefined}>` holding, per
- *   lead id, the server stage and expected revenue as that root first received
- *   them: from the root load that built it, then from its later group loads
- *   (toggle, "load more"). It is an in-memory arithmetic snapshot, not a cache: it
- *   persists nothing and serves no read. `CrmMobilePipeline` reads the snapshot
- *   of the root it displays (its `_crmServerValues`, see below) to compute the
- *   header revenue delta of the leads moved or edited since the server computed
- *   that root's group aggregates: until a root load ends, the view may still
- *   display the previous root while the new one is installed.
- * - Each root owns its snapshot: the map is created with the root, and the root
- *   and every list it holds keep it as `_crmServerValues`. The snapshot is
- *   therefore the current one exactly when its root is installed as `root`, a
- *   superseded load (one whose root was replaced, even while it still awaits its
- *   progress bar) only ever fills its own root's map, and a failed load builds no
- *   root, so the previous root keeps its snapshot. Fresh server data set on the
- *   current root outside a root load (disk-cache update, root reload, leaving
- *   sample mode) gives that root a new map.
- * - `_crmLoadingServerValues` is the map that the lists being built synchronously
- *   right now bind to (`null` otherwise). `_crmBuildWith` sets it around the
- *   creation of a root and of each group, so that every list records into the map
- *   of the root it belongs to.
- * - `crmUseDesktopSpec` is an optional model hook (`params.hooks`), supplied by
- *   `CrmMobilePipelineController`: when a root load fails with a lost connection
- *   and the hook returns `true`, the load is retried once, and the controller's
- *   `onWillLoadRoot` hook applies the desktop load variant, which a wide-layout
- *   visit may have cached. Without the hook (`crm_kanban`, forecast), a failed
- *   load rethrows exactly as before.
+ * Each root owns a transient snapshot of server stage and revenue for mobile
+ * header deltas, held as `_crmServerValues` and exposed for the current root as
+ * `crmServerValues`. Its lists retain that snapshot across group loads, so
+ * overlapping loads cannot mix roots. The snapshot persists nothing and serves
+ * no reads.
  */
 export class CrmKanbanModel extends RelationalModel {
     setup(params, { effect }) {

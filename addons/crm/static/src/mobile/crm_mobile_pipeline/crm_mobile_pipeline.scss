@@ -1,38 +1,16 @@
-// Mobile CRM pipeline (`crm.CrmMobilePipeline`): one stage at a time across the
-// full width of the screen, under a sticky header with the stage name, lead count,
-// revenue and the previous / next / New controls.
-//
-// `.o_crm_mobile_pipeline` is rendered only on small screens; a wide screen gets
-// `web.KanbanRenderer`, whose DOM never carries it. Every rule is nested under it,
-// so nothing here can match a desktop kanban. The root also carries
-// `.o_kanban_renderer`: its `--Kanban-*` custom properties and background are
-// inherited as they are and never redefined here. The lead cards style themselves
-// (`crm_mobile_lead_card.scss`), and a control disabled offline keeps the
-// framework's `.o_disabled_offline` look (`web/static/src/core/offline/offline.scss`).
-//
-// Spacing is a multiple of Bootstrap's `$spacer`; the 44 px touch-target minimum is
-// the only px value. Colours are Bootstrap variables or the renderer's own custom
-// properties. Padding and borders use logical properties: in the horizontal writing
-// mode of the pipeline, `padding-block` / `padding-inline` are the top-bottom /
-// left-right padding and `border-block-end` is the bottom border.
+// Styles scoped to the mobile pipeline; logical spacing follows the writing direction.
 
 .o_crm_mobile_pipeline {
-    // Gap between the header controls and between the cards, and the inner padding.
     --CrmMobilePipeline-gap: #{$spacer * 0.5};
-    // Minimum width and height of every interactive element: the touch target.
     --CrmMobilePipeline-touchTarget: 44px;
 
-    // The header above the stage body, in a single column.
     display: flex;
     flex-direction: column;
     flex-wrap: nowrap;
     width: 100%;
     min-height: 100%;
 
-    // Touch targets: every button, select, input and link, those of the cards and
-    // of the offline helpers included. The named controls are listed as well: their
-    // class selectors outrank any Bootstrap size modifier (`.btn-sm`, `.btn-link`)
-    // that a later markup change could add.
+    // Named selectors preserve minimum touch targets under button size modifiers.
     button,
     select,
     input,
@@ -58,11 +36,7 @@
         justify-content: center;
     }
 
-    // Header ----------------------------------------------------------------------
-
     .o_crm_mobile_pipeline_header {
-        // Stays at the top of the scrolling view while the stage's cards scroll
-        // under it, and paints above them.
         position: sticky;
         top: 0;
         z-index: 1;
@@ -71,7 +45,6 @@
         gap: var(--CrmMobilePipeline-gap);
         padding-block: var(--CrmMobilePipeline-gap);
         padding-inline: $spacer;
-        // Opaque, in the renderer's own background colour, so no card shows through.
         background: var(--Kanban-background);
         border-block-end: $border-width solid $border-color;
 
@@ -90,7 +63,6 @@
         text-align: center;
     }
 
-    // A long stage name ends with an ellipsis instead of widening the header.
     .o_crm_mobile_pipeline_stage_name {
         overflow: hidden;
         text-overflow: ellipsis;
@@ -107,8 +79,6 @@
         align-items: baseline;
         justify-content: center;
     }
-
-    // Stage body ------------------------------------------------------------------
 
     .o_crm_mobile_pipeline_body {
         // A stacking context of its own: whatever z-index the cards or the offline
@@ -127,14 +97,8 @@
         // the body's touch handlers, which change the stage.
         touch-action: pan-y;
 
-        // The offline helper of an uncached stage or lead. The framework positions
-        // `.o_view_nocontent` absolutely over its container; here it is laid out in
-        // the flow instead and fills the height left in the body, so its help box is
-        // centred below the "Back" button rather than over it. On a screen too short
-        // for both, the view scrolls: the help box can never swallow a tap on "Back".
-        // The uncached-lead helper sits in a `d-contents` wrapper, which carries the
-        // id describing "Back" and generates no box: the helper is a flex item of
-        // the body all the same.
+        // Keep the helper in flow below Back; its d-contents wrapper must not introduce
+        // a layout box.
         > .o_view_nocontent,
         > .o_crm_mobile_pipeline_lead_helper > .o_view_nocontent {
             position: relative;
@@ -148,7 +112,6 @@
         align-self: flex-start;
     }
 
-    // "Load more" spans the width of the cards above it.
     .o_crm_mobile_pipeline_load_more button {
         width: 100%;
     }

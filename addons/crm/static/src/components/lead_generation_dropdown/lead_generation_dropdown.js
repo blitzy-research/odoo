@@ -19,6 +19,28 @@ export const MODULE_STATUS = {
     INSTALLED: "INSTALLED",
 };
 
+/**
+ * Confirmation of a module installation. Installing needs the server, so unlike the
+ * shared confirmation dialog its Confirm button is not available offline: the
+ * framework disables it while offline and re-enables it online, and confirming does
+ * nothing while offline, even when called directly. Cancel stays available offline.
+ */
+export class CrmInstallConfirmationDialog extends ConfirmationDialog {
+    static template = "crm.InstallConfirmationDialog";
+
+    setup() {
+        super.setup();
+        this.offlinePlugin = usePlugin(OfflinePlugin);
+    }
+
+    async _confirm() {
+        if (this.offlinePlugin.isOffline()) {
+            return;
+        }
+        return super._confirm();
+    }
+}
+
 export class LeadGenerationDropdown extends Component {
     static template = "crm.lead_generation_dropdown";
     static props = {};
@@ -210,22 +232,31 @@ export class LeadGenerationDropdown extends Component {
             title: element.title,
             body: sprintf(this.newContentText["NOT_INSTALLED"], { module_name: name }),
             confirm: async () => {
+                // Offline nothing is installed. Not `false`, which would make the
+                // dialog re-enable its buttons, Confirm included.
+                if (this.offlinePlugin.isOffline()) {
+                    return;
+                }
                 this.setElementStatus(element, name, MODULE_STATUS.INSTALLING);
                 try {
                     await this.orm.silent.call("ir.module.module", "button_immediate_install", [
                         id,
                     ]);
                     location.reload();
-                } catch (error) {
+                } catch {
+                    // Online too: a fixed text, not the raw error, which can hold server details.
                     this.setElementStatus(element, name, MODULE_STATUS.FAILED_TO_INSTALL);
-                    this.dialogs.add(ErrorDialog, { message: error });
-                    console.error(error);
+                    this.dialogs.add(ErrorDialog, {
+                        message: sprintf(this.newContentText.FAILED_TO_INSTALL, {
+                            module_name: name,
+                        }),
+                    });
                 }
             },
             cancel: () => {},
             confirmLabel: "Install",
         };
-        this.dialogs.add(ConfirmationDialog, dialogProps);
+        this.dialogs.add(CrmInstallConfirmationDialog, dialogProps);
     }
 
     setElementStatus(element, name, status) {

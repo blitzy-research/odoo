@@ -1,29 +1,14 @@
 /**
- * Mobile lane of the CRM offline work: the `crm_mobile_pipeline` kanban view
- * (`CrmMobilePipelineController` and its `CrmMobilePipeline` renderer), the
- * mobile lead card (`CrmMobileLeadCard`), its activity bottom sheet
- * (`CrmMobileLeadActivities`), the bottom-sheet quick create
- * (`CrmMobileQuickCreate`) and the shared `useCrmOffline()` hooks.
- *
- * Every pipeline, card, sheet and quick-create test mounts the real view through
- * its `js_class` (`mountView` with `js_class="crm_mobile_pipeline"`, or the web
- * client with an action), never a component on its own, so the registry entry,
- * the controller, the renderer and the renderer's `static components` all run on
- * their real parent path. The lead form tests mount `js_class="crm_form"`.
- *
- * Queue assertions read genuine entries of the framework queue, created by the
- * code under test (offline saves, quick creates, the activity sheet); parked
- * entries come from the mock server rejecting a replay. Errors the framework's
- * own cached root loads raise offline are declared with `expect.errors()` and
- * `expect.verifyErrors()`; CRM code adds none. The online tests declare the same
- * way the server rejections they inject, and simulate a connection lost during
- * one request with a 502 answer to that request only (`dropConnections`).
- *
- * Mobile tests run in the mobile preset (375x667, touch); the three desktop
- * checks run in the desktop preset.
+ * Tests of the CRM mobile pipeline. They mount the real `crm_mobile_pipeline` view
+ * registration (and `crm_form` for the lead form) and cover the pipeline, the lead
+ * card, its activity sheet and the quick create. Queue and replay assertions read
+ * genuine framework queue entries and their replays. The framework's expected
+ * cached-root-load fallback errors and the injected server errors are declared with
+ * `expect.errors()` and `expect.verifyErrors()`. Mobile tests run in the mobile
+ * preset; the three desktop checks run in the desktop preset.
  */
 
-import { after, beforeEach, expect, test } from "@odoo/hoot";
+import { after, beforeEach, expect, mockDate, test } from "@odoo/hoot";
 import {
     advanceTime,
     animationFrame,
@@ -36,7 +21,6 @@ import {
     runAllTimers,
     waitFor,
 } from "@odoo/hoot-dom";
-import { mockDate } from "@odoo/hoot-mock";
 import { onWillDestroy, onWillPatch, toRaw } from "@odoo/owl";
 import { mailModels } from "@mail/../tests/mail_test_helpers";
 import {
@@ -57,22 +41,22 @@ import {
     serverState,
 } from "@web/../tests/web_test_helpers";
 import { defineCrmModels } from "@crm/../tests/crm_test_helpers";
-import { CrmMobileLeadCard } from "@crm/mobile/crm_mobile_lead_card/crm_mobile_lead_card";
+import {
+    CrmMobileLeadActivities,
+    CrmMobileLeadCard,
+} from "@crm/mobile/crm_mobile_lead_card/crm_mobile_lead_card";
 import {
     CrmMobilePipeline,
     CrmMobilePipelineController,
 } from "@crm/mobile/crm_mobile_pipeline/crm_mobile_pipeline";
-import {
-    getCrmActivityLimit,
-    quickCreateDeepLink,
-    setCrmActivityLimit,
-} from "@crm/mobile/crm_offline_hooks";
+import { isQuickCreateDeepLink, quickCreateDeepLink } from "@crm/mobile/crm_offline_hooks";
 import { CrmFormController } from "@crm/views/crm_form/crm_form";
 import { AutoComplete } from "@web/core/autocomplete/autocomplete";
 import { browser } from "@web/core/browser/browser";
 import { rpc } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { registry } from "@web/core/registry";
+import { user } from "@web/core/user";
 import { buildM2OFieldDescription, Many2OneField } from "@web/views/fields/many2one/many2one_field";
 import { Many2XAutocomplete } from "@web/views/fields/relational_utils";
 import { AnimatedNumber } from "@web/views/view_components/animated_number";
@@ -423,7 +407,7 @@ onRpc("crm.lead", "action_set_won", function actionSetWon({ args }) {
 
 beforeEach(() => {
     patchWithCleanup(AnimatedNumber, { enableAnimations: false });
-    // Job-scoped changes of the shared mail mocks (reset after each test).
+    // Shared mail fixture overrides, reset after each test.
     mailModels.ResPartner._records = [
         { id: 101, name: "Azure Interior" },
         { id: 102, name: "Deco Addict" },
@@ -435,8 +419,7 @@ beforeEach(() => {
 });
 
 // -----------------------------------------------------------------------------
-// Arches (the two CRM lead kanban arches and the lead form, after their in-place
-// edits: mobile `js_class` and the Call activity type option)
+// Arches: CRM lead kanbans and form with the mobile view class and Call-type option.
 // -----------------------------------------------------------------------------
 
 /**
@@ -589,6 +572,38 @@ function queued(model) {
         .sort((a, b) => (a.value.extras?.timeStamp || 0) - (b.value.extras?.timeStamp || 0))
         .map(({ key, value }) => ({ key, ...value }));
 }
+
+/**
+ * The ORM call of a queue entry or of a received request.
+ *
+ * @param {{model: string, method: string, args: any[], kwargs: Object}} call
+ */
+function ormCall({ model, method, args, kwargs }) {
+    return { model, method, args, kwargs };
+}
+
+/**
+ * Records each `model`/`method` call the mock server receives, a replayed queued
+ * call included, as a copy of its `ormCall`, in arrival order. Its handler returns
+ * nothing, so the other handlers of the call still answer it.
+ *
+ * @param {string} model
+ * @param {string} method
+ * @returns {Object[]} the recorded calls, filled as they arrive
+ */
+function receivedCalls(model, method) {
+    const calls = [];
+    onRpc(model, method, (call) => {
+        calls.push(JSON.parse(JSON.stringify(ormCall(call))));
+    });
+    return calls;
+}
+
+/**
+ * A `trackCalls()` entry of a write: a save, resequence, create, write, unlink or
+ * action call.
+ */
+const WRITE_CALL = /\/(?:web_save|web_resequence|(?:name_)?create|write|unlink|action_\w+)$/;
 
 /**
  * Captures the kwargs of every `crm.lead` root load request (`web_read_group`
@@ -748,8 +763,8 @@ async function quickCreateLead({ name, revenue, stageId, contact }) {
 }
 
 /**
- * Restores the connection and waits until the framework has replayed every
- * queued call that is not parked, then lets the views reconcile.
+ * Restores connectivity, advances replay for at most 30 seconds while unparked
+ * calls or a sync remain, then allows view reconciliation.
  *
  * @param {(offline: boolean) => Promise<void>} setOffline
  */
@@ -1965,6 +1980,99 @@ test("mobile pipeline follows viewport changes", async () => {
 });
 
 test.tags("mobile");
+test("mobile pipeline closes an open quick create when the screen widens", async () => {
+    const DESKTOP = { width: 1366, height: 768 };
+    const MOBILE = { width: 375, height: 667 };
+    // The pipeline renderer stays mounted across the resizes, so the sheet can only
+    // leave through the renderer closing it, not through its quick-create hook
+    // unmounting with it.
+    let createdRenderers = 0;
+    let destroyedRenderers = 0;
+    patchWithCleanup(CrmMobilePipeline.prototype, {
+        setup() {
+            super.setup(...arguments);
+            createdRenderers++;
+            onWillDestroy(() => destroyedRenderers++);
+        },
+    });
+    const saves = [];
+    onRpc("crm.lead", "web_save", ({ args, kwargs }) => {
+        // Copied: the mock server completes the values it creates in place.
+        saves.push({ ids: [...args[0]], vals: { ...args[1] }, kwargs: { ...kwargs } });
+    });
+    const calls = trackCalls();
+    const leadWrites = () =>
+        calls.filter((call) =>
+            ["crm.lead/web_save", "crm.lead/onchange", "crm.lead/create"].includes(call)
+        );
+    const sheet = "form.o_crm_mobile_quick_create";
+    await mountPipeline();
+    expect(headerTexts()).toEqual(["New", "3", "$ 600"]);
+
+    // A quick create being filled in, on another stage than the displayed one.
+    await contains(".o_crm_mobile_pipeline_new").click();
+    expect(".o_bottom_sheet").toHaveCount(1);
+    expect(`.o_bottom_sheet ${sheet}`).toHaveCount(1);
+    expect(".o_bottom_sheet .o_bottom_sheet_backdrop").toHaveCount(1);
+    expect(document.body).toHaveClass("bottom-sheet-open");
+    await contains(`${sheet} input[name=name]`).edit("Unsaved Lead", { confirm: false });
+    await contains(`${sheet} input[name=expected_revenue]`).edit("90", { confirm: false });
+    await contains(`${sheet} select[name=stage_id]`).select(String(QUALIFIED));
+
+    // Widened: the sheet leaves with the mobile pipeline (removed at once, without a
+    // slide-out), the standard kanban renders, and nothing is saved or queued.
+    await resize(DESKTOP);
+    await animationFrame();
+    expect(".o_bottom_sheet").toHaveCount(0);
+    expect(sheet).toHaveCount(0);
+    expect(".o_bottom_sheet_backdrop").toHaveCount(0);
+    expect(document.body).not.toHaveClass("bottom-sheet-open");
+    expect(".o_crm_mobile_pipeline").toHaveCount(0);
+    expect(".o_kanban_renderer .o_kanban_group").toHaveCount(3);
+    expect(".o_kanban_group:first .o_kanban_record").toHaveCount(3);
+    expect(".o_kanban_quick_create").toHaveCount(0);
+    expect([createdRenderers, destroyedRenderers]).toEqual([1, 0]);
+    expect(leadWrites()).toEqual([]);
+    expect(queued("crm.lead")).toEqual([]);
+
+    // Small again: the pipeline is back on its stage, and the sheet does not reopen.
+    await resize(MOBILE);
+    await animationFrame();
+    expect(".o_crm_mobile_pipeline").toHaveCount(1);
+    expect(".o_kanban_group").toHaveCount(0);
+    expect(headerTexts()).toEqual(["New", "3", "$ 600"]);
+    expect(".o_bottom_sheet").toHaveCount(0);
+    expect(document.body).not.toHaveClass("bottom-sheet-open");
+    expect([createdRenderers, destroyedRenderers]).toEqual([1, 0]);
+
+    // "New" opens a fresh sheet on the displayed stage.
+    await contains(".o_crm_mobile_pipeline_new").click();
+    expect(`.o_bottom_sheet ${sheet}`).toHaveCount(1);
+    expect(`${sheet} input[name=name]`).toHaveValue("");
+    expect(`${sheet} input[name=expected_revenue]`).not.toHaveValue();
+    expect(`${sheet} select[name=stage_id]`).toHaveValue(String(NEW));
+    expect(leadWrites()).toEqual([]);
+
+    // Saved online: the sheet closes after exactly one create.
+    await contains(`${sheet} input[name=name]`).edit("Online Lead", { confirm: false });
+    await contains(`${sheet} input[name=expected_revenue]`).edit("70", { confirm: false });
+    await contains(".o_crm_mobile_quick_create_save").click();
+    await animationFrame();
+    expect(".o_bottom_sheet").toHaveCount(0);
+    expect(document.body).not.toHaveClass("bottom-sheet-open");
+    expect(leadWrites()).toEqual(["crm.lead/web_save"]);
+    expect(saves).toHaveLength(1);
+    expect(saves[0].ids).toEqual([]);
+    expect(saves[0].vals).toEqual(quickCreateValues("Online Lead", 70));
+    expect(saves[0].kwargs.specification).toEqual({});
+    expect(saves[0].kwargs.context.default_type).toBe("opportunity");
+    expect(queued("crm.lead")).toEqual([]);
+    expect(headerTexts()).toEqual(["New", "4", "$ 670"]);
+    expect(card("Online Lead")).not.toHaveClass("o_crm_mobile_lead_card_provisional");
+    expect(MockServer.env["crm.lead"].search_count([["name", "=", "Unsaved Lead"]])).toBe(0);
+});
+
+test.tags("mobile");
 test("mobile pipeline follows viewport changes made during its first root load", async () => {
     const DESKTOP = { width: 1366, height: 768 };
     const MOBILE = { width: 375, height: 667 };
@@ -2138,10 +2246,9 @@ test("mobile pipeline falls back to the desktop variant offline after a wide-lay
     expect(".o_kanban_group").toHaveCount(3);
     expect(".o_crm_mobile_pipeline").toHaveCount(0);
 
-    // Offline on a small screen, the pipeline is mounted again with the mobile
-    // variant, which was never cached: it is served the desktop variant instead.
-    // (Mounting a new view offline would need the small-screen view description,
-    // which the framework caches per screen size: the mounted view is reused.)
+    // Resize the mounted desktop pipeline to mobile offline: its root load tries the mobile
+    // variant, then falls back to cached desktop data. Reusing the view preserves the framework's
+    // screen-size-specific view description.
     await setOffline(true);
     const calls = trackCalls();
     await resize({ width: 375, height: 667 });
@@ -2325,9 +2432,11 @@ test("[Offline] New Lead deep link opens the mobile quick create from cache", as
     // "New Lead" shortcut opened offline: the pipeline is served from the cache and
     // the quick-create sheet opens once, on the displayed stage.
     await setOffline(true);
-    patchWithCleanup(quickCreateDeepLink, { pending: true });
+    patchWithCleanup(quickCreateDeepLink, {
+        pending: isQuickCreateDeepLink("?menu_id=1&crm_quick_create=1"),
+    });
     await openAction(ACTION_ID);
-    await animationFrame(); // the sheet opens once the pipeline is mounted
+    await animationFrame();
     expect(".o_bottom_sheet form.o_crm_mobile_quick_create").toHaveCount(1);
     expect("form.o_crm_mobile_quick_create select[name=stage_id]").toHaveValue(String(NEW));
     expect(quickCreateDeepLink.pending).toBe(false);
@@ -2354,6 +2463,40 @@ test("[Offline] New Lead deep link opens the mobile quick create from cache", as
         "/web/dataset/call_kw/crm.lead/web_read_group",
         "/web/dataset/call_kw/crm.lead/web_read_group",
     ]);
+});
+
+test.tags("mobile");
+test("New Lead deep link: only crm_quick_create=1 opens the quick create, once", async () => {
+    patchWithCleanup(quickCreateDeepLink, { pending: false });
+    await mountWithCleanup(WebClient);
+
+    // Any other value, or no flag at all, opens no sheet.
+    for (const search of [
+        "?menu_id=1&crm_quick_create=0",
+        "?menu_id=1&crm_quick_create=false",
+        "?menu_id=1&crm_quick_create=",
+        "?menu_id=1&crm_quick_create=yes",
+        "?menu_id=1",
+    ]) {
+        quickCreateDeepLink.pending = isQuickCreateDeepLink(search);
+        await openAction(ACTION_ID);
+        await animationFrame();
+        expect(".o_crm_mobile_pipeline_header").toHaveCount(1);
+        expect(".o_bottom_sheet").toHaveCount(0, { message: search });
+    }
+
+    // The shortcut's value opens the sheet once: the consumed flag opens no other.
+    quickCreateDeepLink.pending = isQuickCreateDeepLink("?menu_id=1&crm_quick_create=1");
+    await openAction(ACTION_ID);
+    await animationFrame();
+    expect(".o_bottom_sheet form.o_crm_mobile_quick_create").toHaveCount(1);
+    expect(quickCreateDeepLink.pending).toBe(false);
+    await contains(".o_crm_mobile_quick_create_cancel").click();
+    expect(".o_bottom_sheet").toHaveCount(0);
+    await openAction(ACTION_ID);
+    await animationFrame();
+    expect(".o_crm_mobile_pipeline_header").toHaveCount(1);
+    expect(".o_bottom_sheet").toHaveCount(0);
 });
 
 test.tags("mobile");
@@ -2432,6 +2575,59 @@ test("mobile pipeline adds activities to an arch without them, after sync in the
     expect(activityTitles()).toEqual(["Follow-up call", "Send brochure"]);
     // Only the framework's offline root load of the never-cached mobile variant.
     expect.verifyErrors(["/web/dataset/call_kw/crm.lead/web_read_group"]);
+});
+
+test.tags("mobile");
+test("mobile pipeline reconnected on a wide screen leaves the desktop fallback without a reload", async () => {
+    expect.errors(2);
+    const setOffline = mockOffline();
+    const specs = rootSpecs();
+    const rootLoads = () => specs.filter(({ method }) => method === "web_read_group");
+    // Visited online at desktop size: the desktop variant is cached.
+    await resize({ width: 1366, height: 768 });
+    await mountPipeline({ arch: plainPipelineArch });
+    expect(".o_kanban_renderer .o_kanban_group").toHaveCount(3);
+    expect(rootLoads()).toHaveLength(1);
+
+    // Offline on a phone, the never-cached mobile variant falls back to the cached
+    // desktop one.
+    await setOffline(true);
+    const calls = trackCalls();
+    await resize({ width: 375, height: 667 });
+    await animationFrame();
+    expect(".o_crm_mobile_pipeline").toHaveCount(1);
+    expect(cardNames()).toEqual(["Office Design", "Quote for Chairs", "Desk Upgrade"]);
+    expect(headerTexts()).toEqual(["New", "3", null]);
+
+    // Widened while still offline: the desktop kanban, from the cache.
+    await resize({ width: 1366, height: 768 });
+    await animationFrame();
+    expect(".o_crm_mobile_pipeline").toHaveCount(0);
+    expect(".o_kanban_renderer .o_kanban_group").toHaveCount(3);
+
+    // Reconnected on the wide screen: the fallback ends, and no root load is issued.
+    calls.splice(0);
+    const loadCount = rootLoads().length;
+    await reconnect(setOffline);
+    expect(calls.filter((call) => call.startsWith("crm.lead/"))).toEqual([]);
+    expect(rootLoads()).toHaveLength(loadCount);
+    expect(".o_kanban_renderer .o_kanban_group").toHaveCount(3);
+
+    // Back on a phone, online: one root load, with the mobile variant.
+    await resize({ width: 375, height: 667 });
+    await animationFrame();
+    expect(rootLoads()).toHaveLength(loadCount + 1);
+    const mobileLoad = rootLoads().at(-1);
+    expect(Object.keys(mobileLoad.specification.activity_ids.fields)).toEqual(ACTIVITY_SUBFIELDS);
+    expect(mobileLoad.aggregates).toInclude("expected_revenue:sum");
+    expect(".o_crm_mobile_pipeline").toHaveCount(1);
+    expect(headerTexts()).toEqual(["New", "3", "$ 600"]);
+    // Only the framework's cached root loads of the desktop variant, served offline
+    // on the phone and after the widening.
+    expect.verifyErrors([
+        "/web/dataset/call_kw/crm.lead/web_read_group",
+        "/web/dataset/call_kw/crm.lead/web_read_group",
+    ]);
 });
 
 test.tags("mobile");
@@ -2661,7 +2857,6 @@ test("mobile lead card shows name, partner, revenue and 44px targets", async () 
     expect(textOf(`${card("Quote for Chairs")} .o_crm_mobile_lead_partner`)).toBe("Bob Contact");
     expect(textOf(`${card("Quote for Chairs")} .o_crm_mobile_lead_revenue`)).toBe("$ 200.00");
     expect(textOf(`${card("Desk Upgrade")} .o_crm_mobile_lead_partner`)).toBe("Deco Addict");
-    // The stage selector lists the pipeline stages, on the lead's own.
     expect(queryAllTexts(`${card("Office Design")} .o_crm_mobile_lead_stage option`)).toEqual([
         "New",
         "Qualified",
@@ -2675,7 +2870,7 @@ test("mobile lead card shows name, partner, revenue and 44px targets", async () 
     expect(targets).toHaveLength(9);
     for (const target of targets) {
         const { width, height } = target.getBoundingClientRect();
-        expect(Math.round(width) >= TOUCH_TARGET && Math.round(height) >= TOUCH_TARGET).toBe(true, {
+        expect(width >= TOUCH_TARGET && height >= TOUCH_TARGET).toBe(true, {
             message: `${target.className}: ${width} x ${height}`,
         });
     }
@@ -2811,6 +3006,7 @@ test("mobile lead card announces its sync state through a status region", async 
 
 test.tags("mobile");
 test("mobile lead card stage move queues offline", async () => {
+    const received = receivedCalls("crm.lead", "web_save");
     const setOffline = mockOffline();
     await mountPipeline();
     // Both stages visited online.
@@ -2826,6 +3022,18 @@ test("mobile lead card stage move queues offline", async () => {
     expect(move.method).toBe("web_save");
     expect(move.args[0]).toEqual([3]);
     expect(move.args[1]).toEqual({ stage_id: QUALIFIED });
+    // The record's save, in the context of the record: the pipeline context and the
+    // `default_stage_id` the framework gives the stage group the lead was loaded in.
+    const moveCall = {
+        model: "crm.lead",
+        method: "web_save",
+        args: [[3], { stage_id: QUALIFIED }],
+        kwargs: {
+            context: { ...user.context, ...PIPELINE_CONTEXT, default_stage_id: NEW },
+            specification: {},
+        },
+    };
+    expect(queued("crm.lead").map(ormCall)).toEqual([moveCall]);
 
     await contains(".o_crm_mobile_pipeline_next").click();
     expect(headerTexts()).toEqual(["Qualified", "4", "$ 1,000"]);
@@ -2835,6 +3043,15 @@ test("mobile lead card stage move queues offline", async () => {
     // Only the framework's record save, which tries the server before queueing the
     // call on the lost connection: no rainbowman lookup, no other request.
     expect(calls).toEqual(["crm.lead/web_save"]);
+
+    // Replayed: the server receives the queued call once, and no other write.
+    const replayStart = calls.length;
+    await reconnect(setOffline);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(received).toEqual([moveCall]);
+    expect(calls.slice(replayStart).filter((call) => WRITE_CALL.test(call))).toEqual([
+        "crm.lead/web_save",
+    ]);
 });
 
 test.tags("mobile");
@@ -2879,6 +3096,79 @@ test("mobile lead card has no stage selector without stage choices", async () =>
     expect(".o_crm_mobile_lead_stage").toHaveCount(0);
     expect(".o_crm_mobile_lead_card .o_crm_mobile_lead_open").toHaveCount(7);
     expect(".o_crm_mobile_lead_card .o_crm_mobile_lead_activities_button").toHaveCount(7);
+});
+
+/** Stage ids of no stage: unknown, negative and fractional. */
+const UNOFFERED_STAGE_VALUES = ["999", "-1", "1.5"];
+
+/**
+ * Chooses `value` on a card's stage `<select>` through an option the card does
+ * not render, appended as a tampered page would: the change reaches the card.
+ *
+ * @param {string} select selector of the card's stage `<select>`
+ * @param {string} value
+ */
+async function selectCraftedStage(select, value) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    queryFirst(select).append(option);
+    await contains(select).select(value);
+}
+
+test.tags("mobile");
+test("mobile lead card ignores a stage choice that is not an offered stage", async () => {
+    await makeMockServer();
+    // An existing stage no loaded lead has: the ungrouped list does not offer it.
+    const proposalId = MockServer.env["crm.stage"].create({ name: "Proposal", sequence: 4 });
+    const setOffline = mockOffline();
+    await mountPipeline({ arch: leadsArch, groupBy: [] });
+    const calls = trackCalls();
+    const select = `${card("Lamps")} .o_crm_mobile_lead_stage`;
+    const badge = `${card("Lamps")} .o_crm_mobile_pending_sync`;
+    const serverStage = () =>
+        MockServer.env["crm.lead"].search_read([["id", "=", 5]], ["stage_id"]);
+    expect(queryAllTexts(`${select} option`)).toEqual(["New", "Qualified", "Won"]);
+
+    // Online, then offline: the ungrouped list saves a chosen stage on its record,
+    // so a stage it does not offer is neither saved nor queued, and the lead keeps
+    // its stage.
+    for (const offline of [false, true]) {
+        await setOffline(offline);
+        for (const value of [String(proposalId), ...UNOFFERED_STAGE_VALUES]) {
+            await selectCraftedStage(select, value);
+            expect(calls.filter((call) => call.startsWith("crm.lead/"))).toEqual([]);
+            expect(queued("crm.lead")).toEqual([]);
+            expect(badge).toHaveCount(0);
+            expect(serverStage()).toEqual([{ id: 5, stage_id: [QUALIFIED, "Qualified"] }]);
+        }
+    }
+
+    // An offered stage still moves the lead: offline, its save is queued.
+    await contains(select).select(String(NEW));
+    const [save] = queued("crm.lead");
+    expect(save.method).toBe("web_save");
+    expect(save.args).toEqual([[5], { stage_id: NEW }]);
+    expect(select).toHaveValue(String(NEW));
+    expect(badge).toHaveText("Pending sync");
+});
+
+test.tags("mobile");
+test("mobile pipeline card ignores a stage outside the stage groups", async () => {
+    const setOffline = mockOffline();
+    await mountPipeline();
+    await setOffline(true);
+    const calls = trackCalls();
+    const select = `${card("Desk Upgrade")} .o_crm_mobile_lead_stage`;
+
+    for (const value of UNOFFERED_STAGE_VALUES) {
+        await selectCraftedStage(select, value);
+        expect(calls).toEqual([]);
+        expect(queued("crm.lead")).toEqual([]);
+        expect(headerTexts()).toEqual(["New", "3", "$ 600"]);
+        expect(cardNames()).toEqual(["Office Design", "Quote for Chairs", "Desk Upgrade"]);
+        expect(`${card("Desk Upgrade")} .o_crm_mobile_pending_sync`).toHaveCount(0);
+    }
 });
 
 test.tags("mobile");
@@ -2985,7 +3275,6 @@ test("mobile quick create opens as bottom sheet with six offline fields", async 
 
     expect(".o_bottom_sheet form.o_crm_mobile_quick_create").toHaveCount(1);
     expect(".o_bottom_sheet .o_crm_mobile_quick_create_field").toHaveCount(6);
-    // Nothing else to fill in: exactly the six fields.
     expect(".o_bottom_sheet :is(input, select, textarea)").toHaveCount(6);
     const fieldEls = queryAll(".o_bottom_sheet .o_crm_mobile_quick_create_field");
     expect(fieldEls.map((el) => el.getAttribute("name"))).toEqual(QUICK_CREATE_FIELDS);
@@ -2997,7 +3286,6 @@ test("mobile quick create opens as bottom sheet with six offline fields", async 
         expect(button).toHaveAttribute("data-available-offline");
         expect(button).toBeEnabled();
     }
-    // The stage selector lists the pipeline stages, on the displayed one.
     expect(queryAllTexts("form.o_crm_mobile_quick_create select[name=stage_id] option")).toEqual([
         "New",
         "Qualified",
@@ -3034,14 +3322,12 @@ test("mobile quick create requires a name and closes on cancel", async () => {
     );
     expect(queued("crm.lead")).toEqual([]);
 
-    // Typing clears the flag.
     await contains("form.o_crm_mobile_quick_create input[name=name]").edit("Draft", {
         confirm: false,
     });
     expect("form.o_crm_mobile_quick_create input[name=name]").not.toHaveClass("is-invalid");
     expect(".o_crm_mobile_quick_create .invalid-feedback").toHaveCount(0);
 
-    // Cancel closes the sheet without saving.
     await contains(".o_crm_mobile_quick_create_cancel").click();
     await animationFrame();
     expect(".o_bottom_sheet").toHaveCount(0);
@@ -3052,6 +3338,7 @@ test("mobile quick create requires a name and closes on cancel", async () => {
 
 test.tags("mobile");
 test("mobile quick create queues a create offline in two cached stages without an online create", async () => {
+    const received = receivedCalls("crm.lead", "web_save");
     const setOffline = mockOffline();
     await mountWithCleanup(WebClient);
     // Only the pipeline is visited online (both stages); nothing is created online.
@@ -3087,22 +3374,42 @@ test("mobile quick create queues a create offline in two cached stages without a
         expect(create.extras.actionId).toBe(ACTION_ID);
         expect(create.extras.viewType).toBe("kanban");
     }
-    expect(creates[0].args[1]).toEqual({
+    const newLeadValues = {
         name: "Lead in New",
         contact_name: "Ann Buyer",
         phone: "+32 470 12 34 56",
         email_from: "ann@example.com",
         expected_revenue: 120,
         stage_id: NEW,
-    });
-    expect(creates[1].args[1]).toEqual({
+    };
+    const qualifiedLeadValues = {
         name: "Lead in Qualified",
         contact_name: "",
         phone: "",
         email_from: "",
         expected_revenue: 80,
         stage_id: QUALIFIED,
-    });
+    };
+    expect(creates[0].args[1]).toEqual(newLeadValues);
+    expect(creates[1].args[1]).toEqual(qualifiedLeadValues);
+    // Creates (no id) in the pipeline list context, which holds the action's
+    // `default_type`, with an empty specification, in queue order.
+    const createKwargs = { context: { ...user.context, ...PIPELINE_CONTEXT }, specification: {} };
+    const createCalls = [
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [[], newLeadValues],
+            kwargs: createKwargs,
+        },
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [[], qualifiedLeadValues],
+            kwargs: createKwargs,
+        },
+    ];
+    expect(creates.map(ormCall)).toEqual(createCalls);
 
     // Each stage shows its provisional card with the pending indicator.
     const provisional = ".o_crm_mobile_lead_card_provisional";
@@ -3116,6 +3423,16 @@ test("mobile quick create queues a create offline in two cached stages without a
     expect(textOf(`${provisional} .o_crm_mobile_pending_sync`)).toBe("Pending sync");
     // Queued directly: no create, onchange or other request is attempted offline.
     expect(calls).toEqual([]);
+
+    // Replayed in queue order: the server receives the two queued creates, and no
+    // other write.
+    await reconnect(setOffline);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(received).toEqual(createCalls);
+    expect(calls.filter((call) => WRITE_CALL.test(call))).toEqual([
+        "crm.lead/web_save",
+        "crm.lead/web_save",
+    ]);
 });
 
 /** The values the quick-create sheet saves for a lead with a name and revenue only. */
@@ -3247,6 +3564,225 @@ test("mobile quick create keeps the values on a server error and queues on a dro
     expect(MockServer.env["crm.lead"].search_count([["name", "=", "Reloaded Lead"]])).toBe(1);
     expect(queued("crm.lead")).toEqual([]);
     expect.verifyErrors(["Pipeline reload failed"]);
+});
+
+const QUICK_CREATE_STAGE = "form.o_crm_mobile_quick_create select[name=stage_id]";
+
+/**
+ * Selects the second stage option of the open quick-create sheet with its value
+ * replaced by `value`, as a tampered page would submit it.
+ *
+ * @param {string} value
+ */
+async function selectTamperedStage(value) {
+    queryAll(`${QUICK_CREATE_STAGE} option`)[1].value = value;
+    await contains(QUICK_CREATE_STAGE).select(value);
+}
+
+/** Records the `stage_id` of every quick-create save the sheet hands to the pipeline. */
+function trackQuickCreateSaves() {
+    const stageIds = [];
+    patchWithCleanup(CrmMobilePipeline.prototype, {
+        onQuickCreateSave(values) {
+            stageIds.push(values.stage_id);
+            return super.onQuickCreateSave(...arguments);
+        },
+    });
+    return stageIds;
+}
+
+/**
+ * Asserts that the open sheet refused its stage: the stage is flagged, focused
+ * and described by an announced message, and the entered values are kept.
+ *
+ * @param {string} name
+ * @param {number} revenue
+ */
+function expectStageRefused(name, revenue) {
+    const feedback = `${QUICK_CREATE_STAGE} + .invalid-feedback`;
+    expect(".o_bottom_sheet form.o_crm_mobile_quick_create").toHaveCount(1);
+    expect(QUICK_CREATE_STAGE).toHaveClass("is-invalid");
+    expect(QUICK_CREATE_STAGE).toHaveAttribute("aria-invalid", "true");
+    expect(QUICK_CREATE_STAGE).toBeFocused();
+    expect(feedback).toHaveText("Select a stage from the list.");
+    expect(feedback).toHaveAttribute("role", "alert");
+    expect(QUICK_CREATE_STAGE).toHaveAttribute("aria-describedby", queryFirst(feedback).id);
+    expect(".o_crm_mobile_quick_create .invalid-feedback").toHaveCount(1);
+    expect("form.o_crm_mobile_quick_create input[name=name]").toHaveValue(name);
+    expect("form.o_crm_mobile_quick_create input[name=expected_revenue]").toHaveValue(revenue);
+    expect(".o_crm_mobile_quick_create_save").toBeEnabled();
+}
+
+test.tags("mobile");
+test("mobile quick create refuses a stage value that is not an offered stage", async () => {
+    const saves = trackQuickCreateSaves();
+    const setOffline = mockOffline();
+    const calls = trackCalls();
+    await mountPipeline();
+    // An existing stage that the pipeline does not offer: no lead, so no group.
+    const hiddenStageId = MockServer.env["crm.stage"].create({ name: "Hidden", sequence: 4 });
+    await contains(".o_crm_mobile_pipeline_new").click();
+    await contains("form.o_crm_mobile_quick_create input[name=name]").edit("Tampered Lead", {
+        confirm: false,
+    });
+    await contains("form.o_crm_mobile_quick_create input[name=expected_revenue]").edit("40", {
+        confirm: false,
+    });
+
+    // Online: negative, fractional, nonfinite, non-numeric and unoffered values.
+    for (const value of ["-1", "1.5", "Infinity", "abc", String(hiddenStageId)]) {
+        await selectTamperedStage(value);
+        // Changing the stage clears the previous refusal.
+        expect(QUICK_CREATE_STAGE).not.toHaveClass("is-invalid");
+        expect(".o_crm_mobile_quick_create .invalid-feedback").toHaveCount(0);
+        await contains(".o_crm_mobile_quick_create_save").click();
+        expectStageRefused("Tampered Lead", 40);
+    }
+    // Refused by the sheet itself, before `onSave`.
+    expect(saves).toEqual([]);
+    expect(calls).not.toInclude("crm.lead/web_save");
+
+    // Offline: nothing is queued.
+    await setOffline(true);
+    await selectTamperedStage("-1");
+    await contains(".o_crm_mobile_quick_create_save").click();
+    expectStageRefused("Tampered Lead", 40);
+    expect(saves).toEqual([]);
+    expect(queued("crm.lead")).toEqual([]);
+
+    // An offered stage clears the flag and creates the lead.
+    await contains(QUICK_CREATE_STAGE).select(String(NEW));
+    expect(QUICK_CREATE_STAGE).not.toHaveClass("is-invalid");
+    expect(QUICK_CREATE_STAGE).not.toHaveAttribute("aria-invalid");
+    expect(QUICK_CREATE_STAGE).not.toHaveAttribute("aria-describedby");
+    expect(".o_crm_mobile_quick_create .invalid-feedback").toHaveCount(0);
+    await contains(".o_crm_mobile_quick_create_save").click();
+    expect(".o_bottom_sheet").toHaveCount(0);
+    const creates = queued("crm.lead");
+    expect(creates).toHaveLength(1);
+    expect(creates[0].args).toEqual([[], quickCreateValues("Tampered Lead", 40)]);
+    expect(creates[0].extras.changes.stage_id).toEqual({ id: NEW, display_name: "New" });
+    expect(card("Tampered Lead")).toHaveClass("o_crm_mobile_lead_card_provisional");
+    expect(saves).toEqual([NEW]);
+    expect(calls).not.toInclude("crm.lead/web_save");
+});
+
+test.tags("mobile");
+test("mobile quick create refuses a stage removed from the pipeline while the sheet is open", async () => {
+    let controller = null;
+    patchWithCleanup(CrmMobilePipelineController.prototype, {
+        setup() {
+            super.setup(...arguments);
+            controller = this;
+        },
+    });
+    const saves = trackQuickCreateSaves();
+    const setOffline = mockOffline();
+    const calls = trackCalls();
+    await mountPipeline();
+    await contains(".o_crm_mobile_pipeline_new").click();
+    await contains("form.o_crm_mobile_quick_create input[name=name]").edit("Late Lead", {
+        confirm: false,
+    });
+    await contains("form.o_crm_mobile_quick_create input[name=expected_revenue]").edit("30", {
+        confirm: false,
+    });
+    await contains(QUICK_CREATE_STAGE).select(String(WON));
+
+    // The pipeline reloads with a search that leaves "Won" out (a same-search
+    // reload keeps its emptied groups): the open sheet still lists it.
+    await controller.model.load({ domain: [["stage_id", "!=", WON]] });
+    await animationFrame();
+    expect(controller.model.root.groups.map(({ value }) => value)).toEqual([NEW, QUALIFIED]);
+    expect(queryAllTexts(`${QUICK_CREATE_STAGE} option`)).toEqual(["New", "Qualified", "Won"]);
+
+    // Online, the pipeline refuses it: no request, the sheet keeps the values.
+    await contains(".o_crm_mobile_quick_create_save").click();
+    expectStageRefused("Late Lead", 30);
+    expect(saves).toEqual([WON]);
+    expect(calls).not.toInclude("crm.lead/web_save");
+    expect(textOf(".o_crm_mobile_pipeline_stage_name")).toBe("New");
+
+    // Offline, nothing is queued.
+    await setOffline(true);
+    await contains(".o_crm_mobile_quick_create_save").click();
+    expectStageRefused("Late Lead", 30);
+    expect(queued("crm.lead")).toEqual([]);
+
+    // Back online, a current stage creates the lead there, once.
+    await setOffline(false);
+    await contains(QUICK_CREATE_STAGE).select(String(QUALIFIED));
+    expect(".o_crm_mobile_quick_create .invalid-feedback").toHaveCount(0);
+    await contains(".o_crm_mobile_quick_create_save").click();
+    await animationFrame();
+    expect(".o_bottom_sheet").toHaveCount(0);
+    expect(saves).toEqual([WON, WON, QUALIFIED]);
+    expect(calls.filter((call) => call === "crm.lead/web_save")).toHaveLength(1);
+    expect(
+        MockServer.env["crm.lead"].search_count([
+            ["name", "=", "Late Lead"],
+            ["stage_id", "=", QUALIFIED],
+        ])
+    ).toBe(1);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(textOf(".o_crm_mobile_pipeline_stage_name")).toBe("Qualified");
+    expect(card("Late Lead")).not.toHaveClass("o_crm_mobile_lead_card_provisional");
+});
+
+test.tags("mobile");
+test("mobile quick create saves a lead without stage while the pipeline offers none", async () => {
+    const saves = trackQuickCreateSaves();
+    await makeMockServer();
+    // No stage exists: every lead loses its stage, so the pipeline has the "None"
+    // group only and offers no stage.
+    MockServer.env["crm.stage"].unlink(MockServer.env["crm.stage"].search([]));
+    const setOffline = mockOffline();
+    await mountPipeline();
+    expect(headerTexts()).toEqual(["None", "7", "$ 2,200"]);
+    expect(".o_crm_mobile_pipeline_prev").toHaveAttribute("disabled");
+    expect(".o_crm_mobile_pipeline_next").toHaveAttribute("disabled");
+
+    await setOffline(true);
+    const calls = trackCalls();
+    await contains(".o_crm_mobile_pipeline_new").click();
+    expect(`${QUICK_CREATE_STAGE} option`).toHaveCount(0);
+    expect(QUICK_CREATE_STAGE).toHaveValue("");
+    await contains("form.o_crm_mobile_quick_create input[name=name]").edit("Stageless Lead", {
+        confirm: false,
+    });
+    await contains("form.o_crm_mobile_quick_create input[name=expected_revenue]").edit("60", {
+        confirm: false,
+    });
+    await contains(".o_crm_mobile_quick_create_save").click();
+
+    // Not refused: the sheet closes and the create is queued once, without stage.
+    expect(".o_crm_mobile_quick_create .invalid-feedback").toHaveCount(0);
+    expect(".o_bottom_sheet").toHaveCount(0);
+    expect(saves).toEqual([false]);
+    const creates = queued("crm.lead");
+    expect(creates).toHaveLength(1);
+    expect(creates[0].method).toBe("web_save");
+    expect(creates[0].args).toEqual([
+        [],
+        { ...quickCreateValues("Stageless Lead", 60), stage_id: false },
+    ]);
+    expect(creates[0].kwargs.context.default_type).toBe("opportunity");
+    expect(creates[0].extras.changes.stage_id).toBe(false);
+    expect(card("Stageless Lead")).toHaveClass("o_crm_mobile_lead_card_provisional");
+    expect(headerTexts()).toEqual(["None", "8", "$ 2,260"]);
+    expect(calls).toEqual([]);
+
+    // The replay creates the lead without stage on the server.
+    await reconnect(setOffline);
+    expect(
+        MockServer.env["crm.lead"].search_count([
+            ["name", "=", "Stageless Lead"],
+            ["stage_id", "=", false],
+        ])
+    ).toBe(1);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(card("Stageless Lead")).not.toHaveClass("o_crm_mobile_lead_card_provisional");
+    expect(headerTexts()).toEqual(["None", "8", "$ 2,260"]);
 });
 
 // -----------------------------------------------------------------------------
@@ -3638,7 +4174,6 @@ test("mobile activities: sheet stays open across reconnection", async () => {
         "Rejected visit",
     ]);
 
-    // Reconnected: the replay ends with the sheet still open.
     await reconnect(setOffline);
     expect(".o_bottom_sheet .o_crm_mobile_lead_activities_sheet").toHaveCount(1);
     // The done row is gone; the logged call is a synced row with its own done button.
@@ -3664,7 +4199,6 @@ test("mobile activities: sheet stays open across reconnection", async () => {
     const [parked] = queued("mail.activity");
     expect(parked.method).toBe("create");
     expect(parked.extras.error).toInclude("Invalid activity");
-    // The new row's done button works online.
     await contains(`${activityRow(newActivity.id)} .o_crm_mobile_activity_done`).click();
     expect(activityRow(newActivity.id)).toHaveCount(0);
     expect(activityTitles()).toEqual(["Follow-up call", "Rejected visit"]);
@@ -3673,6 +4207,7 @@ test("mobile activities: sheet stays open across reconnection", async () => {
 test.tags("mobile");
 test("mobile activities: log a call queues the Call type offline and shows pending", async () => {
     mockDate("2026-10-02 10:00:00");
+    const received = receivedCalls("mail.activity", "create");
     // No lead has a salesperson: no user (avatar) reaches the relational-field cache.
     await makeMockServer();
     MockServer.env["crm.lead"].write(MockServer.env["crm.lead"].search([]), { user_id: false });
@@ -3701,21 +4236,28 @@ test("mobile activities: log a call queues the Call type offline and shows pendi
 
     const [create] = queued("mail.activity");
     expect(create.method).toBe("create");
-    expect(create.args).toEqual([
-        [
-            {
-                res_model: "crm.lead",
-                res_id: 1,
-                activity_type_id: CALL_TYPE_ID,
-                summary: "Call",
-                date_deadline: "2026-10-02",
-                user_id: serverState.userId,
-            },
+    const createCall = {
+        model: "mail.activity",
+        method: "create",
+        args: [
+            [
+                {
+                    res_model: "crm.lead",
+                    res_id: 1,
+                    activity_type_id: CALL_TYPE_ID,
+                    summary: "Call",
+                    date_deadline: "2026-10-02",
+                    user_id: serverState.userId,
+                },
+            ],
         ],
-    ]);
+        kwargs: { context: user.context },
+    };
+    expect(create.args).toEqual(createCall.args);
     // The user context: no default of the lead action becomes an activity default.
     expect(create.kwargs.context.uid).toBe(serverState.userId);
     expect(create.kwargs.context.default_type).toBe(undefined);
+    expect(queued("mail.activity").map(ormCall)).toEqual([createCall]);
     expect(".o_crm_mobile_activity_form").toHaveCount(0);
     expect(".o_crm_mobile_activity_pending .o_crm_mobile_activity_title").toHaveText("Call");
     expect(".o_crm_mobile_activity_pending .o_crm_mobile_activity_type_label").toHaveText("Call");
@@ -3725,11 +4267,18 @@ test("mobile activities: log a call queues the Call type offline and shows pendi
     expect(".o_crm_mobile_activity_pending .o_crm_mobile_pending_sync").toHaveText("Pending sync");
     expect(".o_crm_mobile_activity_pending .o_crm_mobile_activity_done").toHaveCount(0);
     expect(calls).toEqual([]);
+
+    // Replayed: the server receives the queued create once, and no other write.
+    await reconnect(setOffline);
+    expect(queued("mail.activity")).toEqual([]);
+    expect(received).toEqual([createCall]);
+    expect(calls.filter((call) => WRITE_CALL.test(call))).toEqual(["mail.activity/create"]);
 });
 
 test.tags("mobile");
 test("mobile activities: schedule follow-up queues offline and shows pending", async () => {
     mockDate("2026-10-02 10:00:00");
+    const received = receivedCalls("mail.activity", "create");
     const setOffline = mockOffline();
     await mountPipeline();
     await setOffline(true);
@@ -3758,14 +4307,23 @@ test("mobile activities: schedule follow-up queues offline and shows pending", a
 
     const [create] = queued("mail.activity");
     expect(create.method).toBe("create");
-    expect(create.args[0][0]).toEqual({
+    const followUpValues = {
         res_model: "crm.lead",
         res_id: 4,
         activity_type_id: 28,
         summary: "Send the contract",
         date_deadline: "2026-10-03",
         user_id: serverState.userId,
-    });
+    };
+    expect(create.args[0][0]).toEqual(followUpValues);
+    // The user context only: no key of the lead action becomes an activity default.
+    const createCall = {
+        model: "mail.activity",
+        method: "create",
+        args: [[followUpValues]],
+        kwargs: { context: user.context },
+    };
+    expect(queued("mail.activity").map(ormCall)).toEqual([createCall]);
     const pending = ".o_crm_mobile_activity_pending";
     expect(`${pending} .o_crm_mobile_activity_title`).toHaveText("Send the contract");
     expect(`${pending} .o_crm_mobile_activity_type_label`).toHaveText("Upload Document");
@@ -3777,10 +4335,18 @@ test("mobile activities: schedule follow-up queues offline and shows pending", a
     await openActivities("Conference Room");
     expect(activityTitles()).toEqual(["Send the quote", "Send the contract"]);
     expect(calls).toEqual([]);
+
+    // Replayed: the server receives the queued create once, and no other write.
+    await reconnect(setOffline);
+    expect(queued("mail.activity")).toEqual([]);
+    expect(received).toEqual([createCall]);
+    expect(calls.filter((call) => WRITE_CALL.test(call))).toEqual(["mail.activity/create"]);
 });
 
 test.tags("mobile");
 test("mobile activities: mark done queues action_done offline and the list updates after replay", async () => {
+    // Runs before the module's `action_done` handler, which still removes the activity.
+    const received = receivedCalls("mail.activity", "action_done");
     const setOffline = mockOffline();
     await mountPipeline();
     await setOffline(true);
@@ -3797,6 +4363,14 @@ test("mobile activities: mark done queues action_done offline and the list updat
     expect(done.method).toBe("action_done");
     expect(done.args).toEqual([[1]]);
     expect(done.kwargs.context.uid).toBe(serverState.userId);
+    // The user context only: no key of the lead action reaches the activity call.
+    const doneCall = {
+        model: "mail.activity",
+        method: "action_done",
+        args: [[1]],
+        kwargs: { context: user.context },
+    };
+    expect(queued("mail.activity").map(ormCall)).toEqual([doneCall]);
     expect(calls).toEqual([]);
 
     // After the replay, the done activity has left the list (sheet still open).
@@ -3806,6 +4380,9 @@ test("mobile activities: mark done queues action_done offline and the list updat
     expect(".o_bottom_sheet .o_crm_mobile_lead_activities_sheet").toHaveCount(1);
     expect(activityTitles()).toEqual(["Send brochure"]);
     expect(activityRow(1)).toHaveCount(0);
+    // The server received the queued call once, and no other write.
+    expect(received).toEqual([doneCall]);
+    expect(calls.filter((call) => WRITE_CALL.test(call))).toEqual(["mail.activity/action_done"]);
 });
 
 test.tags("mobile");
@@ -3850,6 +4427,141 @@ test("mobile activities: controls disabled without cached types", async () => {
         "Upload Document",
     ]);
     expect(queued("mail.activity")).toEqual([]);
+});
+
+test.tags("mobile");
+test("mobile activities: an open form keeps its type options when the cached types reread empty", async () => {
+    mockDate("2026-10-02 10:00:00");
+    // Once set, the cache reads return only the activity types of these ids.
+    let readableTypeIds = null;
+    patchWithCleanup(OfflinePlugin.prototype, {
+        async searchMany2XRecords(model) {
+            const records = await super.searchMany2XRecords(...arguments);
+            if (model !== "mail.activity.type" || !readableTypeIds) {
+                return records;
+            }
+            return (records || []).filter(({ id }) => readableTypeIds.includes(id));
+        },
+    });
+    const optionReads = [];
+    patchWithCleanup(CrmMobileLeadActivities.prototype, {
+        loadOptions() {
+            const read = super.loadOptions(...arguments);
+            optionReads.push(read);
+            return read;
+        },
+    });
+    const received = receivedCalls("mail.activity", "create");
+    const setOffline = mockOffline();
+    const calls = trackCalls();
+    /** Reconnects, then waits for the one options reread of the open sheet it causes. */
+    const reconnectAndReread = async () => {
+        const reads = optionReads.length;
+        await reconnect(setOffline);
+        expect(optionReads).toHaveLength(reads + 1);
+        await optionReads.at(-1);
+        await animationFrame();
+    };
+    // Option counts of every type select displayed, read at each DOM change.
+    const typeOptionCounts = new Set();
+    const observer = new MutationObserver(() => {
+        for (const select of document.querySelectorAll("select.o_crm_mobile_activity_type")) {
+            typeOptionCounts.add(select.options.length);
+        }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    after(() => observer.disconnect());
+    await mountPipeline();
+    await setOffline(true);
+    await openActivities("Office Design");
+    expect(optionReads).toHaveLength(1);
+    await contains(".o_crm_mobile_schedule_followup").click();
+    await contains(".o_crm_mobile_activity_type").select("28");
+    await contains(".o_crm_mobile_activity_summary").edit("Send the contract", {
+        confirm: false,
+    });
+
+    // The reread at reconnection finds no type: the open form keeps the options it
+    // was opened with, its choice and its draft.
+    readableTypeIds = [];
+    await reconnectAndReread();
+    expect(await cachedActivityTypeIds()).toEqual([]);
+    expect(queryAllTexts(".o_crm_mobile_activity_type option").sort()).toEqual([
+        "Call",
+        "Email",
+        "Upload Document",
+    ]);
+    expect(".o_crm_mobile_activity_type").toHaveValue("28");
+    expect(".o_crm_mobile_activity_summary").toHaveValue("Send the contract");
+
+    // Save sends the type shown. The closed form leaves the empty read: both
+    // openers are disabled.
+    await contains(".o_crm_mobile_activity_save").click();
+    await animationFrame();
+    const followUpValues = {
+        res_model: "crm.lead",
+        res_id: 1,
+        activity_type_id: 28,
+        summary: "Send the contract",
+        date_deadline: "2026-10-03",
+        user_id: serverState.userId,
+    };
+    expect(received).toEqual([
+        {
+            model: "mail.activity",
+            method: "create",
+            args: [[followUpValues]],
+            kwargs: { context: user.context },
+        },
+    ]);
+    expect(".o_crm_mobile_activity_form").toHaveCount(0);
+    expect(".o_crm_mobile_log_call").not.toBeEnabled();
+    expect(".o_crm_mobile_schedule_followup").not.toBeEnabled();
+
+    // Email and Call read at the next reconnection enable the openers again.
+    readableTypeIds = [1, CALL_TYPE_ID];
+    await setOffline(true);
+    await reconnectAndReread();
+    expect(".o_crm_mobile_schedule_followup").toBeEnabled();
+    await contains(".o_crm_mobile_schedule_followup").click();
+    await contains(".o_crm_mobile_activity_type").select(String(CALL_TYPE_ID));
+    await contains(".o_crm_mobile_activity_summary").edit("Book the visit", {
+        confirm: false,
+    });
+
+    // A reread without the chosen type shows the types read, and Save refuses the
+    // type no longer offered: the draft stays, the type is flagged, nothing is sent.
+    readableTypeIds = [1, 28];
+    await setOffline(true);
+    await reconnectAndReread();
+    expect(queryAllTexts(".o_crm_mobile_activity_type option").sort()).toEqual([
+        "Email",
+        "Upload Document",
+    ]);
+    await contains(".o_crm_mobile_activity_save").click();
+    expect(".o_crm_mobile_activity_form").toHaveCount(1);
+    expect(".o_crm_mobile_activity_summary").toHaveValue("Book the visit");
+    expect(".o_crm_mobile_activity_type").toHaveClass("is-invalid");
+    expect(".o_crm_mobile_activity_form .invalid-feedback").toHaveText(
+        "An activity type is required."
+    );
+    expect(received).toHaveLength(1);
+
+    await contains(".o_crm_mobile_activity_type").select("28");
+    await contains(".o_crm_mobile_activity_save").click();
+    await animationFrame();
+    expect(received.map(({ args }) => args[0][0])).toEqual([
+        followUpValues,
+        { ...followUpValues, summary: "Book the visit" },
+    ]);
+    expect(".o_crm_mobile_activity_form").toHaveCount(0);
+    expect(queued("mail.activity")).toEqual([]);
+    expect(calls.filter((call) => WRITE_CALL.test(call))).toEqual([
+        "mail.activity/create",
+        "mail.activity/create",
+    ]);
+    observer.disconnect();
+    expect([...typeOptionCounts].sort()).toEqual([2, 3]);
 });
 
 test.tags("mobile");
@@ -4000,7 +4712,6 @@ test("mobile activities: a dropped connection queues an online action and keeps 
     expect(done.args).toEqual([[2]]);
     expect(`${activityRow(2)} .o_crm_mobile_activity_done`).toHaveText("Done · Pending sync");
 
-    // Replayed once reconnected.
     await reconnect(setOffline);
     expect(queued("mail.activity")).toEqual([]);
     expect(MockServer.env["mail.activity"].search_count([["id", "=", 2]])).toBe(0);
@@ -4127,7 +4838,6 @@ test("mobile activities: Cancel is disabled while a save runs and only the saved
     expect(".o_crm_mobile_activity_pending").toHaveCount(0);
     expect(activityTitles()).toInclude("Call");
 
-    // A form opened afterwards can be cancelled again.
     await contains(".o_crm_mobile_schedule_followup").click();
     expect(".o_crm_mobile_activity_cancel").toBeEnabled();
     await contains(".o_crm_mobile_activity_cancel").click();
@@ -4598,81 +5308,63 @@ async function addOfficeDesignActivities() {
     );
 }
 
-/** `localStorage` key of the activity page sizes "Show more" remembers, per scope. */
-const ACTIVITY_LIMITS_KEY = "crm.mobile_activity_limits";
-
-/**
- * Activity page sizes remembered by "Show more", `{[scope]: limit}`, or `null`
- * when none is. Hoot mocks `localStorage` and empties it after every test.
- */
-function rememberedActivityLimits() {
-    const stored = browser.localStorage.getItem(ACTIVITY_LIMITS_KEY);
-    return stored === null ? null : JSON.parse(stored);
-}
-
 test.tags("mobile");
-test("mobile activities: remembered page sizes ignore unreadable values and keep the latest scopes", async () => {
-    // No page size is remembered when the test starts.
-    expect(rememberedActivityLimits()).toBe(null);
-    expect(getCrmActivityLimit("lead:1:1")).toBe(ACTIVITY_PAGE);
-
-    // Unreadable or meaningless values read as the first page.
-    browser.localStorage.setItem(ACTIVITY_LIMITS_KEY, "{not json");
-    expect(getCrmActivityLimit("lead:1:1")).toBe(ACTIVITY_PAGE);
-    browser.localStorage.setItem(ACTIVITY_LIMITS_KEY, JSON.stringify([10]));
-    expect(getCrmActivityLimit("0")).toBe(ACTIVITY_PAGE);
-    browser.localStorage.setItem(
-        ACTIVITY_LIMITS_KEY,
-        JSON.stringify({ "lead:1:1": "10", "lead:1:2": 7.5, "lead:1:3": 3, "lead:1:4": 15 })
-    );
-    expect(getCrmActivityLimit("lead:1:1")).toBe(ACTIVITY_PAGE);
-    expect(getCrmActivityLimit("lead:1:2")).toBe(ACTIVITY_PAGE);
-    expect(getCrmActivityLimit("lead:1:3")).toBe(ACTIVITY_PAGE);
-    expect(getCrmActivityLimit("lead:1:4")).toBe(15);
-    // A write keeps the valid page sizes only, and a page size back to the first
-    // page forgets its scope.
-    setCrmActivityLimit("lead:1:5", 2 * ACTIVITY_PAGE);
-    expect(rememberedActivityLimits()).toEqual({ "lead:1:4": 15, "lead:1:5": 2 * ACTIVITY_PAGE });
-    setCrmActivityLimit("lead:1:4", ACTIVITY_PAGE);
-    setCrmActivityLimit("lead:1:5", ACTIVITY_PAGE);
-    expect(rememberedActivityLimits()).toBe(null);
-
-    // The 50 most recently set scopes are kept: setting one again makes it the most
-    // recent, and the least recent are dropped.
-    for (let id = 1; id <= 50; id++) {
-        setCrmActivityLimit(`lead:1:${id}`, 2 * ACTIVITY_PAGE);
-    }
-    setCrmActivityLimit("lead:1:1", 15);
-    setCrmActivityLimit("lead:1:51", 2 * ACTIVITY_PAGE);
-    const scopes = Object.keys(rememberedActivityLimits());
-    expect(scopes).toHaveLength(50);
-    expect(scopes[0]).toBe("lead:1:3");
-    expect(scopes.slice(-2)).toEqual(["lead:1:1", "lead:1:51"]);
-    expect(getCrmActivityLimit("lead:1:2")).toBe(ACTIVITY_PAGE);
-    expect(getCrmActivityLimit("lead:1:1")).toBe(15);
-
-    // A storage that cannot be read or written: the first page, and no error.
-    patchWithCleanup(browser.localStorage, {
-        getItem() {
-            throw new Error("Storage disabled");
-        },
-        setItem() {
-            throw new Error("Storage quota exceeded");
-        },
-        removeItem() {
-            throw new Error("Storage disabled");
-        },
+test("mobile activities: a page size raised by Show more lasts for its search in the session, in memory only", async () => {
+    expect.errors(1);
+    await addOfficeDesignActivities();
+    let rejectRootLoad = false;
+    onRpc("crm.lead", "web_read_group", () => {
+        if (rejectRootLoad) {
+            rejectRootLoad = false;
+            throw makeServerError({ message: "Leads reload failed" });
+        }
     });
-    expect(getCrmActivityLimit("lead:1:1")).toBe(ACTIVITY_PAGE);
-    expect(() => setCrmActivityLimit("lead:1:1", 20)).not.toThrow();
-    expect(() => setCrmActivityLimit("lead:1:1", ACTIVITY_PAGE)).not.toThrow();
+    // Registered after the rejection, so that it records the rejected load too.
+    const specs = rootSpecs();
+    const limits = () =>
+        specs
+            .filter(({ method }) => method === "web_read_group")
+            .map(({ specification }) => specification.activity_ids.limit);
+    await mountWithCleanup(WebClient);
+    await openAction(ACTION_ID);
+    expect(limits()).toEqual([ACTIVITY_PAGE]);
+
+    // "Show more" raises the page size of the pipeline's search and stores nothing
+    // in the browser storage.
+    await openActivities("Office Design");
+    await contains(".o_crm_mobile_activities_load_more").click();
+    await animationFrame();
+    expect(limits()).toEqual([ACTIVITY_PAGE, 2 * ACTIVITY_PAGE]);
+    expect(Object.keys(browser.localStorage).filter((key) => key.startsWith("crm."))).toEqual([]);
+    await closeSheet();
+
+    // Opened again in the session, the pipeline requests the raised page size.
+    await openAction(ACTION_ID);
+    expect(limits()).toEqual([ACTIVITY_PAGE, 2 * ACTIVITY_PAGE, 2 * ACTIVITY_PAGE]);
+    await openActivities("Office Design");
+    expect(activityTitles()).toEqual(OFFICE_DESIGN_ACTIVITIES);
+    await closeSheet();
+
+    // Another search keeps the first page.
+    await openAction(LEADS_ACTION_ID);
+    expect(limits()).toEqual([ACTIVITY_PAGE, 2 * ACTIVITY_PAGE, 2 * ACTIVITY_PAGE, ACTIVITY_PAGE]);
+
+    // A failed "Show more" puts its search back at the first page, and the
+    // pipeline's search keeps its raised page size.
+    rejectRootLoad = true;
+    await openActivities("Office Design");
+    await contains(".o_crm_mobile_activities_load_more").click();
+    await animationFrame();
+    expect.verifyErrors(["Leads reload failed"]);
+    await closeSheet();
+    await openAction(LEADS_ACTION_ID);
+    await openAction(ACTION_ID);
+    expect(limits().slice(4)).toEqual([2 * ACTIVITY_PAGE, ACTIVITY_PAGE, 2 * ACTIVITY_PAGE]);
 });
 
 test.tags("mobile");
 test("mobile activities: the pipeline loads one page of activities and shows more online", async () => {
     expect.errors(2);
-    // No page size is remembered when the test starts.
-    expect(rememberedActivityLimits()).toBe(null);
     await addOfficeDesignActivities();
     const setOffline = mockOffline();
     const specs = rootSpecs();
@@ -4708,10 +5400,6 @@ test("mobile activities: the pipeline loads one page of activities and shows mor
     expect(activityTitles()).toEqual(OFFICE_DESIGN_ACTIVITIES);
     expect(".o_crm_mobile_activities_more_online").toHaveCount(0);
     expect(".o_crm_mobile_activities_more").toHaveCount(0);
-    // The larger page size is remembered for the pipeline action and its search.
-    const remembered = rememberedActivityLimits();
-    expect(Object.values(remembered)).toEqual([2 * ACTIVITY_PAGE]);
-    expect(Object.keys(remembered)[0]).toMatch(new RegExp(`^pipeline:crm\\.lead:${ACTION_ID}:`));
     // A lead with fewer activities than a page has nothing more to show.
     await closeSheet();
     await contains(".o_crm_mobile_pipeline_next").click();
@@ -4720,9 +5408,14 @@ test("mobile activities: the pipeline loads one page of activities and shows mor
     expect(".o_crm_mobile_activities_more_online").toHaveCount(0);
     expect(".o_crm_mobile_activities_more").toHaveCount(0);
     await closeSheet();
+    // The Leads action's search, visited online, loads and caches the first page.
+    await openAction(LEADS_ACTION_ID);
+    expect(rootLoads()).toHaveLength(3);
+    expect(rootLoads()[2].specification.activity_ids.limit).toBe(ACTIVITY_PAGE);
 
-    // Offline, the pipeline mounted again asks for the remembered page size: its
-    // root load is served from the cache with every activity the visit showed.
+    // Offline, the pipeline opened again in this session asks for the raised page
+    // size: its root load is served from the cache with every activity the visit
+    // showed.
     await setOffline(true);
     calls.length = 0;
     await openAction(ACTION_ID);
@@ -4735,10 +5428,9 @@ test("mobile activities: the pipeline loads one page of activities and shows mor
     expect(calls.filter((call) => call.startsWith("mail.activity/"))).toEqual([]);
     await closeSheet();
 
-    // Without a remembered page size, the pipeline asks for the first page, which
-    // the first visit cached: the others wait for sync, with no "Show more".
-    browser.localStorage.removeItem(ACTIVITY_LIMITS_KEY);
-    await openAction(ACTION_ID);
+    // A search whose page size was not raised asks for the first page, which its
+    // online visit cached: the others wait for sync, with no "Show more".
+    await openAction(LEADS_ACTION_ID);
     expect(".o_crm_mobile_pipeline_body .o_view_nocontent").toHaveCount(0);
     await openActivities("Office Design");
     expect(activityTitles()).toEqual(OFFICE_DESIGN_ACTIVITIES.slice(0, ACTIVITY_PAGE));
@@ -4871,10 +5563,59 @@ test("mobile activities: types warmed on reconnection enable a sheet opened offl
 });
 
 test.tags("mobile");
+test("mobile activities: the same pipeline retries a failed type warm-up on reconnection and on its return to a small screen", async () => {
+    // No activity or lead has a type, so the root loads cache none, and the first
+    // two warm-ups fail.
+    mailModels.MailActivity._records = ACTIVITY_RECORDS.map((record) => ({
+        ...record,
+        activity_type_id: false,
+    }));
+    await makeMockServer();
+    MockServer.env["crm.lead"].write([1, 4], { activity_type_id: false });
+    const warmUps = [];
+    onRpc("mail.activity.type", "web_search_read", () => {
+        warmUps.push(warmUps.length + 1);
+        if (warmUps.length <= 2) {
+            throw makeServerError({ message: "Temporarily unavailable" });
+        }
+    });
+    const setOffline = mockOffline();
+    await mountPipeline();
+    await animationFrame();
+    expect(warmUps).toEqual([1]);
+    expect(await cachedActivityTypeIds()).toEqual([]);
+
+    // Reconnected: the same mounted pipeline warms the types again.
+    await setOffline(true);
+    await reconnect(setOffline);
+    expect(warmUps).toEqual([1, 2]);
+    expect(await cachedActivityTypeIds()).toEqual([]);
+
+    // On a wide screen, no warm-up: it is a mobile-only request.
+    await resize({ width: 1366, height: 768 });
+    await animationFrame();
+    expect(".o_crm_mobile_pipeline").toHaveCount(0);
+    expect(warmUps).toEqual([1, 2]);
+
+    // Back on a small screen: the same pipeline tries again, and succeeds.
+    await resize({ width: 375, height: 667 });
+    await animationFrame();
+    expect(".o_crm_mobile_pipeline").toHaveCount(1);
+    expect(warmUps).toEqual([1, 2, 3]);
+    expect(await cachedActivityTypeIds()).toEqual([1, CALL_TYPE_ID, 28]);
+    await openActivities("Office Design");
+    expect(".o_crm_mobile_log_call").toBeEnabled();
+    await closeSheet();
+
+    // Once warmed, a reconnection warms nothing more in this session.
+    await setOffline(true);
+    await reconnect(setOffline);
+    expect(warmUps).toEqual([1, 2, 3]);
+});
+
+test.tags("mobile");
 test("mobile activities: the phone lead form loads one page of activities and shows more online", async () => {
     expect.errors(4);
-    // No page size is remembered when the test starts.
-    expect(rememberedActivityLimits()).toBe(null);
     await addOfficeDesignActivities();
     const setOffline = mockOffline();
     const specs = [];
@@ -4926,10 +5667,6 @@ test("mobile activities: the phone lead form loads one page of activities and sh
     expect(activityTitles()).toEqual(OFFICE_DESIGN_ACTIVITIES);
     expect(".o_crm_mobile_activities_more_online").toHaveCount(0);
     expect(".o_crm_mobile_activities_more").toHaveCount(0);
-    // The larger page size is remembered for this lead of this action only.
-    expect(rememberedActivityLimits()).toEqual({
-        [`lead:${ACTION_ID}:1`]: 2 * ACTIVITY_PAGE,
-    });
     // The edit is still the form's own, and the form saves it.
     await closeSheet();
     expect(".o_field_widget[name=name] input").toHaveValue("Office Design Plus");
@@ -4982,10 +5719,9 @@ test("mobile activities: the phone lead form loads one page of activities and sh
 test.tags("mobile");
 test("mobile activities: a failed show-more reload keeps one page of activities", async () => {
     expect.errors(1);
-    // No page size is remembered when the test starts.
-    expect(rememberedActivityLimits()).toBe(null);
     await addOfficeDesignActivities();
     const setOffline = mockOffline();
+    /** Activity page size of every root load request, the held one included. */
     const limits = [];
     let rejectRootLoad = false;
     onRpc("crm.lead", "web_read_group", ({ kwargs }) => {
@@ -5002,6 +5738,8 @@ test("mobile activities: a failed show-more reload keeps one page of activities"
         if (isRootLoad && heldRootLoad) {
             const { promise } = heldRootLoad;
             heldRootLoad = null;
+            const { params } = await request.json();
+            limits.push(params.kwargs.unfold_read_specification.activity_ids.limit);
             await promise;
             return new Response("", { status: 502 });
         }
@@ -5018,16 +5756,15 @@ test("mobile activities: a failed show-more reload keeps one page of activities"
     expect(".o_bottom_sheet .o_crm_mobile_lead_activities_sheet").toHaveCount(1);
     expect(activityTitles()).toEqual(OFFICE_DESIGN_ACTIVITIES.slice(0, ACTIVITY_PAGE));
     expect(".o_crm_mobile_activities_load_more").toBeEnabled();
-    // The larger page was not loaded: the remembered page size is the first page.
-    expect(rememberedActivityLimits()).toBe(null);
 
     // The connection is lost during the reload: CRM code raises no error, and the
     // pipeline and the open sheet keep the loaded page, the others waiting for sync.
     heldRootLoad = Promise.withResolvers();
     const held = heldRootLoad;
     await contains(".o_crm_mobile_activities_load_more").click();
-    // Remembered before the reload, which reads it...
-    expect(Object.values(rememberedActivityLimits())).toEqual([2 * ACTIVITY_PAGE]);
+    // The larger page was not loaded: the remembered page size is the first page,
+    // so this reload asks for one more page again...
+    expect(limits).toEqual([ACTIVITY_PAGE, 2 * ACTIVITY_PAGE, 2 * ACTIVITY_PAGE]);
     await setOffline(true);
     held.resolve();
     await animationFrame();
@@ -5039,30 +5776,32 @@ test("mobile activities: a failed show-more reload keeps one page of activities"
     expect(activityTitles()).toEqual(OFFICE_DESIGN_ACTIVITIES.slice(0, ACTIVITY_PAGE));
     expect(".o_crm_mobile_activities_more").toHaveText("2 more activities after sync");
     expect(".o_crm_mobile_activities_load_more").toHaveCount(0);
-    expect(limits).toEqual([ACTIVITY_PAGE, 2 * ACTIVITY_PAGE]);
-    // ...and forgotten again, since the larger page was neither loaded nor cached.
-    expect(rememberedActivityLimits()).toBe(null);
-
-    // The previous limit was restored each time: back online, the pipeline reloads
-    // one page, and "Show more" asks for one more page only.
+    expect(limits).toEqual([ACTIVITY_PAGE, 2 * ACTIVITY_PAGE, 2 * ACTIVITY_PAGE]);
+    // ...and forgotten again, since the larger page was neither loaded nor cached:
+    // back online, the pipeline reloads one page, and "Show more" asks for one more
+    // page only.
     await reconnect(setOffline);
-    expect(limits).toEqual([ACTIVITY_PAGE, 2 * ACTIVITY_PAGE, ACTIVITY_PAGE]);
+    expect(limits).toEqual([ACTIVITY_PAGE, 2 * ACTIVITY_PAGE, 2 * ACTIVITY_PAGE, ACTIVITY_PAGE]);
     expect(".o_bottom_sheet .o_crm_mobile_lead_activities_sheet").toHaveCount(1);
     expect(activityTitles()).toEqual(OFFICE_DESIGN_ACTIVITIES.slice(0, ACTIVITY_PAGE));
     await contains(".o_crm_mobile_activities_load_more").click();
     await animationFrame();
-    expect(limits).toEqual([ACTIVITY_PAGE, 2 * ACTIVITY_PAGE, ACTIVITY_PAGE, 2 * ACTIVITY_PAGE]);
+    expect(limits).toEqual([
+        ACTIVITY_PAGE,
+        2 * ACTIVITY_PAGE,
+        2 * ACTIVITY_PAGE,
+        ACTIVITY_PAGE,
+        2 * ACTIVITY_PAGE,
+    ]);
     expect(activityTitles()).toEqual(OFFICE_DESIGN_ACTIVITIES);
-    expect(Object.values(rememberedActivityLimits())).toEqual([2 * ACTIVITY_PAGE]);
 });
 
 test.tags("mobile");
 test("mobile activities: a show-more reload served the desktop variant keeps one page of activities", async () => {
     expect.errors(1);
-    // No page size is remembered when the test starts.
-    expect(rememberedActivityLimits()).toBe(null);
     await addOfficeDesignActivities();
     const setOffline = mockOffline();
+    /** Activity page size of every root load request, the held one included. */
     const limits = [];
     onRpc("crm.lead", "web_read_group", ({ kwargs }) => {
         limits.push(kwargs.unfold_read_specification.activity_ids.limit ?? null);
@@ -5074,6 +5813,8 @@ test("mobile activities: a show-more reload served the desktop variant keeps one
         if (isRootLoad && heldRootLoad) {
             const { promise } = heldRootLoad;
             heldRootLoad = null;
+            const { params } = await request.json();
+            limits.push(params.kwargs.unfold_read_specification.activity_ids.limit ?? null);
             await promise;
             return new Response("", { status: 502 });
         }
@@ -5097,7 +5838,7 @@ test("mobile activities: a show-more reload served the desktop variant keeps one
     heldRootLoad = Promise.withResolvers();
     const held = heldRootLoad;
     await contains(".o_crm_mobile_activities_load_more").click();
-    expect(Object.values(rememberedActivityLimits())).toEqual([2 * ACTIVITY_PAGE]);
+    expect(limits).toEqual([null, ACTIVITY_PAGE, 2 * ACTIVITY_PAGE]);
     await setOffline(true);
     held.resolve();
     await animationFrame();
@@ -5108,19 +5849,23 @@ test("mobile activities: a show-more reload served the desktop variant keeps one
     expect(activityTitles()).toEqual(["Follow-up call"]);
     expect(".o_crm_mobile_activities_more").toHaveText("6 more activities after sync");
     expect(".o_crm_mobile_activities_load_more").toHaveCount(0);
-    expect(rememberedActivityLimits()).toBe(null);
-    expect(limits).toEqual([null, ACTIVITY_PAGE]);
+    expect(limits).toEqual([null, ACTIVITY_PAGE, 2 * ACTIVITY_PAGE]);
 
     // Back online, the fallback ends with a reload of the first page, and "Show
     // more" loads the next one.
     await reconnect(setOffline);
-    expect(limits).toEqual([null, ACTIVITY_PAGE, ACTIVITY_PAGE]);
+    expect(limits).toEqual([null, ACTIVITY_PAGE, 2 * ACTIVITY_PAGE, ACTIVITY_PAGE]);
     expect(activityTitles()).toEqual(OFFICE_DESIGN_ACTIVITIES.slice(0, ACTIVITY_PAGE));
     await contains(".o_crm_mobile_activities_load_more").click();
     await animationFrame();
-    expect(limits).toEqual([null, ACTIVITY_PAGE, ACTIVITY_PAGE, 2 * ACTIVITY_PAGE]);
+    expect(limits).toEqual([
+        null,
+        ACTIVITY_PAGE,
+        2 * ACTIVITY_PAGE,
+        ACTIVITY_PAGE,
+        2 * ACTIVITY_PAGE,
+    ]);
     expect(activityTitles()).toEqual(OFFICE_DESIGN_ACTIVITIES);
-    expect(Object.values(rememberedActivityLimits())).toEqual([2 * ACTIVITY_PAGE]);
     // The framework's cached root load (the desktop variant), served offline.
     expect.verifyErrors(["/web/dataset/call_kw/crm.lead/web_read_group"]);
 });
@@ -5128,11 +5873,9 @@ test("mobile activities: a show-more reload served the desktop variant keeps one
 test.tags("mobile");
 test("mobile activities: a failed phone form show-more reload keeps one page of activities", async () => {
     expect.errors(3);
-    // No page size is remembered when the test starts.
-    expect(rememberedActivityLimits()).toBe(null);
     await addOfficeDesignActivities();
     const setOffline = mockOffline();
-    /** `[resId, activity limit]` of every lead form root load reaching the server. */
+    /** `[resId, activity limit]` of every lead form root load request, the held one included. */
     const loads = [];
     let rejectLoad = false;
     onRpc("crm.lead", "web_read", ({ args, kwargs }) => {
@@ -5149,11 +5892,15 @@ test("mobile activities: a failed phone form show-more reload keeps one page of 
         if (isLeadLoad && heldLoad) {
             const { promise } = heldLoad;
             heldLoad = null;
+            const { params } = await request.json();
+            loads.push([
+                params.args[0][0],
+                params.kwargs.specification.activity_ids?.limit ?? null,
+            ]);
             await promise;
             return new Response("", { status: 502 });
         }
     });
-    const scope = `lead:${ACTION_ID}:1`;
     // Visited online at desktop size first, which caches the desktop variant of the
     // lead's form; resized to mobile, the pager loads each lead with one page.
     await resize({ width: 1366, height: 768 });
@@ -5183,7 +5930,6 @@ test("mobile activities: a failed phone form show-more reload keeps one page of 
     expect.verifyErrors(["Lead reload failed"]);
     expect(loads.at(-1)).toEqual([1, 2 * ACTIVITY_PAGE]);
     expect(activityTitles()).toEqual(OFFICE_DESIGN_ACTIVITIES.slice(0, ACTIVITY_PAGE));
-    expect(rememberedActivityLimits()).toBe(null);
 
     // The connection is lost during "Show more": the lead is refreshed in place, so
     // the form keeps the lead and the page it shows (the cached desktop variant
@@ -5192,7 +5938,11 @@ test("mobile activities: a failed phone form show-more reload keeps one page of 
     heldLoad = Promise.withResolvers();
     const held = heldLoad;
     await contains(".o_crm_mobile_activities_load_more").click();
-    expect(rememberedActivityLimits()).toEqual({ [scope]: 2 * ACTIVITY_PAGE });
+    // One more page than the first again: the failed refresh raised nothing.
+    expect(loads.slice(3)).toEqual([
+        [1, 2 * ACTIVITY_PAGE],
+        [1, 2 * ACTIVITY_PAGE],
+    ]);
     await setOffline(true);
     held.resolve();
     await animationFrame();
@@ -5204,7 +5954,6 @@ test("mobile activities: a failed phone form show-more reload keeps one page of 
     expect(".o_crm_mobile_activities_more").toHaveText("2 more activities after sync");
     expect(".o_crm_mobile_activities_notice").toHaveCount(0);
     expect(".o_crm_mobile_activities_load_more").toHaveCount(0);
-    expect(rememberedActivityLimits()).toBe(null);
     const loadCount = loads.length;
 
     // Back online, the form needs no reload, and "Show more" loads the next page.
@@ -5215,7 +5964,6 @@ test("mobile activities: a failed phone form show-more reload keeps one page of 
     await animationFrame();
     expect(loads.at(-1)).toEqual([1, 2 * ACTIVITY_PAGE]);
     expect(activityTitles()).toEqual(OFFICE_DESIGN_ACTIVITIES);
-    expect(rememberedActivityLimits()).toEqual({ [scope]: 2 * ACTIVITY_PAGE });
     await closeSheet();
 
     // The in-place refresh is the form's own root load: offline, the pager leaves
@@ -5239,8 +5987,6 @@ test("mobile activities: a failed phone form show-more reload keeps one page of 
 
 test.tags("mobile");
 test("mobile activities: a phone form show-more refresh keeps the edits made while it loads", async () => {
-    // No page size is remembered when the test starts.
-    expect(rememberedActivityLimits()).toBe(null);
     await addOfficeDesignActivities();
     /** `[resId, activity limit]` of every lead form root load reaching the server. */
     const loads = [];
@@ -5271,7 +6017,6 @@ test("mobile activities: a phone form show-more refresh keeps the edits made whi
     const calls = trackCalls();
     const serverLead = () =>
         MockServer.env["crm.lead"].search_read([["id", "=", 1]], ["name", "contact_name"])[0];
-    const scope = `lead:${ACTION_ID}:1`;
     await mountWithCleanup(WebClient);
     await getService("action").doAction(ACTION_ID, {
         clearBreadcrumbs: true,
@@ -5306,7 +6051,6 @@ test("mobile activities: a phone form show-more refresh keeps the edits made whi
     ).toEqual(["crm.lead/web_read"]);
     expect(calls.filter((call) => call.startsWith("mail.activity/"))).toEqual([]);
     expect(serverLead().name).toBe("Office Design");
-    expect(rememberedActivityLimits()).toEqual({ [scope]: 2 * ACTIVITY_PAGE });
     await contains(".o_crm_mobile_activities_button").click();
     expect(activityTitles()).toEqual(OFFICE_DESIGN_ACTIVITIES);
     expect(".o_crm_mobile_activities_more_online").toHaveCount(0);
@@ -5317,22 +6061,22 @@ test("mobile activities: a phone form show-more refresh keeps the edits made whi
     expect(serverLead().name).toBe("Office Design Deluxe");
     expect(serverLead().contact_name).toBe("Ann Example");
 
-    // The lead's page size goes back to one page, then a pager move saving an edit
-    // reuses the record for the next lead while "Show more" waits for it: the first
-    // lead did not get the larger page, so its page size is forgotten again.
-    browser.localStorage.removeItem(ACTIVITY_LIMITS_KEY);
+    // A pager move saving an edit reuses the record for the next lead while "Show
+    // more" waits for it: the first lead did not get the larger page, so its page
+    // size goes back to the one it had.
     await contains(".o_field_widget[name=name] input").edit("Office Design");
     const pagerSave = holdNext("/crm.lead/web_save");
     await contains(".o_pager_next").click();
     await pagerSave.reached.promise;
     const showMore = controllers.at(-1).crmLoadMoreActivities(1);
-    expect(rememberedActivityLimits()).toEqual({ [scope]: 2 * ACTIVITY_PAGE });
     pagerSave.release.resolve();
     await showMore;
     await animationFrame();
     expect(".o_field_widget[name=name] input").toHaveValue("Quote for Chairs");
     expect(loads.at(-1)).toEqual([2, ACTIVITY_PAGE]);
-    expect(rememberedActivityLimits()).toBe(null);
+    await contains(".o_pager_previous").click();
+    expect(".o_field_widget[name=name] input").toHaveValue("Office Design");
+    expect(loads.at(-1)).toEqual([1, 2 * ACTIVITY_PAGE]);
 });
 
 test.tags("mobile");
@@ -5420,6 +6164,73 @@ test("mobile lead form reconnected during its first load leaves the desktop fall
     expect(loads).toEqual(["desktop", "mobile", "desktop"]);
 });
 
+test.tags("mobile");
+test("lead form fallback widened offline reconnects without a desktop root read", async () => {
+    expect.errors(2);
+    const setOffline = mockOffline();
+    /** Variant of every lead form root load reaching the server. */
+    const loads = [];
+    onRpc("crm.lead", "web_read", ({ kwargs }) => {
+        loads.push(kwargs.specification.activity_ids ? "mobile" : "desktop");
+    });
+    const calls = trackCalls();
+    const leadCalls = () => calls.filter((call) => call.startsWith("crm.lead/"));
+    // Visited online at desktop size first, which caches the desktop variant of both
+    // leads' forms; resized to mobile, the mounted form is reused (its view
+    // description is cached per screen size).
+    await resize({ width: 1366, height: 768 });
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(ACTION_ID, {
+        clearBreadcrumbs: true,
+        viewType: "form",
+        props: { resId: 1, resIds: [1, 2] },
+    });
+    await contains(".o_pager_next").click();
+    await contains(".o_pager_previous").click();
+    expect(loads).toEqual(["desktop", "desktop", "desktop"]);
+    await resize({ width: 375, height: 667 });
+    await animationFrame();
+
+    // Offline on the phone, the pager asks for the phone variant of the next lead,
+    // which was never cached: the form falls back to its cached desktop variant.
+    await setOffline(true);
+    await contains(".o_pager_next").click();
+    expect(".o_field_widget[name=name] input").toHaveValue("Quote for Chairs");
+    expect(".o_crm_mobile_activities_button").toHaveCount(1);
+
+    // Widened while still offline, then reconnected with nothing queued: the root
+    // already holds the desktop variant, so the form issues no lead request.
+    await resize({ width: 1366, height: 768 });
+    await animationFrame();
+    calls.length = 0;
+    await reconnect(setOffline);
+    expect(leadCalls()).toEqual([]);
+    expect(loads).toEqual(["desktop", "desktop", "desktop"]);
+    expect(".o_field_widget[name=name] input").toHaveValue("Quote for Chairs");
+    expect(".o_crm_mobile_activities_button").toHaveCount(0);
+    expect(".o_error_dialog").toHaveCount(0);
+
+    // A fallback that stays on the phone ends at the reconnection with one reload
+    // of the phone variant, whose activity rows the sheet lists.
+    await resize({ width: 375, height: 667 });
+    await animationFrame();
+    await setOffline(true);
+    await contains(".o_pager_previous").click();
+    expect(".o_field_widget[name=name] input").toHaveValue("Office Design");
+    calls.length = 0;
+    await reconnect(setOffline);
+    expect(leadCalls()).toEqual(["crm.lead/web_read"]);
+    expect(loads).toEqual(["desktop", "desktop", "desktop", "mobile"]);
+    await contains(".o_crm_mobile_activities_button").click();
+    expect(activityTitles()).toEqual(["Follow-up call", "Send brochure"]);
+    expect(".o_crm_mobile_activities_notice").toHaveCount(0);
+    // The framework's cached root loads (the desktop variant), served offline.
+    expect.verifyErrors([
+        "/web/dataset/call_kw/crm.lead/web_read",
+        "/web/dataset/call_kw/crm.lead/web_read",
+    ]);
+});
+
 // -----------------------------------------------------------------------------
 // Lead form on a phone: partner field and stage statusbar
 // -----------------------------------------------------------------------------
@@ -5497,16 +6308,12 @@ test("[Offline] phone partner field searches cached names with zero requests and
     expect(save.args[0]).toEqual([2]);
     expect(save.args[1].partner_id).toBe(102);
 
-    // No request reached the server. The attempts the lost network refused are the
-    // framework's own: its record search, which falls back to the cached partners,
-    // and its record save, which queues the call. No `name_search`, no select-create
-    // dialog, no enrichment lookup.
+    // No request reached the server. The record searches read the cached partners
+    // without attempting any request; the only attempt the lost network refused is
+    // the framework's record save, which queues the call. No `name_search`, no
+    // select-create dialog, no enrichment lookup.
     expect(serverCalls).toEqual([]);
-    expect(
-        attempts.filter(
-            (call) => !["res.partner/web_name_search", "crm.lead/web_save"].includes(call)
-        )
-    ).toEqual([]);
+    expect(attempts.filter((call) => call !== "crm.lead/web_save")).toEqual([]);
 });
 
 test.tags("mobile");
@@ -5701,7 +6508,7 @@ test("[Offline] stale enrichment and create options opened online do nothing", a
     await contains(RECORD_ITEM).click();
     expect(PARTNER_INPUT).toHaveValue("Azure Interior");
     expect(".o-autocomplete--dropdown-menu").toHaveCount(0);
-    // Online again, "Search more..." opens its dialog as before.
+    // Reconnected, Search more opens its dialog.
     await setOffline(false);
     await searchPartner("De");
     await contains(".o-autocomplete--dropdown-item.o_m2o_dropdown_option_search_more").click();
@@ -5808,11 +6615,9 @@ test("[Offline] form stage change queues through the statusbar", async () => {
 test.tags("mobile");
 test("[Offline] card stage choices after a move back to the server stage replay last", async () => {
     expect.errors(1);
-    const replayedStages = [];
-    onRpc("crm.lead", "web_save", ({ args }) => {
-        replayedStages.push(args[1].stage_id);
-    });
+    const received = receivedCalls("crm.lead", "web_save");
     const setOffline = mockOffline();
+    const calls = trackCalls();
     await mountWithCleanup(WebClient);
     await openAction(ACTION_ID);
     await contains(`${card("Office Design")} .o_crm_mobile_lead_open`).click();
@@ -5886,11 +6691,45 @@ test("[Offline] card stage choices after a move back to the server stage replay 
     await animationFrame();
     expect(".o_offline_systray_content").toHaveCount(0);
 
+    // Each a lead write with an empty specification, in the context of its Record: B
+    // in the form's (the pipeline context), the card's writes in the card's, which
+    // adds the `default_stage_id` the framework gives the stage group the lead was
+    // loaded in. B and the card's own write share a timestamp: either may come first.
+    const formContext = { ...user.context, ...PIPELINE_CONTEXT };
+    const cardContext = { ...formContext, default_stage_id: NEW };
+    const stageWrite = (stageId, context) => ({
+        model: "crm.lead",
+        method: "web_save",
+        args: [[1], { stage_id: stageId }],
+        kwargs: { context, specification: {} },
+    });
+    const firstWrites = [stageWrite(QUALIFIED, formContext), stageWrite(QUALIFIED, cardContext)];
+    const lastWrites = [
+        stageWrite(NEW, cardContext),
+        stageWrite(WON, cardContext),
+        stageWrite(QUALIFIED, cardContext),
+    ];
+    const queuedWrites = queued("crm.lead").map(ormCall);
+    expect(queuedWrites.slice(0, 2)).toEqual(firstWrites, { ignoreOrder: true });
+    expect(queuedWrites.slice(2)).toEqual(lastWrites);
+
     // Replayed in timestamp order (B and the card's own write, then A, C and D), the
     // last choice reaches the server last.
+    const replayStart = calls.length;
     await reconnect(setOffline);
     expect(queued("crm.lead")).toEqual([]);
-    expect(replayedStages).toEqual([QUALIFIED, QUALIFIED, NEW, WON, QUALIFIED]);
+    expect(received.map(({ args }) => args[1].stage_id)).toEqual([
+        QUALIFIED,
+        QUALIFIED,
+        NEW,
+        WON,
+        QUALIFIED,
+    ]);
+    expect(received.slice(0, 2)).toEqual(firstWrites, { ignoreOrder: true });
+    expect(received.slice(2)).toEqual(lastWrites);
+    expect(calls.slice(replayStart).filter((call) => WRITE_CALL.test(call))).toEqual(
+        Array(5).fill("crm.lead/web_save")
+    );
     expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(QUALIFIED);
     expect(cardNames()).toEqual(["Office Design", "Conference Room", "Lamps", "Storage Racks"]);
     expect(".modal").toHaveCount(0);

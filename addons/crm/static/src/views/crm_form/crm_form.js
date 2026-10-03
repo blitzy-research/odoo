@@ -31,36 +31,13 @@ import { Composer } from "@mail/core/common/composer";
 import {
     CRM_MOBILE_ACTIVITY_LIMIT,
     crmReportError,
-    getCrmActivityLimit,
     getCrmActivitySubfields,
-    setCrmActivityLimit,
     useCrmOffline,
 } from "@crm/mobile/crm_offline_hooks";
 import { CrmMobileLeadActivities } from "@crm/mobile/crm_mobile_lead_card/crm_mobile_lead_card";
 
-/**
- * Lead form (`js_class="crm_form"`) and its offline behaviour.
- *
- * Online, and on a wide screen, the lead form behaves exactly as before: every
- * addition below checks the connection (and, for mobile code, the small-screen
- * signal) and otherwise defers to the framework. Offline it consumes the framework
- * offline plugin only (`OfflinePlugin` through `usePlugin` or the model's
- * `offlinePlugin`, and the shared `useCrmOffline()` hooks); it owns no queue, cache
- * or store of its own:
- * - the post-save rainbowman lookup is skipped (decorative read);
- * - "Won" queues `action_set_won` and shows the lead as won locally;
- * - archive, unarchive and delete, queued by the framework, show their result at
- *   once, and that state is re-applied while the queued call waits;
- * - every other `object`/`action` button of the lead form is inert;
- * - on a phone the form loads the lead's activity rows with its own (cached) root
- *   load and opens the mobile activity sheet from the control panel;
- * - the chatter and composer of a lead are read-only.
- */
-
-/** Values the lead shows once won, applied locally (never saved) while offline. */
 const OFFLINE_WON_VALUES = Object.freeze({ won_status: "won", probability: 100 });
 
-/** `crm.lead` methods whose queued call puts the lead in its archived/unarchived state. */
 const ARCHIVE_METHODS = Object.freeze(["action_archive", "action_unarchive"]);
 
 /** Field types whose record value is a list (its change is a list of commands). */
@@ -169,7 +146,7 @@ class CrmFormRecord extends formView.Model.Record {
      * Offline, the framework queues `action_archive`/`action_unarchive` and returns
      * the queue key without changing `active`; the lead then shows its new state at
      * once (ribbon, Archive/Unarchive items), without registering a change. Online
-     * the parent reloads the record, as before.
+     * the parent reloads the record.
      *
      * @param {boolean} isArchive
      */
@@ -238,23 +215,18 @@ class CrmFormRecord extends formView.Model.Record {
     }
 
     /**
-     * Refreshes the lead with the server values (the cache offline) through the
-     * model's own root-load machinery (the controller's load variant, the RPC cache
-     * and `onRootLoaded`), keeping the form's unsaved changes. It runs in the model
-     * mutex and replaces no record, so an edit or a save made meanwhile waits behind
-     * it and applies to the refreshed record. Nothing happens once the model shows
-     * another record.
+     * Refreshes the lead in place from the server (the cache offline) through the
+     * model's root load, in the model mutex: no record is replaced, so an edit or a
+     * save made meanwhile waits and applies to the refreshed record. Unsaved changes
+     * are kept, and the controller's `onRootLoaded` then reapplies the state of the
+     * lead's queued calls. Nothing happens once the model shows another record.
      *
-     * - `dropRestored`: the changes still holding the value the form restored from
-     *   the record's queued save are dropped instead of kept (that save left the
-     *   queue: replayed, its values are the server's; discarded, they must not be
-     *   queued again by a later save);
-     * - `save` (online, a lead with an id): once the lead is refreshed, the changes
-     *   it kept, when there are any, are saved. The save starts from the refreshed
-     *   values, so what the CRM save adds from them (the email and phone to
-     *   synchronize with the partner) is the server's current state, never a value
-     *   from before the refresh. When the save does not happen (invalid record), the
-     *   changes stay in the form, unsaved.
+     * - `dropRestored`: drops the changes still holding the values restored from the
+     *   record's queued save, which left the queue: replayed, the server has them;
+     *   discarded, a later save must not queue them again;
+     * - `save` (online, a lead with an id): then saves the kept changes from the
+     *   refreshed values, so the email and phone synchronized with the partner are
+     *   the server's current ones.
      *
      * A request made while another one waits to start is merged into it.
      *
@@ -537,23 +509,18 @@ function crmActivityRelated() {
 }
 
 /**
- * Controller of the lead form (template `crm.CrmFormView`, a `primary` inherit of
- * `web.FormView` that adds the phone "Activities" button to the control panel).
+ * Controller of the standard lead form (template `crm.CrmFormView`, which adds the
+ * phone "Activities" button to the control panel).
  *
  * Offline it is the execution boundary of the lead form's buttons: "Won" is queued
- * as `action_set_won` (never `action_set_won_rainbowman`) and every other
- * `object`/`action` button is inert. It keeps the local state of the lead's queued
- * won, archive and delete while their calls wait, and refreshes the lead from the
- * server (or the cache offline), keeping the form's unsaved edits, when they leave
- * the queue by replay or discard; parked (rejected) entries stay queued, so their
- * local state stays and the offline systray shows the error.
+ * as `action_set_won` and every other `object`/`action` button is inert. The local
+ * state of the displayed lead's queued calls is shown while they wait, and the lead
+ * is reconciled when they leave the queue; parked entries stay queued and keep
+ * their local state.
  *
- * On a phone the root load also requests the lead's activity rows ("mobile
- * variant"); otherwise it requests exactly what the arch declares ("desktop
- * variant", the current specification). A root loaded on a phone takes the desktop
- * variant before its next save or onchange once the screen widened. Offline, when
- * the mobile variant was never cached, the load is retried once with the desktop
- * variant.
+ * On a phone the root load also requests the lead's activity rows (mobile variant);
+ * otherwise it requests what the arch declares (desktop variant). Offline, when the
+ * mobile variant was never cached, the load falls back to the desktop variant.
  */
 export class CrmFormController extends formView.Controller {
     static template = "crm.CrmFormView";
@@ -563,7 +530,6 @@ export class CrmFormController extends formView.Controller {
         this.crmOffline = useCrmOffline();
         this.crmActivitiesSheet = usePopover(CrmMobileLeadActivities, { useBottomSheet: true });
 
-        /** Offline fallback to the desktop variant of the root load is active. */
         this.crmDesktopFallback = false;
         /** @type {"mobile"|"desktop"} variant applied to the last root load */
         this.crmLastVariant = "desktop";
@@ -636,7 +602,9 @@ export class CrmFormController extends formView.Controller {
         // some of the lead's calls and left none of them queued, the server values
         // replace the local presentation (won, archived): edits made since the form
         // restored the lead's queued save are saved, while the replayed values it
-        // restored are not sent again. A parked call keeps the local presentation.
+        // restored are not sent again. A lead created offline (no id), whose create
+        // was replayed, is left instead (`crmLeaveCreatedLead`). A parked call keeps
+        // the local presentation.
         this.crmOffline.onReplayed(() => {
             if (this.crmHandOverKey && !this.crmOffline.isQueued(this.crmHandOverKey)) {
                 this.crmHandOverKey = null;
@@ -650,6 +618,10 @@ export class CrmFormController extends formView.Controller {
                 }
             }
             if (replayed && !ownKeys.size) {
+                const root = this.model.root;
+                if (root && !root.resId) {
+                    return this.crmOwn(this.crmLeaveCreatedLead(root));
+                }
                 return this.crmOwn(this.crmReconcile({ dropRestored: true, save: true }));
             }
         });
@@ -690,13 +662,17 @@ export class CrmFormController extends formView.Controller {
             }
         });
 
-        // Back online while the desktop-variant fallback is active: load the mobile
-        // variant again, keeping the form's changes.
+        // Back online, the desktop-variant fallback ends. A phone reloads the mobile
+        // variant, keeping the form's changes; a wide screen already shows the
+        // desktop variant and requests nothing.
         useEffect(() => {
             const isOffline = this.crmOffline.isOffline();
+            const isSmall = this.crmOffline.isSmall;
             if (!isOffline && this.crmDesktopFallback) {
                 this.crmDesktopFallback = false;
-                untrack(() => this.crmOwn(this.crmReconcile()));
+                if (isSmall) {
+                    untrack(() => this.crmOwn(this.crmReconcile()));
+                }
             }
         });
     }
@@ -750,13 +726,10 @@ export class CrmFormController extends formView.Controller {
     }
 
     /**
-     * Owns a promise this controller starts without a caller awaiting it (effects,
-     * queue callbacks, the deferred restoration of a queued save, the mount
-     * microtask). A lost connection is the sanctioned offline outcome (the cache or
-     * the next reconnection takes over) and ends there; any other error goes to the
-     * framework error handling, the way the action service shows an error of a
-     * mounted controller (`Promise.reject(error)` in its `onError`), once even when
-     * merged reconciliations share it (`crmReportError`).
+     * Owns a promise this controller starts without a caller awaiting it. A lost
+     * connection ends there (the cache or the next reconnection takes over); any
+     * other error is reported once to the framework error handling, even when merged
+     * reconciliations share it (`crmReportError`).
      *
      * @param {any} promise
      * @returns {Promise<void>} resolved once `promise` settled
@@ -766,17 +739,11 @@ export class CrmFormController extends formView.Controller {
     }
 
     /**
-     * Refreshes the displayed lead after its queued calls left the queue, or at the
-     * end of the offline fallback (from the cache when offline), keeping the form's
-     * unsaved changes as `CrmFormRecord.crmRefresh` describes; then shows its name
-     * and the state of its still-queued calls.
-     *
-     * Asked for while the form's first root load runs (the model is not ready yet),
-     * it runs once that load has completed, unless the controller is destroyed by
-     * then: that load may have read the lead, or chosen its load variant, before the
-     * replay, the discard or the reconnection. Requests made meanwhile then start
-     * together and are merged into one refresh (`crmRefresh`); none runs when the
-     * first load never completes.
+     * Refreshes the displayed lead through `CrmFormRecord.crmRefresh`, which defines
+     * the replay and discard options, then shows its name and the state of its
+     * still-queued calls. Asked for before the model is ready, it runs after the first
+     * root load, which may have read the lead before the replay, discard or
+     * reconnection; a destroyed controller is skipped.
      *
      * @param {{dropRestored?: boolean, save?: boolean}} [options]
      * @returns {Promise<void>}
@@ -888,6 +855,34 @@ export class CrmFormController extends formView.Controller {
         }
         this.crmHistoryBackDone = true;
         return this.env.config.historyBack();
+    }
+
+    /**
+     * Leaves the form of a lead created offline once the replay created it. The
+     * replay returns no id, so the form cannot show the created lead: it is left for
+     * the containing action, which loads it from the server (a dialog is closed),
+     * the exit the framework takes when a form has no record left. Unsaved edits are
+     * discarded first: they cannot reach the created lead, and leaving would save
+     * them as a second create. Nothing happens once the controller is destroyed or
+     * the model shows another record.
+     *
+     * @param {Object} root the new record whose create was replayed
+     * @returns {Promise<void>}
+     */
+    async crmLeaveCreatedLead(root) {
+        const isStale = () =>
+            status(this) === "destroyed" || toRaw(this.model.root) !== toRaw(root);
+        if ((await root.isDirty()) && !isStale()) {
+            await root.discard();
+        }
+        if (isStale()) {
+            return;
+        }
+        if (this.env.inDialog) {
+            await this.env.dialogData.close();
+        } else {
+            this.env.config.historyBack();
+        }
     }
 
     /**
@@ -1050,11 +1045,11 @@ export class CrmFormController extends formView.Controller {
 
     /**
      * @override
-     * Applies the load-specification variant before every root load (first load,
-     * reloads, pager moves), i.e. before its cache key is computed. The phone
-     * variant adds `activity_ids` with the activity sheet's sub-fields; the desktop
-     * variant is exactly what the arch declares. `config.activeFields` is replaced by
-     * a fresh object, never mutated, and `config.fields` is left as it is.
+     * Configures incoming root loads before their cache key is computed. Phone loads
+     * add the activity rows; desktop loads use the arch specification. A post-save
+     * reload keeps its existing specification, so its response matches the fields it
+     * requested. A replaced `activeFields` is a fresh object; `config.fields` is not
+     * changed.
      *
      * @param {Object} config root configuration about to be loaded
      */
@@ -1078,9 +1073,8 @@ export class CrmFormController extends formView.Controller {
         if (this.crmArchHasActivities || !currentActiveFields) {
             return;
         }
-        // The arch declares no `activity_ids`, so an entry present was added here.
         if (!mobile && !("activity_ids" in currentActiveFields)) {
-            return; // desktop variant already: the specification stays untouched
+            return;
         }
         const activeFields = { ...currentActiveFields };
         delete activeFields.activity_ids;
@@ -1093,15 +1087,14 @@ export class CrmFormController extends formView.Controller {
                     readonly: true,
                 },
             ]);
-            // Each lead has its own page size, read from the remembered preference,
-            // never from this controller: the lead's form opened again, even cold
-            // and offline, then issues the request of its last visit, whose cache
-            // key holds the page "Show more" reached. A new record has none.
+            // Each lead's page size is read from the session, not this controller:
+            // its form opened again in this session requests the page "Show more"
+            // reached, which its cache holds. A new record has none.
             activeFields.activity_ids = {
                 ...activeFields.activity_ids,
                 related: crmActivityRelated(),
                 limit: config.resId
-                    ? getCrmActivityLimit(this.crmActivityScope(config.resId))
+                    ? this.crmOffline.getActivityLimit(this.crmActivityScope(config.resId))
                     : CRM_MOBILE_ACTIVITY_LIMIT,
             };
         }
@@ -1146,21 +1139,14 @@ export class CrmFormController extends formView.Controller {
     /**
      * `crmLeaveMobileVariant` model hook, run before a request is built from the
      * root's own configuration (`onWillSaveRecord`, and the root's onchange in
-     * `CrmFormRecord._getOnchangeValues`). The root keeps the variant of its last
-     * root load until the next one, and widening the screen does not reload it, so
-     * a root loaded on a phone still holds the `activity_ids` the phone variant
-     * added. On a wide screen, `config.activeFields` is then replaced by a fresh
-     * object without that field (never mutated; `config.fields` is left as it is)
-     * and the root forgets the field's loaded value: the request is the desktop
-     * one, and its result is parsed with the fields it asked for. The form keeps
-     * its unsaved changes; the activity sheet is closed on a wide screen.
+     * `CrmFormRecord._getOnchangeValues`). On a wide screen, it removes the mobile-only
+     * `activity_ids` a phone root load added: `config.activeFields` is replaced by a
+     * fresh object without it and the root forgets its loaded value, so the request
+     * and the parsing of its result use the desktop fields. Unsaved changes are kept.
      *
-     * Nothing changes on a small screen (the phone variant, or the offline fallback
-     * that keeps the loaded rows of the displayed lead), for another configuration
-     * than the root's, for an arch declaring `activity_ids`, when the root already
-     * has the desktop variant, or when it holds a change of `activity_ids`. The
-     * phone variant is never applied here: the next root load on a small screen
-     * applies it (`onWillLoadRoot`).
+     * Nothing changes on a small screen, for another configuration than the root's,
+     * for an arch declaring `activity_ids`, or when the root holds a change of
+     * `activity_ids`.
      *
      * @param {Object} config configuration a request is about to be built from
      */
@@ -1176,10 +1162,8 @@ export class CrmFormController extends formView.Controller {
             return;
         }
         const currentActiveFields = toRaw(config.activeFields);
-        // The arch declares no `activity_ids`, so an entry present was added by the
-        // phone variant.
         if (!("activity_ids" in currentActiveFields)) {
-            return; // desktop variant already
+            return;
         }
         if (!root.crmForgetLoadedValue("activity_ids")) {
             return;
@@ -1191,9 +1175,9 @@ export class CrmFormController extends formView.Controller {
     }
 
     /**
-     * Scope of the activity page size remembered for the phone root load of the
-     * lead `resId`: the lead and the form's action, whose context is part of
-     * that load's request, hence of its cache key, like the page size.
+     * Scope of the session's activity page size for the phone root load of the
+     * lead `resId`: the lead and the form's action, whose context is part of that
+     * load's request and cache key.
      *
      * @param {number} resId
      * @returns {string}
@@ -1204,21 +1188,14 @@ export class CrmFormController extends formView.Controller {
 
     /**
      * `crmLoadMoreActivities` model hook, the activity sheet's "Show more": online
-     * on a phone, with the phone variant applied to the displayed lead `resId`,
-     * raises the activity rows it loads by one page (`CRM_MOBILE_ACTIVITY_LIMIT`)
-     * and refreshes the lead in place (`CrmFormRecord.crmRefresh`), so the larger
-     * page lands in the form's own (cached) root load. It never issues a separate
-     * `mail.activity` read. The refresh runs in the model mutex, replaces no
-     * record and keeps the form's unsaved changes: nothing is saved first, and an
-     * edit made while it runs waits behind it and applies to the refreshed lead.
+     * on a phone, with the phone variant applied to the displayed lead `resId`, it
+     * raises the lead's activity page by `CRM_MOBILE_ACTIVITY_LIMIT` and refreshes
+     * the lead in place (`CrmFormRecord.crmRefresh`), keeping unsaved changes, so the
+     * larger page comes from the form's own (cached) root request.
      *
-     * The lead's raised page size is remembered (`setCrmActivityLimit`) before the
-     * refresh, which reads it, so that the lead's form opened again issues the same
-     * request and is served the cached larger page offline. The previous page size
-     * is remembered again when the displayed lead did not load that page: the
-     * refresh failed (a lost connection resolves, any other error propagates), or
-     * it did not apply the phone variant with that page to this lead (the form
-     * moved to another record, or the screen widened, meanwhile).
+     * The lead's session page size is raised before the refresh, which reads it, and
+     * restored when the refresh fails (a lost connection resolves, any other error
+     * propagates) or the displayed lead did not load that page.
      *
      * @param {number} resId lead whose sheet asks for more activities
      * @returns {Promise<void>}
@@ -1236,13 +1213,13 @@ export class CrmFormController extends formView.Controller {
             return;
         }
         const scope = this.crmActivityScope(resId);
-        const previousLimit = getCrmActivityLimit(scope);
+        const previousLimit = this.crmOffline.getActivityLimit(scope);
         const limit = previousLimit + CRM_MOBILE_ACTIVITY_LIMIT;
-        setCrmActivityLimit(scope, limit);
+        this.crmOffline.setActivityLimit(scope, limit);
         try {
             await root.crmRefresh();
         } catch (error) {
-            setCrmActivityLimit(scope, previousLimit);
+            this.crmOffline.setActivityLimit(scope, previousLimit);
             if (!(error instanceof ConnectionLostError)) {
                 throw error;
             }
@@ -1254,7 +1231,7 @@ export class CrmFormController extends formView.Controller {
         // reuses the record) or applied the desktop variant (no activity rows).
         const loadedLimit = toRaw(root.activeFields).activity_ids?.limit || 0;
         if (toRaw(this.model.root) !== toRaw(root) || root.resId !== resId || loadedLimit < limit) {
-            setCrmActivityLimit(scope, previousLimit);
+            this.crmOffline.setActivityLimit(scope, previousLimit);
         }
     }
 
@@ -1365,7 +1342,6 @@ patch(Chatter.prototype, {
     setup() {
         super.setup(...arguments);
         this.crmOfflinePlugin = usePlugin(OfflinePlugin);
-        // Close an open composer when the connection drops.
         useEffect(() => {
             if (this.threadModel() !== "crm.lead") {
                 return;

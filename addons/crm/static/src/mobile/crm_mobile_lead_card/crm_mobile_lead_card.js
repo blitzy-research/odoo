@@ -68,37 +68,10 @@ function serverDate(value) {
 }
 
 /**
- * Activity bottom sheet of a lead, opened from the mobile lead card and, on a
- * phone, from the lead form's "Activities" button.
- *
- * It lists the lead's synced activities (from the activity rows loaded with the
- * opener's own root load) and the activities queued offline (from the framework
- * queue), and offers "Log a call", "Schedule follow-up" and "Mark done". Every
- * write goes through `useCrmOffline()`: online it reaches the server and reloads
- * the lead record, offline it is queued and its row appears at once, projected
- * from the queue. No meeting or calendar action is offered. The opener's mobile
- * root load reads a bounded page of activity rows per lead: online, "Show more"
- * has the opener reload its root with the next page.
- *
- * The bottom-sheet service keeps the props it was opened with, while a reload
- * replaces the opener's records, so the sheet never stores a record: every render
- * reads `getLeadRecord()`. `refresh()` re-renders it on the opener model's
- * `update` event, after a replay and after a systray discard, and closes it when
- * the lead is gone (deleted, archived, filtered out, or the form moved on); the
- * same check runs on mount, for a lead gone while the sheet was starting, and
- * whenever the opener's records change, since a root reload emits no event. The
- * activity types and assignees are read from the relational-field cache at
- * startup, and again when types reach that cache while the sheet is open.
- *
- * @example
- * this.activitiesSheet = usePopover(CrmMobileLeadActivities, { useBottomSheet: true });
- * const leadId = record.resId;
- * this.activitiesSheet.open(target, {
- *     leadId,
- *     getLeadRecord: () => this.props.getRecord(leadId),
- *     model: record.model,
- *     callTypeId: this.crmOffline.callTypeId(archInfo),
- * });
+ * Lists loaded and queued lead activities and delegates writes to the shared hooks.
+ * Resolve displayed data through `getLeadRecord` on every render because the sheet
+ * retains props while reloads replace records. Close when the lead disappears; read
+ * options from the relational-field cache.
  */
 export class CrmMobileLeadActivities extends Component {
     static template = "crm.CrmMobileLeadActivities";
@@ -132,7 +105,6 @@ export class CrmMobileLeadActivities extends Component {
             version: 0,
             types: [],
             assignees: [],
-            // Values of the inline schedule form, or `null` when it is closed.
             form: null,
             // Validity flags of the form fields, by field name: `true` from a Save
             // that found the field invalid until the field changes or a form opens.
@@ -145,20 +117,18 @@ export class CrmMobileLeadActivities extends Component {
             // queued): `{[activityId]: true}`. Their rows leave the list at once, as
             // the lead's reload shows them, even when that reload fails.
             doneOnline: {},
-            // A "Show more" reload of the opener's root is running.
             loadingMore: false,
         });
-        // The template reads the activity data and the synced rows several times
-        // per render: each is computed once, and again only after something it
-        // read changes (the lead record through `state.version`, the queue, the
-        // cached options, `state.doneBusy`, `state.doneOnline`).
+        // Memoize repeated template reads; invalidate from the live record, queue,
+        // options and completion state.
         this.activityDataMemo = computed(() => this.computeActivityData());
         this.syncedRowsMemo = computed(() => this.computeSyncedRows());
-        /** Set once `closeIfLeadGone()` has closed the sheet. */
         this.closed = false;
         /** Numbers of the last options read started and of the last one applied. */
         this.optionsReads = 0;
         this.optionsApplied = 0;
+        /** Activity types of the last applied read, offered once no form is open. */
+        this.readTypes = [];
         /** Lead record the running "Show more" reload started from. */
         this.loadingMoreFrom = null;
         const refresh = () => this.refresh();
@@ -179,10 +149,8 @@ export class CrmMobileLeadActivities extends Component {
                 untrack(() => this.closeIfLeadGone());
             }
         });
-        // Types cached after the startup read (a warm-up finishing while the sheet
-        // is open, or run by the opener when the connection returns) are read again,
-        // so "Log a call" and "Schedule follow-up" enable without reopening. The
-        // first run, during setup, only records the state: `onWillStart` reads.
+        // Reread options when warm-up completes or connectivity returns; `onWillStart`
+        // owns the initial read.
         let seenRevision = null;
         let wasOffline = false;
         useEffect(() => {
@@ -198,10 +166,6 @@ export class CrmMobileLeadActivities extends Component {
         });
     }
 
-    /**
-     * Re-renders with the opener's current lead record, and closes the sheet when
-     * there is none any more.
-     */
     refresh() {
         this.state.version++;
         this.closeIfLeadGone();
@@ -224,7 +188,8 @@ export class CrmMobileLeadActivities extends Component {
      * Reads the activity types and the assignees from the relational-field cache
      * (no RPC, online or offline). Reads may overlap: one is applied only when no
      * later-started read was applied before it, and none once the sheet is
-     * destroyed.
+     * destroyed. A read finding no type leaves an open form its type options, so
+     * its type `<select>` is never empty; `closeForm()` then offers that read.
      */
     async loadOptions() {
         const read = ++this.optionsReads;
@@ -236,11 +201,13 @@ export class CrmMobileLeadActivities extends Component {
             return;
         }
         this.optionsApplied = read;
-        this.state.types = types;
+        this.readTypes = types;
+        if (types.length || !this.state.form) {
+            this.state.types = types;
+        }
         this.state.assignees = assignees;
     }
 
-    /** Reads the options again, after the startup read. */
     async reloadOptions() {
         try {
             await this.loadOptions();
@@ -257,32 +224,22 @@ export class CrmMobileLeadActivities extends Component {
     }
 
     /**
-     * Activity rows of the lead record currently loaded by the opener, from
-     * `useCrmOffline().activityRows()`. Run by `activityDataMemo` only.
+     * Activity data for the opener's current lead, or `null` without loaded activity data.
      *
-     * @returns {{rows: Object[], moreCount: number, variant: string}|null} `null`
-     *  without a record, or when the record carries no activity data
+     * @returns {{rows: Object[], moreCount: number, variant: string}|null}
      */
     computeActivityData() {
         const record = this.leadRecord;
         return record ? this.crmOffline.activityRows(record) : null;
     }
 
-    /**
-     * @returns {{rows: Object[], moreCount: number, variant: string}|null} the
-     *  activity data of the current render (see `computeActivityData`)
-     */
     get activityData() {
         return this.activityDataMemo();
     }
 
     /**
-     * Synced activities, each with its labels, its queued "mark done" state
-     * (`donePending`) and whether its "mark done" request is running
-     * (`doneBusy`). The queue is read once for all rows: one set of the activity
-     * ids a queued `action_done` targets, matched as `isActivityDonePending()`
-     * does. Activities this sheet marked done online (`state.doneOnline`) are
-     * left out. Run by `syncedRowsMemo` only.
+     * Synced rows with labels and queued/busy completion state; omit successfully
+     * completed online rows and read queued completions once.
      *
      * @returns {Object[]}
      */
@@ -309,7 +266,6 @@ export class CrmMobileLeadActivities extends Component {
         }));
     }
 
-    /** @returns {Object[]} the synced rows of the current render (see `computeSyncedRows`) */
     get syncedRows() {
         return this.syncedRowsMemo();
     }
@@ -327,7 +283,7 @@ export class CrmMobileLeadActivities extends Component {
         }));
     }
 
-    /** Activities beyond the next one when only the desktop variant is cached. */
+    /** Number of activities not included in the loaded rows, for either load variant. */
     get moreCount() {
         return this.activityData?.moreCount || 0;
     }
@@ -345,7 +301,6 @@ export class CrmMobileLeadActivities extends Component {
         return this.state.types.length > 0;
     }
 
-    /** "Log a call" needs the arch's Call type among the cached types. */
     get canLogCall() {
         const { callTypeId } = this.props;
         return (
@@ -356,10 +311,8 @@ export class CrmMobileLeadActivities extends Component {
     }
 
     /**
-     * "Show more" is offered online when the opener's bounded mobile root load
-     * left some of the lead's activities out and the opener can reload its root
-     * with one more page (`crmLoadMoreActivities` model hook). Offline, the larger
-     * page was never cached: the remaining activities wait for sync.
+     * Additional pages are requested only online through the opener root-load hook
+     * (`crmLoadMoreActivities`); offline only the currently loaded page is shown.
      */
     get canLoadMoreActivities() {
         const activityData = this.activityData;
@@ -446,8 +399,7 @@ export class CrmMobileLeadActivities extends Component {
     }
 
     /**
-     * Stores a form field's new value. A field flagged invalid by Save is no
-     * longer flagged once it changes; the next Save checks it again.
+     * Update a draft field and clear its validation error.
      *
      * @param {"activity_type_id"|"summary"|"date_deadline"|"user_id"} fieldName
      * @param {Event} ev
@@ -469,17 +421,23 @@ export class CrmMobileLeadActivities extends Component {
         if (this.state.saving) {
             return;
         }
-        this.state.invalid = {};
-        this.state.form = null;
+        this.closeForm();
     }
 
     /**
-     * Values to schedule from the form, checked against what the form offers:
-     * the type and the assignee must be ids of the cached options and the
-     * deadline an existing "YYYY-MM-DD" date; the summary is sent as a string.
-     * When a check fails, the failing fields are flagged invalid (each with its
-     * message), the first of them is focused, and nothing is returned; the form
-     * keeps every value.
+     * Closes the schedule form, clearing its invalid-field flags, and offers the
+     * types of the last cache read: when it found none, both openers are disabled.
+     */
+    closeForm() {
+        this.state.invalid = {};
+        this.state.form = null;
+        this.state.types = this.readTypes;
+    }
+
+    /**
+     * Validate type/assignee against available options and the deadline as a server
+     * date. Invalid values preserve the draft, flag fields and focus the first error;
+     * return `null`.
      *
      * @param {{activity_type_id: unknown, summary: unknown, date_deadline: unknown, user_id: unknown}} form
      * @returns {{activity_type_id: number, summary: string, date_deadline: string, user_id: number}|null}
@@ -508,14 +466,9 @@ export class CrmMobileLeadActivities extends Component {
     }
 
     /**
-     * Schedules the activity on the lead currently loaded by the opener. Offline
-     * the queued row appears through the queue signal. Online the hooks reload
-     * the lead record, so no reload happens here. Invalid values (see
-     * `validateForm`) schedule nothing and keep the form open with the failing
-     * fields flagged. A server error keeps the form open with its values and
-     * reaches the framework error handling. When the opener no longer has the
-     * lead, nothing is scheduled and the sheet closes through `closeIfLeadGone()`,
-     * so a Save reaching a sheet already closed for its lead closes nothing more.
+     * Validate and schedule for the current lead through the shared hooks, which own
+     * online refresh. Invalid values and server errors preserve the draft; a missing
+     * lead closes the sheet once.
      */
     async saveForm() {
         const { form } = this.state;
@@ -537,7 +490,7 @@ export class CrmMobileLeadActivities extends Component {
             // Close only the form that was submitted: a form opened since then
             // keeps its draft.
             if (toRaw(this.state.form) === toRaw(form)) {
-                this.state.form = null;
+                this.closeForm();
             }
         } finally {
             this.state.saving = false;
@@ -546,13 +499,11 @@ export class CrmMobileLeadActivities extends Component {
     }
 
     /**
-     * Marks a synced activity done (queued offline; online the hooks reload the
-     * lead record). It is sent at most once: nothing happens while a request for
-     * the same activity runs (`state.doneBusy`, set before the first await), once
-     * it is done on the server (`state.doneOnline`: its row leaves the list then,
-     * even when the lead reload that follows fails or is lost) or once its "mark
-     * done" waits in the queue, read live rather than from the row, which may come
-     * from an earlier render.
+     * Prevents concurrent completions and repeats after a successful or queued
+     * completion; a failed request remains retryable. The queued state is read live
+     * (`isActivityDonePending`), not from the row, which may come from an earlier
+     * render. A server-committed completion (`state.doneOnline`) removes the row even
+     * when the lead reload that follows fails or is lost.
      *
      * @param {{id: number}} row
      */
@@ -606,17 +557,8 @@ export class CrmMobileLeadActivities extends Component {
 }
 
 /**
- * Lead card of the mobile pipeline.
- *
- * It shows the lead's name, partner (or contact name) and expected revenue with
- * the writes queued for it applied, so offline edits made anywhere are visible,
- * and a "Pending sync" badge ("Sync failed" once parked) read from the framework
- * queue alone. It offers opening the lead, a stage selector and the activity
- * sheet. A provisional card (a lead created offline, `provisional` set and no
- * `record`) can do none of these until its create is replayed.
- *
- * The pipeline renders it only on its small-screen branch; the card holds no
- * screen-size logic of its own.
+ * Mobile lead card with live queued-write projection and sync status. Provisional
+ * cards cannot open, move or schedule until synced.
  */
 export class CrmMobileLeadCard extends Component {
     static template = "crm.CrmMobileLeadCard";
@@ -646,8 +588,9 @@ export class CrmMobileLeadCard extends Component {
     /**
      * Display values `{name, partner_id, contact_name, expected_revenue,
      * stage_id}`: the provisional values, else the record projected with its
-     * queued writes. `null` while a queued delete or archive hides the card, and
-     * for a card given neither `record` nor `provisional`, which renders nothing.
+     * queued writes. `null` while a pending, non-parked delete or archive hides
+     * the card (a parked one leaves it visible with "Sync failed"), and for a card
+     * given neither `record` nor `provisional`, which renders nothing.
      *
      * @returns {Object|null}
      */
@@ -685,7 +628,6 @@ export class CrmMobileLeadCard extends Component {
         };
     }
 
-    /** @param {Object} values display values (see `values`) */
     partnerLabel(values) {
         const { partner_id, contact_name } = values;
         return partner_id?.display_name || contact_name || "";

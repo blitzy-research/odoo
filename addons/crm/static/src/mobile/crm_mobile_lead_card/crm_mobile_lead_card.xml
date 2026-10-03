@@ -2,16 +2,8 @@
 <templates xml:space="preserve">
 
     <!--
-        Lead card of the CRM mobile pipeline (CrmMobileLeadCard).
-        `card` is `this.cardData`, read once per render: the lead projected with its
-        queued writes (`card.values`) and what derives from it, or `null` while a
-        queued delete or archive hides it (or without record), in which case nothing
-        renders. Every interactive element carries data-available-offline on the
-        element itself, so the offline plugin never disables it: the card stays
-        usable offline. The `disabled` states set here are the card's own (a
-        provisional card, created offline, cannot be opened, moved or given
-        activities until it has synced), and the framework never toggles a button
-        that is already disabled.
+        Render the projected card unless a pending, non-parked delete/archive hides it;
+        provisional actions need a server ID.
     -->
     <t t-name="crm.CrmMobileLeadCard">
         <t t-set="card" t-value="this.cardData"/>
@@ -27,7 +19,6 @@
                 <span t-if="card.partnerLabel" class="o_crm_mobile_lead_partner text-muted" t-out="card.partnerLabel"/>
                 <span t-if="card.revenueLabel" class="o_crm_mobile_lead_revenue" t-out="card.revenueLabel"/>
             </button>
-            <!-- Read from the framework queue only; the text, not only the colour, tells the state. -->
             <span t-if="card.syncState"
                 class="o_crm_mobile_pending_sync badge align-self-start"
                 t-att-class="card.syncState === 'failed' ? 'text-bg-danger' : 'text-bg-warning'"
@@ -67,15 +58,7 @@
         </div>
     </t>
 
-    <!--
-        Activity bottom sheet of a lead (CrmMobileLeadActivities), opened from the
-        mobile lead card and, on a phone, from the lead form's "Activities" button.
-        Synced rows come from the activity rows loaded with the opener's own root
-        load; pending rows come from the framework queue, so parked ones survive
-        every reload. "Log a call", "Schedule follow-up" and "Mark done" are queued
-        offline. No meeting or calendar action is offered. The inline schedule form
-        is a <div>, not a <form>, so it has no submit semantics: only Save schedules.
-    -->
+    <!-- Use a div for the draft: Enter must not schedule an activity; only Save does. -->
     <t t-name="crm.CrmMobileLeadActivities">
         <div class="o_crm_mobile_lead_activities_sheet d-flex flex-column gap-3 p-3">
             <header class="d-flex flex-column">
@@ -88,7 +71,6 @@
                     class="o_crm_mobile_activity_row d-flex align-items-center gap-2"
                     t-att-class="{ 'o_crm_mobile_activity_done_pending': row.donePending }"
                     t-att-data-activity-id="row.id">
-                    <!-- The type label titles a row without summary. -->
                     <div class="o_crm_mobile_activity_info d-flex flex-column flex-grow-1 min-w-0">
                         <span class="o_crm_mobile_activity_title fw-bold text-truncate" t-out="row.summary or row.typeLabel"/>
                         <span class="o_crm_mobile_activity_details d-flex flex-wrap column-gap-2 text-muted small">
@@ -123,13 +105,7 @@
                 </li>
             </ul>
 
-            <!--
-                Activities not listed above. Online, when the opener's bounded mobile root
-                load left some out, "Show more" reloads that root with the next page. It is
-                online only, like the pipeline's "Load more", hence no data-available-offline.
-                Offline, and in the desktop-variant fallback (only the next activity is
-                known), the others have no action.
-            -->
+            <!-- Additional mobile pages require an online root reload; otherwise show only the remaining count. -->
             <div t-if="this.canLoadMoreActivities"
                 class="o_crm_mobile_activities_more_online d-flex align-items-center gap-2">
                 <span class="o_crm_mobile_activities_more_count text-muted"><t t-out="this.moreCount"/> more activities</span>
@@ -154,7 +130,7 @@
                     t-att-disabled="!this.hasTypes"
                     t-on-click="this.openFollowUp">Schedule follow-up</button>
             </div>
-            <!-- Both openers are disabled without cached types, so the type list is never empty here. -->
+            <!-- The openers require cached types; an open form keeps its type options until it closes, and Save revalidates against the options shown. -->
             <div t-else="" class="o_crm_mobile_activity_form d-flex flex-column gap-2">
                 <select class="o_crm_mobile_activity_type form-select"
                     t-att-class="{ 'is-invalid o_field_invalid': this.state.invalid.activity_type_id }"
@@ -227,13 +203,7 @@
         </div>
     </t>
 
-    <!--
-        Template of the lead form controller (CrmFormController). It adds one
-        small-screen "Activities" button to the control panel, which opens the lead's
-        activity bottom sheet. On a wide screen the t-if is false, so the desktop form
-        DOM is unchanged. Primary inherit: extensions of web.FormView from earlier
-        asset blocks (such as mail's chatter one) are kept.
-    -->
+    <!-- Primary inheritance preserves framework extensions without adding a desktop activities button. -->
     <t t-name="crm.CrmFormView" t-inherit="web.FormView" t-inherit-mode="primary">
         <xpath expr="//Layout/t[@t-set-slot='control-panel-additional-actions']" position="inside">
             <button t-if="this.crmOffline.isSmall and this.model.root.resId and !this.env.inDialog"

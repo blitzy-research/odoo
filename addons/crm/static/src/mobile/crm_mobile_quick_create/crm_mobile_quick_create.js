@@ -12,49 +12,19 @@ import { useCrmOffline } from "@crm/mobile/crm_offline_hooks";
  * @property {string} phone trimmed
  * @property {string} email_from trimmed
  * @property {number} expected_revenue finite number, 0 when left empty or invalid
- * @property {number|false} stage_id id of the selected stage
+ * @property {number|false} stage_id id of an offered stage, false when none is offered
  */
 
-/**
- * @param {unknown} value raw value bound to an input by `t-model`
- * @returns {string} the value as a trimmed string ("" for null or undefined)
- */
 function trimmed(value) {
     return String(value ?? "").trim();
 }
 
 /**
- * Bottom-sheet quick create of the CRM mobile pipeline.
- *
- * It captures exactly six `crm.lead` fields (name, contact name, phone, email,
- * expected revenue and stage) and hands them to the opener's `onSave`. It issues no
- * request and touches no offline storage: the opener saves the values online or
- * queues them offline through `useCrmOffline().createLead()`, with the pipeline
- * context (`default_type: "opportunity"`) that supplies the type, team, salesperson
- * and company defaults on the server. No `onchange` is needed, so the sheet works
- * offline in every loaded stage.
- *
- * Like every CRM mobile component, it resolves the shared CRM offline hooks with
- * `useCrmOffline()` (exposed as `this.crmOffline`) and never imports the framework
- * offline plugin itself. Its only offline action, the create, still goes through
- * those hooks in the opener's `onSave`.
- *
- * It is opened only by the small-screen stage pipeline (its "New" button, or once on
- * mount for the "New Lead" PWA shortcut), through
- * `usePopover(CrmMobileQuickCreate, { useBottomSheet: true })`; `web.BottomSheet`
- * passes `close`.
- *
- * Save closes the sheet once `onSave` resolves. When `onSave` rejects (an online
- * server error), the sheet stays open with the entered values and the error is
- * rethrown, so the framework's RPC error handling displays it.
- *
- * @example
- * this.quickCreate = usePopover(CrmMobileQuickCreate, { useBottomSheet: true });
- * this.quickCreate.open(target, {
- *     stages: [{ id: 1, display_name: "New" }, { id: 2, display_name: "Qualified" }],
- *     defaultStageId: 2,
- *     onSave: (values) => this.crmOffline.createLead(this.props.list, values, extras),
- * });
+ * Collects the six-field mobile lead draft and delegates persistence to `onSave`.
+ * The opener supplies action context and owns online/offline policy; no onchange
+ * is needed. Save requires a nonempty name and an offered stage, closes on
+ * resolution and preserves the draft on rejection; `onSave` resolving `false`
+ * refuses the stage. Opened only by the small-screen pipeline.
  */
 export class CrmMobileQuickCreate extends Component {
     static template = "crm.CrmMobileQuickCreate";
@@ -72,6 +42,9 @@ export class CrmMobileQuickCreate extends Component {
      */
     nameRef = signal(null);
 
+    /** Stage select (`t-ref="this.stageRef"`), focused when Save refuses its value. */
+    stageRef = signal(null);
+
     setup() {
         this.crmOffline = useCrmOffline();
         // Unique per sheet, so each `<label for>` targets its own control even if
@@ -85,6 +58,7 @@ export class CrmMobileQuickCreate extends Component {
             expected_revenue: "",
             stage_id: this.props.defaultStageId || this.props.stages[0]?.id || false,
             invalidName: false,
+            invalidStage: false,
             isSaving: false,
         });
     }
@@ -97,16 +71,23 @@ export class CrmMobileQuickCreate extends Component {
         return `${this.fieldIdPrefix}_${name}`;
     }
 
-    /**
-     * Clears the "name required" state as soon as the user types in the name.
-     */
     onNameInput() {
         this.state.invalidName = false;
     }
 
+    onStageChange() {
+        this.state.invalidStage = false;
+    }
+
+    flagInvalidStage() {
+        this.state.invalidStage = true;
+        this.stageRef()?.focus();
+    }
+
     /**
-     * Validates the name, then hands the six values to `onSave` and closes the
-     * sheet once it resolves. A second Save while one is running is ignored.
+     * Validates the name and the stage, then hands the six values to `onSave` and
+     * closes the sheet once it resolves, unless with `false` (stage refused). A
+     * second Save while one is running is ignored.
      *
      * @returns {Promise<void>} rejects with `onSave`'s error, sheet left open
      */
@@ -120,6 +101,12 @@ export class CrmMobileQuickCreate extends Component {
             this.nameRef()?.focus();
             return;
         }
+        const { stages } = this.props;
+        const stage = stages.find(({ id }) => id === this.state.stage_id);
+        if (stages.length && !stage) {
+            this.flagInvalidStage();
+            return;
+        }
         const expectedRevenue = Number(this.state.expected_revenue);
         /** @type {CrmMobileQuickCreateValues} */
         const values = {
@@ -130,22 +117,27 @@ export class CrmMobileQuickCreate extends Component {
             // NaN and Infinity would serialize as `null`: send 0 instead, as for
             // an empty input.
             expected_revenue: Number.isFinite(expectedRevenue) ? expectedRevenue : 0,
-            stage_id: Number(this.state.stage_id) || false,
+            stage_id: stage ? stage.id : false,
         };
         this.state.isSaving = true;
+        let accepted;
         try {
-            await this.props.onSave(values);
+            accepted = await this.props.onSave(values);
         } catch (error) {
-            // Keep the sheet open with the entered values and let the framework's
-            // error handling show the server error.
             if (status(this) !== "destroyed") {
                 this.state.isSaving = false;
             }
             throw error;
         }
-        if (status(this) !== "destroyed") {
-            this.props.close?.();
+        if (status(this) === "destroyed") {
+            return;
         }
+        if (accepted === false) {
+            this.state.isSaving = false;
+            this.flagInvalidStage();
+            return;
+        }
+        this.props.close?.();
     }
 
     /**
@@ -155,14 +147,10 @@ export class CrmMobileQuickCreate extends Component {
      * @returns {Promise<void>}
      */
     onSubmit(ev) {
-        // Never let the browser submit the form: that would navigate away.
         ev?.preventDefault();
         return this.onSave();
     }
 
-    /**
-     * Closes the sheet without saving.
-     */
     onCancel() {
         this.props.close?.();
     }

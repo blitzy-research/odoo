@@ -11,11 +11,8 @@ patch(ActivityMenu.prototype, {
     },
 
     /**
-     * Read during render by the CRM `mail.ActivityMenu` extension template
-     * (crm_mobile_pipeline.xml) to give the CRM row and its counters their
-     * offline disabled state. Reading the offline signal during render
-     * subscribes the menu, so one opened online re-renders when the
-     * connectivity changes; the signal is read for the CRM row only.
+     * Only CRM rows subscribe to connectivity, so an open menu updates its
+     * row and counters on disconnection.
      *
      * @param {Object} group activity group of the systray menu
      * @returns {boolean} whether the group is the CRM one and the connection is lost
@@ -43,10 +40,8 @@ patch(ActivityMenu.prototype, {
         // fetch the data from the button otherwise fetch the ones from the parent (.o_ActivityMenuView_activityGroup).
         const context = {};
         if (group.model === "crm.lead") {
-            // My Activities cannot be loaded without the server: offline, the CRM
-            // row is inert (no dropdown close, no action load, nothing queued).
-            // The template disables the row and its counters, and this early
-            // return also covers keyboard activation and direct calls.
+            // My Activities needs the server; stop before closing the menu or
+            // loading the action, including direct calls.
             if (this.offlinePlugin.isOffline()) {
                 return;
             }

@@ -2,7 +2,9 @@ import { registry } from "@web/core/registry";
 import { ShareTargetItem } from "@web/webclient/share_target/share_target_item";
 import { onWillStart, untrack, useEffect, usePlugin } from "@odoo/owl";
 import { _t } from "@web/core/l10n/translation";
+import { ConnectionLostError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
+import { FormViewDialog } from "@web/views/view_dialogs/form_view_dialog";
 import { crmOwnEffectPromise } from "@crm/mobile/crm_offline_hooks";
 
 export class CrmShareTargetItem extends ShareTargetItem {
@@ -15,12 +17,10 @@ export class CrmShareTargetItem extends ShareTargetItem {
         this.offlinePlugin = usePlugin(OfflinePlugin);
         this.teamsDomain = [["company_id", "in", [this.currentCompany.id, false]]];
         onWillStart(() => this.updateTeams());
-        // The team read is skipped offline (see updateTeams), so reload the teams once the
-        // connection comes back. Only the offline signal is tracked: updateTeams reads reactive
-        // state synchronously (this.context), hence the untrack. The first, immediate run never
-        // reloads, so an online start-up still issues a single team read, from onWillStart.
-        // A read lost to the connection dropping again keeps the teams and the selection and is
-        // retried at the next reconnection; any other error goes to the framework error service.
+        // Track the offline signal only, and read the teams again on reconnection; the first
+        // run does not, so an online start-up keeps the single read of onWillStart. The
+        // untrack covers the reactive state updateTeams reads (this.context). A read lost to
+        // a new disconnection is ignored; any other error reaches the framework error service.
         let wasOffline = false;
         useEffect(() => {
             const offline = this.offlinePlugin.isOffline();
@@ -32,8 +32,7 @@ export class CrmShareTargetItem extends ShareTargetItem {
     }
 
     async updateTeams() {
-        // The lead share target is DISABLE offline (crm/static/src/mobile/offline_inventory.md):
-        // no crm.team read, the previous team list and selection are kept.
+        // Skip the team read offline; the team list and the selection are kept.
         if (this.offlinePlugin.isOffline()) {
             return;
         }
@@ -56,10 +55,11 @@ export class CrmShareTargetItem extends ShareTargetItem {
 
     /**
      * The lead share target is DISABLE offline (crm/static/src/mobile/offline_inventory.md):
-     * the attachments need the id of a lead created on the server, so nothing is uploaded,
-     * created, written or opened while offline. This entry guard covers a save started
-     * offline; a save started online stops at the create and open steps below when the
-     * connection drops meanwhile.
+     * the attachments need the id of a lead created on the server. A save entered offline
+     * returns before the upload. For a save started online, the steps below recheck the
+     * connection: createRecordWithFile after the upload and after the lead creation,
+     * _createRecord when name_create loses the connection, and openCreatedRecord before
+     * navigating. A request already sent is not cancelled.
      *
      * @override
      */
@@ -71,37 +71,75 @@ export class CrmShareTargetItem extends ShareTargetItem {
     }
 
     /**
-     * DISABLE offline (crm/static/src/mobile/offline_inventory.md): a save started online
-     * whose upload ends after the connection is lost stops here, as does a direct call. The
-     * lead is not created, so the uploaded attachments are not relinked. Returns null, the
-     * "record wasn't saved" value of the base contract.
+     * The base steps, with a connection check before the lead creation (an upload that ended
+     * offline, a direct call) and before the attachment relink (a name_create that lost the
+     * connection, or a form fallback whose save the framework queued offline, without an
+     * id); the base method has no hook between them. Offline, it returns null and leaves the
+     * attachments unlinked.
      *
      * @override
+     * @returns {Promise<?number>} the created lead id, or null if the record wasn't saved
      */
     async createRecordWithFile(attachments) {
         if (this.offlinePlugin.isOffline()) {
             return null;
         }
-        return super.createRecordWithFile(...arguments);
+        // Base steps, not super, online too: super can't recheck between name_create and relink.
+        const { filename } = attachments[0];
+        const resId = await this._createRecord(filename, this.context);
+        if (resId === null || this.offlinePlugin.isOffline()) {
+            return null;
+        }
+        const attachmentIds = attachments.map((a) => a.id);
+        await this.orm.write("ir.attachment", attachmentIds, {
+            res_id: resId,
+            res_model: this.modelName,
+        });
+        return resId;
     }
 
     /**
-     * DISABLE offline (crm/static/src/mobile/offline_inventory.md): a direct call issues no
-     * name_create and opens no form dialog. Returns null, the "record wasn't saved" value of
-     * the base contract.
+     * The base steps, except that an offline entry, or a name_create that loses the
+     * connection, returns null without the form dialog fallback, which cannot create a lead
+     * offline; the base method catches every error into that fallback. Any other name_create
+     * error opens the fallback, as in the base.
      *
      * @override
+     * @returns {Promise<?number>} the created lead id, or null if the record wasn't saved
      */
     async _createRecord(name, context) {
         if (this.offlinePlugin.isOffline()) {
             return null;
         }
-        return super._createRecord(...arguments);
+        // Base steps, not super, online too: super can't recheck between name_create and fallback.
+        try {
+            const [resId] = await this.orm.call(this.modelName, "name_create", [name], {
+                context,
+            });
+            return resId;
+        } catch (error) {
+            if (error instanceof ConnectionLostError || this.offlinePlugin.isOffline()) {
+                return null;
+            }
+            // fallback on form view dialog when name_create fails
+            return new Promise((resolve) => {
+                this.dialog.add(FormViewDialog, {
+                    canExpand: false,
+                    close: resolve,
+                    context: {
+                        ...context,
+                        default_name: name,
+                    },
+                    title: name,
+                    resModel: this.modelName,
+                    onRecordSaved: ({ resId }) => resolve(resId),
+                });
+            });
+        }
     }
 
     /**
-     * DISABLE offline (crm/static/src/mobile/offline_inventory.md): a save stopped by the
-     * connection loss, like a direct call, opens no record.
+     * Skips the navigation when entered offline.
      *
      * @override
      */
@@ -113,8 +151,7 @@ export class CrmShareTargetItem extends ShareTargetItem {
     }
 
     /**
-     * DISABLE offline (crm/static/src/mobile/offline_inventory.md): the company switch is only
-     * the first step of a create that cannot run offline, so the active companies are kept.
+     * Keeps the active companies when entered offline, where the share save cannot start.
      *
      * @override
      */

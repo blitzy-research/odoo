@@ -1,22 +1,4 @@
-/**
- * `crm_mobile_pipeline`: the CRM lead kanban view with a one-stage-at-a-time
- * pipeline on small screens.
- *
- * - Wide screen: the view is the `crm_kanban` view. The controller loads exactly
- *   the specification `crm_kanban` builds from the arch (its "desktop variant"),
- *   and the renderer `t-call`s `web.KanbanRenderer` with its inherited
- *   `CrmKanbanRenderer` behaviour, so the DOM, components, handlers and requests
- *   are those of `crm_kanban`, including after a resize back from a small screen.
- * - Small screen: the controller loads a "mobile variant" of the specification
- *   (card fields the arch lacks, the leads' activity rows and the revenue
- *   aggregate) and the renderer shows one stage at a time, with lead cards, the
- *   provisional cards of leads created offline, a stage header and a bottom-sheet
- *   quick create.
- *
- * Offline state and queue reads go through `useCrmOffline()` only: this module
- * holds no queue, cache or storage of its own. The model, the arch parser and the
- * search model are those of `crm_kanban`.
- */
+/** Mobile stage-pipeline rendering with framework kanban fallback on wide screens. */
 
 import {
     markRaw,
@@ -50,10 +32,8 @@ import {
     CRM_MOBILE_ACTIVITY_LIMIT,
     consumeQuickCreateDeepLink,
     crmOwnEffectPromise,
-    getCrmActivityLimit,
     getCrmActivitySubfields,
     isFieldMapping,
-    setCrmActivityLimit,
     useCrmOffline,
 } from "@crm/mobile/crm_offline_hooks";
 import { CrmMobileLeadCard } from "@crm/mobile/crm_mobile_lead_card/crm_mobile_lead_card";
@@ -78,14 +58,12 @@ const MOBILE_CARD_FIELDS = Object.freeze([
     Object.freeze({ name: "stage_id", type: "many2one", relation: "crm.stage", readonly: false }),
 ]);
 
-/** The lead activities one2many, added to the mobile variant when the arch lacks it. */
 const ACTIVITY_FIELD = Object.freeze({
     name: "activity_ids",
     type: "one2many",
     relation: "mail.activity",
 });
 
-/** Aggregate behind the mobile stage header revenue (server sum of every group). */
 const REVENUE_FIELD = "expected_revenue";
 
 /**
@@ -115,10 +93,6 @@ function many2oneId(value) {
     return value || false;
 }
 
-/**
- * @param {unknown} value
- * @returns {number} `value` when it is a finite number, `0` otherwise
- */
 function amount(value) {
     return Number.isFinite(value) ? value : 0;
 }
@@ -128,23 +102,9 @@ function amount(value) {
 // -----------------------------------------------------------------------------
 
 /**
- * The CRM kanban controller, switching the root load specification between the
- * arch's own ("desktop") variant and the "mobile" variant on every root load.
- *
- * - `onWillLoadRoot` runs before the cache key of every root load is computed,
- *   including `_updateConfig` reloads, so a cached load is looked up with the
- *   variant that is applied; a configuration restored from the action state is
- *   corrected at its next load.
- * - An effect reloads the root whenever the viewport crosses the small-screen
- *   breakpoint, in either direction, so desktop → mobile → desktop ends with the
- *   first desktop specification. Crossings during the first root load are checked
- *   once that load has completed: the root is reloaded once if the variant it
- *   applied no longer matches the screen.
- * - Offline on a small screen, when the mobile variant was never cached but a
- *   wide-layout visit cached the desktop one, `crmUseDesktopSpec()` lets
- *   `CrmKanbanModel.load` retry once with the desktop variant. The fallback ends at
- *   the first online root load, and the root is reloaded when the connection
- *   returns while it is active.
+ * Selects the arch's desktop or mobile root specification before its cache key is
+ * computed. Viewport changes reload the matching variant; uncached offline mobile
+ * loads may retry the desktop variant until reconnection.
  */
 export class CrmMobilePipelineController extends crmKanbanView.Controller {
     setup() {
@@ -172,7 +132,6 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
             };
         }
 
-        // Viewport: the specification follows the screen size in both directions.
         let wasSmall = this.crmOffline.isSmall;
         useEffect(() => {
             const isSmall = this.crmOffline.isSmall;
@@ -182,23 +141,26 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
             }
         });
 
-        // Reconnection: leave the offline desktop-variant fallback.
         let wasOffline = this.crmOffline.isOffline();
         useEffect(() => {
             const isOffline = this.crmOffline.isOffline();
             const reconnected = wasOffline && !isOffline;
             wasOffline = isOffline;
-            if (reconnected && this.crmDesktopFallback) {
-                untrack(() => this.crmReload());
+            if (!reconnected || !this.crmDesktopFallback) {
+                return;
             }
+            untrack(() => {
+                // Fallback recovery is mobile-only: a wide screen already loads the
+                // desktop variant, so the fallback just ends.
+                if (this.crmOffline.isSmall) {
+                    this.crmReload();
+                } else {
+                    this.crmDesktopFallback = false;
+                }
+            });
         });
     }
 
-    /**
-     * @override
-     * Adds the variant hook, the offline-fallback hook and the activity sheet's
-     * "Show more" hook to the parent's hooks.
-     */
     get modelParams() {
         const params = super.modelParams;
         const onWillLoadRoot = params.hooks?.onWillLoadRoot;
@@ -208,8 +170,6 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
                 ...params.hooks,
                 onWillLoadRoot: (config) => {
                     onWillLoadRoot?.(config);
-                    // Called without config through the progress bar wrapper, which
-                    // `setup` handles.
                     if (config) {
                         this.crmApplyVariant(config);
                     }
@@ -221,12 +181,10 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
     }
 
     /**
-     * Builds the two load-specification variants, each from its own run of the
-     * parent's recipe (`KanbanController.modelParams`), so they share no object:
-     * - `desktop` is exactly what `crm_kanban` loads for the arch;
-     * - `mobile` adds the card fields the arch lacks, the leads' activity rows and
-     *   the `expected_revenue` aggregate.
-     * Both are read-only once built.
+     * Builds the desktop variant (what `crm_kanban` loads for the arch) and the
+     * mobile variant (plus the card fields the arch lacks, the activity rows and the
+     * revenue aggregate) as independent active-field and aggregate configurations;
+     * existing schema field definitions remain shared and must not be mutated.
      *
      * @returns {{desktop: Object, mobile: Object}} each `{activeFields, fields, fieldsToAggregate}`
      */
@@ -265,9 +223,7 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
         const activityField = mobile.activeFields[ACTIVITY_FIELD.name];
         if (activityField) {
             const related = activityField.related || { activeFields: {}, fields: {} };
-            // The activity sheet's rows, in the (cached) root load, with the same
-            // `{activeFields, fields}` structure the relational model builds for
-            // x2many sub-fields. Fresh definitions: the model owns what it is given.
+            // Fresh activity sub-field definitions belong to the model receiving them.
             const subFields = getCrmActivitySubfields();
             const subActiveFields = {};
             for (const name of Object.keys(subFields)) {
@@ -301,8 +257,8 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
      * (and offline fallback) to a root configuration and to every group
      * configuration it holds, with fresh objects, so that no shared object is
      * mutated and the records of existing groups also load the new variant. The
-     * mobile variant reads at most the activity page size remembered for the
-     * root's search (`crmActivityScope`) per lead.
+     * mobile variant reads at most the session's activity page size of the root's
+     * search (`crmActivityScope`) per lead.
      *
      * @param {Object} config root configuration about to be loaded
      */
@@ -314,12 +270,8 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
         const { desktop, mobile } = this.crmVariants;
         const variant = useMobile ? mobile : desktop;
         this.crmLastVariant = useMobile ? "mobile" : "desktop";
-        // The page size is read from the remembered preference, never from this
-        // controller: a pipeline mounted again, even cold and offline, then issues
-        // the request of its last visit, whose cache key holds the page "Show more"
-        // reached.
         const activityLimit = useMobile
-            ? getCrmActivityLimit(this.crmActivityScope(config))
+            ? this.crmOffline.getActivityLimit(this.crmActivityScope(config))
             : CRM_MOBILE_ACTIVITY_LIMIT;
         // Group configurations are created once (`_postprocessReadGroup`) with
         // references to the root's objects and never refreshed: assign them too.
@@ -377,17 +329,9 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
     }
 
     /**
-     * Reloads the root, from the effects above, which cannot return the reload: it
-     * is owned here (`crmOwnEffectPromise`). A load lost to the connection is
-     * ignored: the framework shows its offline helper for an unavailable root. Any
-     * other error reaches the framework error handling, once.
-     *
-     * Until the model is ready, the load in progress is its first one, which applied
-     * the variant of the screen when it started. Every call made meanwhile shares one
-     * check, owned once by the call that starts it, run when the model becomes
-     * ready: it reloads the root once if the variant a load would apply now differs
-     * from the one the last root load applied, and does nothing otherwise (crossings
-     * that cancel out) or once the controller is destroyed.
+     * Owns effect-started reloads and reports non-connection errors once. Before
+     * readiness, calls share a deferred variant check: reload only if the current
+     * screen requires another variant and the controller survives.
      */
     crmReload() {
         if (this.model.isReady()) {
@@ -411,11 +355,8 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
     }
 
     /**
-     * Scope of the activity page size remembered for a root load: the view's
-     * model and action, and the root's search (domain and grouping). The search
-     * is part of the root load's request, hence of its cache key, like the page
-     * size: a "Show more" in one search leaves the page size, and so the cached
-     * pages, of the action's other searches unchanged.
+     * Scope of the session's activity page size: model/action plus domain/grouping,
+     * so searches keep independent root-cache page sizes.
      *
      * @param {Object} config root configuration
      * @returns {string}
@@ -426,19 +367,9 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
     }
 
     /**
-     * `crmLoadMoreActivities` model hook, the activity sheet's "Show more": online
-     * on a small screen, with the mobile variant applied, raises the activity rows
-     * loaded per lead by one page (`CRM_MOBILE_ACTIVITY_LIMIT`) and reloads the
-     * root, so the larger page lands in the root load and its cache. It never
-     * issues a separate `mail.activity` read.
-     *
-     * The raised page size is remembered (`setCrmActivityLimit`) before the
-     * reload, which reads it, so that a later root load of the same search,
-     * after a reopen, issues the same request and is served the cached larger
-     * page offline. The previous page size is remembered again when that page
-     * was not loaded: the reload failed (a lost connection resolves, any other
-     * error propagates), or the connection was lost and the desktop variant was
-     * served instead (`crmDesktopFallback`).
+     * Online mobile "Show more": raises the session's root-load activity limit by one
+     * page and reloads. Restores the previous limit if loading fails or falls back
+     * to desktop; rows remain in the root cache.
      *
      * @returns {Promise<void>}
      */
@@ -452,17 +383,17 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
             return;
         }
         const scope = this.crmActivityScope(this.model.config);
-        const previousLimit = getCrmActivityLimit(scope);
-        setCrmActivityLimit(scope, previousLimit + CRM_MOBILE_ACTIVITY_LIMIT);
+        const previousLimit = this.crmOffline.getActivityLimit(scope);
+        this.crmOffline.setActivityLimit(scope, previousLimit + CRM_MOBILE_ACTIVITY_LIMIT);
         try {
             await this.model.load();
         } catch (error) {
-            setCrmActivityLimit(scope, previousLimit);
+            this.crmOffline.setActivityLimit(scope, previousLimit);
             ignoreConnectionLost(error);
             return;
         }
         if (this.crmDesktopFallback) {
-            setCrmActivityLimit(scope, previousLimit);
+            this.crmOffline.setActivityLimit(scope, previousLimit);
         }
     }
 }
@@ -472,18 +403,8 @@ export class CrmMobilePipelineController extends crmKanbanView.Controller {
 // -----------------------------------------------------------------------------
 
 /**
- * Renderer of `crm_mobile_pipeline` (template `crm.CrmMobilePipeline`).
- *
- * Not small: `t-call="web.KanbanRenderer"` with the inherited `CrmKanbanRenderer`
- * behaviour, and none of the mobile effects below act. Small and grouped by
- * stage: one stage at a time ("stage pipeline"). Small and ungrouped: the lead
- * cards in one column.
- *
- * What the cards and the header show is the loaded data with the framework
- * queue projected onto it (`useCrmOffline().projectLead`): a lead whose queued
- * write moves it to another stage is listed and counted there, a lead whose
- * delete or archive is pending is hidden, and leads created offline show as
- * provisional cards.
+ * Wide screens reuse the framework kanban and no mobile effect acts there; small
+ * screens render stage or ungrouped cards with live queued-write projections.
  */
 export class CrmMobilePipeline extends CrmKanbanRenderer {
     static template = "crm.CrmMobilePipeline";
@@ -498,7 +419,6 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     setup() {
         super.setup();
         this.crmOffline = useCrmOffline();
-        /** `activeIndex` of `stageGroups`; `helperLeadId` of the uncached lead shown */
         this.mobile = proxy({ activeIndex: 0, helperLeadId: false });
         this.quickCreate = usePopover(CrmMobileQuickCreate, { useBottomSheet: true });
         /** @type {Set<string>} ids of the stage groups whose "Load more" is loading */
@@ -506,26 +426,21 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         /** @type {{x: number, y: number}|null} start of the current touch gesture */
         this.crmTouch = null;
         this.crmMounted = false;
-        this.crmWarmed = false;
 
-        // Reconciliation: after a replay or a discard, the root is reloaded (from
-        // the cache offline), so provisional cards become server records and
-        // discarded writes stop being projected. No id is remapped.
-        // The framework also ends a sync, with nothing to replay, at every web
-        // client start and reconnection: the reload follows only syncs that had
-        // lead or activity entries waiting for a replay, which is what the
-        // pipeline displays. Parked entries (`extras.error`) are not waiting: the
-        // framework's sync skips them, and they stay queued until discarded.
-        // `hasQueuedEntries` is armed while such entries are queued, and disarmed
-        // by the reload after a replay or by a discard that leaves none. Entries
-        // leaving the queue during a replay are not discards, so it stays armed
-        // until that replay ends.
+        // Reconciliation reload: ignore empty and parked-only syncs. Arm while
+        // replayable CRM entries are queued on a small screen; keep armed until the
+        // sync ends, or disarm when a discard leaves none. A wide screen neither
+        // reads the queue nor stays armed: turning small reloads the root anyway.
         const hasEntriesToReplay = () =>
             ["crm.lead", "mail.activity"].some((model) =>
                 this.crmOffline.queuedEntries(model).some(({ value }) => !value.extras?.error)
             );
         let hasQueuedEntries = false;
         useEffect(() => {
+            if (!this.isMobile) {
+                hasQueuedEntries = false;
+                return;
+            }
             if (hasEntriesToReplay()) {
                 hasQueuedEntries = true;
             }
@@ -537,7 +452,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             }
         });
         const disarmAfterDiscard = () => {
-            if (!hasEntriesToReplay()) {
+            if (!this.isMobile || !hasEntriesToReplay()) {
                 hasQueuedEntries = false;
             }
         };
@@ -576,14 +491,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             }
         });
 
-        /** "Back" of the uncached-lead helper (the stage body's or the ungrouped one's). */
         this.crmHelperBackRef = signal.ref();
-        /** Id of the uncached-lead helper, which describes its "Back" button. */
         this.crmLeadHelperId = uniqueId("o_crm_mobile_pipeline_lead_helper_");
         /**
-         * Focus that the next patch moves once it renders its target: the "Back"
-         * button of the helper shown for `helperLeadId`, or the open button of the
-         * card of `leadId` after "Back".
+         * Focus target for the next patch: helper Back, or the reopened lead card.
          *
          * @type {{helperLeadId: number}|{leadId: number}|null}
          */
@@ -624,12 +535,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     // Getters
     // -------------------------------------------------------------------------
 
-    /** Small-screen layout, read live (follows viewport changes). */
     get isMobile() {
         return this.crmOffline.isSmall;
     }
 
-    /** Small screen and grouped by stage: one stage at a time. */
     get isStagePipeline() {
         const { list } = this.props;
         return this.isMobile && list.isGrouped && list.groupByField?.name === "stage_id";
@@ -643,7 +552,6 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         return this.getGroupsOrRecords().map(({ group }) => group);
     }
 
-    /** `mobile.activeIndex` clamped to the current groups. */
     get activeIndex() {
         const count = this.stageGroups.length;
         if (!count) {
@@ -652,7 +560,6 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         return Math.min(Math.max(this.mobile.activeIndex, 0), count - 1);
     }
 
-    /** The displayed stage group, or `null` when there is none. */
     get activeGroup() {
         return this.stageGroups[this.activeIndex] || null;
     }
@@ -667,12 +574,9 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
 
     /**
      * @override
-     * The framework's empty-data helper derives emptiness from the server counts
-     * only. The mobile layout also shows the leads created offline and projects
-     * the queued writes onto the loaded leads, so it shows the helper only while
-     * no lead card shows in any listed stage (or in the ungrouped list). The
-     * framework's decision is kept where the framework renders (wide screen,
-     * another grouping, a stage grouping without groups) and in sample mode.
+     * Framework counts omit provisional/projected cards. In the mobile layout, show
+     * the empty helper only when no card remains; preserve framework decisions
+     * elsewhere and in sample mode.
      *
      * @returns {boolean}
      */
@@ -728,14 +632,14 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     // -------------------------------------------------------------------------
 
     /**
-     * Caches the activity types once per instance, when mounted on a small screen
-     * and online. This request is mobile-only: it is never issued on a wide screen.
+     * Mobile-only activity-type warm-up, when mounted and online. The shared hook
+     * warms once per session and retries after a failure, so a reconnection or a
+     * return to a small screen tries again.
      */
     crmMaybeWarm() {
-        if (this.crmWarmed || !this.crmMounted || !this.isMobile || this.crmOffline.isOffline()) {
+        if (!this.crmMounted || !this.isMobile || this.crmOffline.isOffline()) {
             return;
         }
-        this.crmWarmed = true;
         this.crmOffline.warmActivityTypes();
     }
 
@@ -770,11 +674,6 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     // Navigation
     // -------------------------------------------------------------------------
 
-    /**
-     * Shows the stage at `index` (clamped), leaving any lead helper.
-     *
-     * @param {number} index
-     */
     async goToStage(index) {
         const count = this.stageGroups.length;
         if (!count) {
@@ -936,11 +835,6 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         });
     }
 
-    /**
-     * Cards of an ungrouped list: the loaded leads whose projection is visible.
-     *
-     * @returns {Object[]} records
-     */
     getUngroupedRecords() {
         return this.props.list.records.filter(
             (record) => !record.isInQuickCreation && this.crmOffline.projectLead(record) !== null
@@ -1059,11 +953,8 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     }
 
     /**
-     * Text of the stage header's status region, which assistive technologies read
-     * out when the displayed stage or its count or revenue changes (queued creates,
-     * edits and moves, a replay): the final values, never the intermediate ones the
-     * animated revenue shows. The revenue part is left out when the header omits it.
-     * Labelled values, so the text reads right whatever the count.
+     * Announces the final stage count/revenue through the status region, not
+     * intermediate animated values.
      *
      * @param {{count: number, revenue: {value: number, currencies: number[]|undefined}|null}} stageView
      *  `crmStageView(group)` of this render
@@ -1099,11 +990,6 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         return formatInteger(value, { humanReadable: true, minDigits: 3 });
     }
 
-    /**
-     * Offline, a stage with leads none of which was ever loaded.
-     *
-     * @param {Object} group
-     */
     isStageUnavailableOffline(group) {
         return this.crmOffline.isOffline() && group.count > 0 && group.list.records.length === 0;
     }
@@ -1123,13 +1009,6 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         return count - loaded.length;
     }
 
-    /**
-     * "Load more" (`crmLoadMore`) is offered online only, while the stage has leads
-     * left to load.
-     *
-     * @param {number} unloadedCount `crmGetUnloadedCount` of the stage
-     * @returns {boolean}
-     */
     showLoadMore(unloadedCount) {
         return !this.crmOffline.isOffline() && unloadedCount > 0;
     }
@@ -1197,7 +1076,6 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         return this.props.openRecord(record);
     }
 
-    /** Leaves the lead helper: the lead's card takes the focus back. */
     closeLeadHelper() {
         const leadId = this.mobile.helperLeadId;
         this.mobile.helperLeadId = false;
@@ -1205,13 +1083,8 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     }
 
     /**
-     * Moves the focus `openLead` or `closeLeadHelper` requested, once a patch has
-     * rendered its target. The card button that opened the helper, and the "Back"
-     * button that closes it, leave the DOM with that patch, which would otherwise
-     * drop the focus to the document body. "Back" is described by the helper's
-     * text, so the reason the form did not open is read with it. A request whose
-     * target the patch did not render (the helper left or replaced in the meantime,
-     * the lead no longer listed) is dropped.
+     * Applies requested focus after patching; helper/card replacement would otherwise
+     * leave focus on the body. Drops requests whose targets disappeared.
      */
     crmApplyFocusRequest() {
         const request = this.crmFocusRequest;
@@ -1257,16 +1130,24 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     /**
      * Moves a lead to a stage. On the stage pipeline this is the framework's move
      * (queued offline, the CRM model skips its rainbowman lookup); on an ungrouped
-     * list the record saves its new stage.
+     * list the record saves its new stage. A stage id that is not a positive
+     * integer of an offered stage (`stages`) is ignored: nothing changes, and
+     * nothing is saved or queued.
      *
      * @param {Object} record
      * @param {number} stageId
      * @returns {Promise|undefined}
      */
     moveLead(record, stageId) {
+        const stage =
+            Number.isSafeInteger(stageId) && stageId > 0
+                ? this.stages.find((s) => s.id === stageId)
+                : undefined;
+        if (!stage) {
+            return;
+        }
         let holder;
-        const stage = this.stages.find((s) => s.id === stageId);
-        const stageValue = { id: stageId, display_name: stage?.display_name ?? "" };
+        const stageValue = { id: stage.id, display_name: stage.display_name ?? "" };
         if (this.isStagePipeline) {
             const groups = this.stageGroups;
             const source = groups.find((group) => group.list.records.includes(record));
@@ -1298,18 +1179,9 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     }
 
     /**
-     * Saves a stage choice through the framework (`save`: the group move or the
-     * record save) and keeps it the lead's last queued stage write.
-     *
-     * Offline, the framework queues the save under the key of the record's first
-     * offline save, with that save's timestamp (or the current one, which writes
-     * queued in the same millisecond share), while `crmWriteStage` queues its
-     * writes after every queued lead write. Replay and `projectLead` follow
-     * `extras.timeStamp`, so another queued stage write of the lead timestamped at
-     * or after the choice would win over it: the choice is then also written
-     * through `crmWriteStage`, after every queued lead write. An online save, a
-     * save that queued nothing and a choice already queued last add nothing. A
-     * queued save whose values are not a field-value mapping writes no stage.
+     * Keeps a saved stage choice last in replay order. If another queued stage write
+     * ties or follows the framework save's reused timestamp, appends an explicit
+     * `crmWriteStage`; unchanged or already-last choices add nothing.
      *
      * @param {Object} record
      * @param {{id: number, display_name: string}} stageValue
@@ -1403,13 +1275,9 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         }
         const { model } = this.props.list;
         if (model.useSampleModel) {
-            // The sample data leaves when the sheet opens, as when the framework's
-            // kanban quick create opens. Offline, the created lead is only queued and
-            // no reload ends sample mode, so its provisional card would otherwise
-            // show among sample cards, under the sample helper. The sample sums go
-            // too (the framework's column headers drop them with the counts): the
-            // stage header then sums no lead, as for an empty server stage, and
-            // shows the revenue of the leads created offline only.
+            // Leave sample mode before creating offline: no server reload will remove
+            // sample cards or aggregates. Clear them so only provisional revenue is
+            // shown.
             model.removeSampleDataInGroups();
             model.useSampleModel = false;
             for (const stageGroup of this.props.list.groups) {
@@ -1427,11 +1295,18 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * Creates the lead: online it is saved and the pipeline reloads; offline it is
      * queued with its display values (the provisional card). An online server error
      * rejects, so the sheet keeps the entered values. Then shows the chosen stage.
+     * The sheet keeps the stages it opened with, so a stage no longer among the
+     * current ones (`false` only while none is) is refused before any request.
      *
      * @param {Object} values the six quick-create values (`stage_id` is an id)
+     * @returns {Promise<false|undefined>} `false` when the stage is refused
      */
     async onQuickCreateSave(values) {
-        const stage = this.stages.find((s) => s.id === values.stage_id);
+        const stages = this.stages;
+        const stage = stages.find((s) => s.id === values.stage_id);
+        if (!stage && (stages.length || values.stage_id !== false)) {
+            return false;
+        }
         const { actionId, actionName } = this.env.config || {};
         await this.crmOffline.createLead(this.props.list, values, {
             actionId,
@@ -1454,11 +1329,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
 // View
 // -----------------------------------------------------------------------------
 
-/**
- * The `crm_kanban` view (model `CrmKanbanModel`, arch parser `CrmKanbanArchParser`,
- * default kanban search model, `crm.Kanban.Buttons`) with the controller and
- * renderer above.
- */
+/** Reuses the CRM kanban model, arch parser and search model. */
 export const crmMobilePipelineView = {
     ...crmKanbanView,
     Controller: CrmMobilePipelineController,

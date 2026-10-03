@@ -1,43 +1,7 @@
-/**
- * CRM offline and mobile support: the one module that talks to the framework
- * offline plugin on behalf of CRM.
- *
- * It provides:
- * - `useCrmOffline()`, the hook every CRM mobile component and the lead form use
- *   to read the framework queue and connection state and to queue CRM writes;
- * - the quick-create deep-link flag (`crm_quick_create` URL parameter);
- * - the activity page size remembered per mobile root load (`getCrmActivityLimit`,
- *   `setCrmActivityLimit`), a view preference holding no record data;
- * - the activity sub-fields both mobile root loads read (`CRM_ACTIVITY_SUBFIELDS`,
- *   `getCrmActivitySubfields`);
- * - the frozen DISABLE sets generated from `offline_inventory.md`;
- * - module-level, CRM-scoped guards patched into framework classes and services
- *   (view buttons, navigation, view mount, action menus, team cards, tag colours,
- *   relational autocomplete, team form).
- *
- * Design rules shared by every guard below:
- * - the plugin is the framework `OfflinePlugin`, resolved with `usePlugin`, or the
- *   instance a framework class already holds; this module owns no queue, cache,
- *   record store or connectivity detection of its own;
- * - a guard whose CRM scope is known from the call or the component itself (the
- *   record, view or current action model, button params, an action `xml_id` string
- *   or action object, a menu `xmlid`, a view type, component props) tests that
- *   scope BEFORE the offline signal is read, so components outside CRM never
- *   subscribe to it and never re-render;
- * - the two action-service entry points that cannot know their action without
- *   loading it, `doAction` with a numeric id and `loadState` (a URL or router
- *   state), read the offline signal first. Online they call the original at once.
- *   Offline they resolve the action from the sources the original reads itself,
- *   the session's stored `current_action` (`loadState` only) and the disk-cached
- *   `loadAction`, so they issue no request the action service would not issue;
- *   they stop only for a disabled CRM action or, in a state, a blocked CRM view
- *   type, and pass any other request, including an action they cannot identify
- *   (a client action, or one not cached), to the original with the same arguments;
- * - online, and outside CRM, each guard calls the original with the same
- *   arguments and returns its result unchanged (same DOM, same requests).
- */
+/** Shared CRM offline hooks and execution guards backed by the framework `OfflinePlugin`. */
 
 import { onMounted, onPatched, proxy, signal, untrack, useEffect, usePlugin } from "@odoo/owl";
+import { ActivityButton } from "@mail/core/web/activity_button";
 import { AutoComplete } from "@web/core/autocomplete/autocomplete";
 import { browser } from "@web/core/browser/browser";
 // The `loadState()` guard must inspect the state the action service itself falls
@@ -69,8 +33,9 @@ import { menuService } from "@web/webclient/menus/menu_service";
 // -----------------------------------------------------------------------------
 
 /**
- * Builds a read-only Set: `add`, `delete` and `clear` throw, and the instance is
- * frozen, so no module can widen or narrow a DISABLE set at runtime.
+ * Builds a Set whose own `add`, `delete` and `clear` throw and whose own
+ * properties are frozen: this stops ordinary API misuse, not borrowed
+ * `Set.prototype` methods.
  *
  * @param {Iterable<string>} values
  * @returns {ReadonlySet<string>}
@@ -180,7 +145,6 @@ const LEAD_WRITE_METHODS = freezeSet([
     "action_unarchive",
 ]);
 
-/** Lead fields `projectLead` projects (plus `won_status`/`probability` when loaded). */
 const PROJECTED_FIELDS = Object.freeze([
     "name",
     "partner_id",
@@ -246,102 +210,17 @@ export function getCrmActivitySubfields(extraProps = {}) {
 }
 
 // -----------------------------------------------------------------------------
-// Activity page size preference
+// Activity page sizes
 // -----------------------------------------------------------------------------
 
-/** `localStorage` key of the remembered activity page sizes: JSON `{[scope]: limit}`. */
-const ACTIVITY_LIMITS_STORAGE_KEY = "crm.mobile_activity_limits";
-/** Most scopes whose page size is remembered: the least recently set are dropped. */
-const ACTIVITY_LIMITS_MAX_SCOPES = 50;
-
 /**
- * Tells whether `limit` is a page size worth remembering: an integer above the
- * default first page.
+ * Activity page sizes raised by "Show more", per root load scope, kept in memory
+ * for the web-client session (the offline plugin instance) and never persisted:
+ * a new session requests the first page, which its first online visit cached.
  *
- * @param {unknown} limit
- * @returns {boolean}
+ * @type {WeakMap<OfflinePlugin, Map<string, number>>}
  */
-function isRaisedActivityLimit(limit) {
-    return Number.isInteger(limit) && limit > CRM_MOBILE_ACTIVITY_LIMIT;
-}
-
-/**
- * Remembered page sizes, `{[scope]: limit}`, in the order they were last set.
- * A missing or unreadable value (invalid JSON, not an object, storage throwing)
- * reads as no preference at all.
- *
- * @returns {Object<string, number>}
- */
-function readActivityLimits() {
-    try {
-        const stored = JSON.parse(browser.localStorage.getItem(ACTIVITY_LIMITS_STORAGE_KEY));
-        if (stored && typeof stored === "object" && !Array.isArray(stored)) {
-            return stored;
-        }
-    } catch {
-        // Unreadable preference: every scope uses the default page size.
-    }
-    return {};
-}
-
-/**
- * Activity page size the mobile root load of `scope` requests: the one a "Show
- * more" remembered for it, `CRM_MOBILE_ACTIVITY_LIMIT` otherwise.
- *
- * This is a view preference, persisted in `localStorage` the way the list view
- * persists its optional columns: it stores no record data, since the rows of a
- * page stay in the framework's RPC cache with the root load that read them. The
- * page size is part of that root load's request, hence of its cache key: reading
- * it from here, after a reopen or a cold start, issues the same request as the
- * last visit of `scope`, so a page reached through "Show more" online is still
- * served from the cache offline.
- *
- * A `scope` names one kind of root load whose request only differs by the page
- * size, e.g. a pipeline action and search, or a lead form.
- *
- * @param {string} scope
- * @returns {number}
- */
-export function getCrmActivityLimit(scope) {
-    const limit = readActivityLimits()[scope];
-    return isRaisedActivityLimit(limit) ? limit : CRM_MOBILE_ACTIVITY_LIMIT;
-}
-
-/**
- * Remembers the activity page size of `scope` (see `getCrmActivityLimit`). A
- * limit that is not above `CRM_MOBILE_ACTIVITY_LIMIT` forgets the scope. The
- * scope just set becomes the most recent one, and only the
- * `ACTIVITY_LIMITS_MAX_SCOPES` most recent scopes are kept. A storage that
- * cannot be written (quota, disabled storage) leaves the preference unchanged.
- *
- * @param {string} scope
- * @param {number} limit
- */
-export function setCrmActivityLimit(scope, limit) {
-    try {
-        const limits = {};
-        for (const [storedScope, storedLimit] of Object.entries(readActivityLimits())) {
-            if (storedScope !== scope && isRaisedActivityLimit(storedLimit)) {
-                limits[storedScope] = storedLimit;
-            }
-        }
-        if (isRaisedActivityLimit(limit)) {
-            limits[scope] = limit;
-        }
-        const scopes = Object.keys(limits);
-        const dropped = Math.max(scopes.length - ACTIVITY_LIMITS_MAX_SCOPES, 0);
-        for (const oldScope of scopes.slice(0, dropped)) {
-            delete limits[oldScope];
-        }
-        if (Object.keys(limits).length) {
-            browser.localStorage.setItem(ACTIVITY_LIMITS_STORAGE_KEY, JSON.stringify(limits));
-        } else {
-            browser.localStorage.removeItem(ACTIVITY_LIMITS_STORAGE_KEY);
-        }
-    } catch {
-        // The page size is not remembered: the next root load uses the stored one.
-    }
-}
+const activityLimits = new WeakMap();
 
 // -----------------------------------------------------------------------------
 // Predicates
@@ -400,13 +279,6 @@ export function isCrmOfflineGuarded(record, clickParams, attrs) {
     );
 }
 
-/**
- * Tells whether a view type is blocked offline for the given model.
- *
- * @param {string} [resModel]
- * @param {string} [viewType]
- * @returns {boolean}
- */
 function isBlockedViewType(resModel, viewType) {
     return (
         CRM_OFFLINE_BLOCKED_VIEW_MODELS.has(resModel) &&
@@ -419,16 +291,28 @@ function isBlockedViewType(resModel, viewType) {
 // -----------------------------------------------------------------------------
 
 /**
- * `?crm_quick_create` (PWA shortcut "New Lead") read once, at module evaluation,
- * before the router rewrites the URL. `pending` is the test seam: tests set it.
+ * Whether a URL query string carries the "New Lead" deep-link flag: only
+ * `crm_quick_create=1`, the value the PWA shortcut sends, sets it.
+ *
+ * @param {string} search URL query string, e.g. `location.search`
+ * @returns {boolean}
+ */
+export function isQuickCreateDeepLink(search) {
+    return new URLSearchParams(search).get("crm_quick_create") === "1";
+}
+
+/**
+ * The "New Lead" deep-link flag (PWA shortcut), set only by `crm_quick_create=1`
+ * and read once, at module evaluation, before the router rewrites the URL.
+ * `pending` is the test seam: tests set it.
  */
 export const quickCreateDeepLink = {
-    pending: new URLSearchParams(browser.location.search).has("crm_quick_create"),
+    pending: isQuickCreateDeepLink(browser.location.search),
 };
 
 /**
- * Returns `true` the first time it is called after the deep link was opened, then
- * `false`: the quick-create sheet opens once per page load.
+ * Consumes and clears the pending quick-create flag, returning whether it was set.
+ * Does not open a sheet; the caller controls that action.
  *
  * @returns {boolean}
  */
@@ -442,40 +326,23 @@ export function consumeQuickCreateDeepLink() {
 // Queue reading helpers (pure functions over framework queue entries)
 // -----------------------------------------------------------------------------
 
-/**
- * Orders queue entries as the framework replays them (`extras.timeStamp`).
- *
- * @param {{value: {extras?: {timeStamp?: number}}}} a
- * @param {{value: {extras?: {timeStamp?: number}}}} b
- */
 function byTimeStamp(a, b) {
     return (a.value.extras?.timeStamp || 0) - (b.value.extras?.timeStamp || 0);
 }
 
-/**
- * Tells whether a queued call's first argument (the target ids) contains `resId`.
- *
- * @param {{args?: any[]}} value
- * @param {number|false} resId
- */
 function targetsRecord(value, resId) {
     const ids = value.args?.[0];
     return Boolean(resId) && Array.isArray(ids) && ids.includes(resId);
 }
 
-/**
- * Tells whether a queued entry has been parked by a rejected replay.
- *
- * @param {{value: {extras?: {error?: string}}}} entry
- */
 function isParked(entry) {
     return Boolean(entry.value.extras?.error);
 }
 
 /**
  * Tells whether a value read back from the queue is a field-value mapping (a
- * plain object, neither `null` nor an array), the shape of a `web_save` values
- * argument and of its display values (`extras.changes`).
+ * non-null, non-array object), the shape of a `web_save` values argument and of
+ * its display values (`extras.changes`).
  *
  * @param {any} value
  * @returns {boolean}
@@ -542,11 +409,6 @@ const warmedActivityTypes = new WeakSet();
  */
 const activityTypesRevisions = new WeakMap();
 
-/**
- * @param {OfflinePlugin} plugin
- * @returns {import("@odoo/owl").Signal<number>} the plugin's revision signal,
- *  created on first use
- */
 function getActivityTypesRevision(plugin) {
     let revision = activityTypesRevisions.get(plugin);
     if (!revision) {
@@ -564,15 +426,8 @@ function getActivityTypesRevision(plugin) {
 const crmReportedErrors = new WeakSet();
 
 /**
- * Reports the error of work nobody awaits, or whose failure must not reject its
- * caller (the reload after a committed write). A `ConnectionLostError` means the
- * connection dropped again meanwhile: it is expected and ignored (work an effect
- * started runs again at its next trigger; a reload keeps the data already
- * loaded). Any other error is handed to the framework error service as an
- * uncaught promise error, the way the action service shows an error of a mounted
- * controller: the standard error dialog, no CRM-specific error UI.
- * Work shared by several owners (merged refreshes, a shared request) rejects each
- * of them with the same error object: that one failure is reported once.
+ * Ignore `ConnectionLostError`; report other unawaited-work failures through
+ * standard unhandled-promise handling, once per error object.
  *
  * @param {unknown} error
  */
@@ -608,21 +463,8 @@ export function crmOwnEffectPromise(result) {
 // -----------------------------------------------------------------------------
 
 /**
- * CRM view of the framework offline state and queue. Call it from a component
- * `setup` only. Every member reads live state (signals, `ui.isSmall`, the queue)
- * when it is called, so a render that calls it re-renders on changes.
- *
- * Queue entries are the framework's `{key, value: {model, method, args, kwargs,
- * extras}}` objects of `OfflinePlugin._ormToSync()`.
- *
- * @example
- * setup() {
- *     this.crmOffline = useCrmOffline();
- *     this.crmOffline.onReplayed(() => this.reload());
- * }
- * get pending() {
- *     return this.crmOffline.hasPendingWrite(this.props.record);
- * }
+ * Setup-only access to CRM's framework offline state and queue; reads remain live
+ * and participate in render/effect tracking.
  */
 export function useCrmOffline() {
     const plugin = usePlugin(OfflinePlugin);
@@ -644,7 +486,6 @@ export function useCrmOffline() {
      */
     const isQueued = (key) => key !== undefined && key !== null && key in plugin._ormToSync();
 
-    /** @param {Object} record */
     const leadWrites = (record) =>
         record
             ? queuedEntries(record.resModel).filter((entry) => isLeadWriteOf(entry, record))
@@ -697,7 +538,6 @@ export function useCrmOffline() {
     };
 
     return {
-        /** @returns {boolean} */
         isOffline,
 
         /** Small-screen (mobile) layout, read live on every access. */
@@ -777,7 +617,6 @@ export function useCrmOffline() {
                     (method === "unlink" || method === "action_archive") &&
                     !isParked(entry)
                 ) {
-                    // Hidden while pending; a parked (rejected) entry projects normally.
                     return null;
                 }
             }
@@ -870,7 +709,6 @@ export function useCrmOffline() {
             }
             const records = record.data.activity_ids?.records || [];
             if (activeField.related?.activeFields?.summary) {
-                // `records` is the loaded page, `count` every activity id of the lead.
                 const total = record.data.activity_ids?.count ?? records.length;
                 return {
                     variant: "mobile",
@@ -905,6 +743,39 @@ export function useCrmOffline() {
                     },
                 ],
             };
+        },
+
+        /**
+         * Activity page size the mobile root loads of `scope` request in this
+         * session: the one "Show more" raised it to, `CRM_MOBILE_ACTIVITY_LIMIT`
+         * otherwise. A `scope` names root loads whose requests differ only by that
+         * page size, e.g. a pipeline action and search, or a lead form.
+         *
+         * @param {string} scope
+         * @returns {number}
+         */
+        getActivityLimit(scope) {
+            return activityLimits.get(plugin)?.get(scope) ?? CRM_MOBILE_ACTIVITY_LIMIT;
+        },
+
+        /**
+         * Sets the activity page size of `scope` for this session. A limit that is
+         * not an integer above `CRM_MOBILE_ACTIVITY_LIMIT` forgets the scope.
+         *
+         * @param {string} scope
+         * @param {number} limit
+         */
+        setActivityLimit(scope, limit) {
+            let limits = activityLimits.get(plugin);
+            if (!Number.isInteger(limit) || limit <= CRM_MOBILE_ACTIVITY_LIMIT) {
+                limits?.delete(scope);
+                return;
+            }
+            if (!limits) {
+                limits = new Map();
+                activityLimits.set(plugin, limits);
+            }
+            limits.set(scope, limit);
         },
 
         /**
@@ -1047,14 +918,10 @@ export function useCrmOffline() {
         },
 
         /**
-         * Creates a lead from the mobile quick-create sheet. Online it saves and
-         * reloads the pipeline; offline (or when the connection drops) it queues a
-         * `web_save` whose `extras` carry the display values of the provisional card
-         * (`{actionId, actionName, viewType, displayName, changes}`). Online, only
-         * a server error of the save rejects, so the sheet keeps the entered
-         * values. Once the lead is saved, a failed pipeline reload is reported once
-         * (`crmReportError`) and the create resolves, so the sheet closes and does
-         * not offer to create the lead a second time.
+         * Create with `list.context`. Offline or connection-loss saves return a queue
+         * key and use `extras.changes` for provisional display. Online save errors
+         * propagate; committed writes resolve even when refresh fails, with errors
+         * reported through `crmReportError`.
          *
          * @param {Object} list the pipeline root list
          * @param {Object} vals server values (`stage_id` is an id)
@@ -1084,10 +951,11 @@ export function useCrmOffline() {
         },
 
         /**
-         * Runs `callback` (untracked) each time a replay of the queue finishes while
-         * online. Setup only. A promise `callback` returns is owned by the hook
-         * (`crmOwnEffectPromise`): a lost connection is ignored, any other error
-         * reaches the framework error service.
+         * Runs `callback` (untracked) after an online `syncingORM` true-to-false
+         * transition, including empty syncs; callers that need a CRM replay must
+         * track the relevant entries. Setup only. A promise `callback` returns is
+         * owned by the hook (`crmOwnEffectPromise`): a lost connection is ignored,
+         * any other error reaches the framework error service.
          *
          * @param {() => (Promise<unknown>|void)} callback
          */
@@ -1136,12 +1004,6 @@ export function useCrmOffline() {
             });
         },
 
-        /**
-         * The module-level `consumeQuickCreateDeepLink`: `true` once per page load
-         * after the "New Lead" deep link, sharing its single once-only flag.
-         *
-         * @returns {boolean}
-         */
         consumeQuickCreateDeepLink,
     };
 }
@@ -1209,6 +1071,27 @@ function isDisabledActionRequest(actionRequest) {
         Boolean(actionRequest) &&
         typeof actionRequest === "object" &&
         CRM_OFFLINE_DISABLED_ACTIONS.has(actionRequest.xml_id)
+    );
+}
+
+/**
+ * Text the server's `/web/action/load` reads as an action id, in the forms Python's
+ * `int()` accepts: Unicode `White_Space` around an optional sign and `Nd` digits,
+ * single `_` between digits allowed (int()'s digit cap and Unicode version aside).
+ */
+const ACTION_ID_TEXT = /^\p{White_Space}*[+-]?\p{Nd}+(?:_\p{Nd}+)*\p{White_Space}*$/u;
+
+/**
+ * Pure: matches the request's form only, never evaluates it.
+ *
+ * @param {unknown} actionRequest
+ * @returns {boolean} whether the request is an action id, as a number or as a
+ *  string the server reads as one (the disk-cache key stays the request itself)
+ */
+function isActionIdRequest(actionRequest) {
+    return (
+        typeof actionRequest === "number" ||
+        (typeof actionRequest === "string" && ACTION_ID_TEXT.test(actionRequest))
     );
 }
 
@@ -1332,9 +1215,11 @@ function guardActionManager(api, offlinePlugin) {
             if (offlinePlugin.isOffline()) {
                 return Promise.resolve();
             }
-        } else if (typeof actionRequest === "number" && offlinePlugin.isOffline()) {
-            // An id is identified through the disk-cached action; an uncached one
-            // cannot be, and goes to the original (whose load fails like any other).
+        } else if (isActionIdRequest(actionRequest) && offlinePlugin.isOffline()) {
+            // An id (a number or a numeric string) is identified through the
+            // disk-cached action, looked up with the request as given so the cache
+            // key is the original's; an uncached one cannot be, and goes to the
+            // original (whose load fails like any other).
             return api
                 .loadAction(actionRequest, options?.additionalContext)
                 .catch(() => null)
@@ -1607,14 +1492,9 @@ const CRM_OFFLINE_DISABLED_MENU_ITEM = ".dropdown-item.o_disabled_offline[aria-d
 
 patch(KanbanDropdownMenuWrapper.prototype, {
     /**
-     * The open card menu's dropdown navigates (Tab, Shift+Tab, arrows, Home, End)
-     * through every `.o-navigable` item and focuses it programmatically, whatever
-     * its `tabindex` or `aria-disabled`; the wrapper marks every `.dropdown-item`
-     * so on each mount and patch. Registered after the wrapper's own callbacks,
-     * these run after them and take the mark back from the items disabled offline,
-     * so a menu opened online never navigates to them. DOM only: no signal is
-     * read, so other kanban menus neither subscribe nor change, and online the
-     * wrapper marks the re-enabled item again.
+     * The dropdown wrapper marks all items `o-navigable` after mount/patch, ignoring
+     * disabled ARIA/tabindex states. Run after it to remove the mark from
+     * offline-disabled team items and preserve keyboard navigation elsewhere.
      */
     setup() {
         super.setup(...arguments);
@@ -1678,13 +1558,51 @@ patch(Many2ManyTagsField.prototype, {
 });
 
 // -----------------------------------------------------------------------------
-// Guard: relational autocomplete of the lead form (partner field)
+// Guard: lead activity buttons (kanban_activity, list_activity)
 // -----------------------------------------------------------------------------
 
 /**
- * @param {Many2XAutocomplete} autocomplete
- * @returns {boolean} whether the autocomplete belongs to a lead view
+ * @param {ActivityButton} button
+ * @returns {boolean} whether a lead's activity button is offline (scope tested first)
  */
+function isLeadActivityButtonOffline(button) {
+    const { record } = button.props;
+    return record.resModel === "crm.lead" && Boolean(record.model?.offlinePlugin?.isOffline());
+}
+
+/**
+ * The activity button of the lead kanban cards (`kanban_activity`) and of the
+ * Opportunities list (`list_activity`, whose button is a subclass). Its popover
+ * fetches the lead's activities from the server, so offline the framework disables
+ * the `<button>` and this guard stops a direct call as well.
+ */
+patch(ActivityButton.prototype, {
+    /** Closes a lead's popover opened online as soon as the connection drops. */
+    setup() {
+        super.setup(...arguments);
+        useEffect(() => {
+            if (isLeadActivityButtonOffline(this)) {
+                untrack(() => this.popover.isOpen && this.popover.close());
+            }
+        });
+    },
+
+    /**
+     * Offline, a lead's button opens no popover, so nothing is fetched; closing a
+     * popover still open stays allowed, and issues no request.
+     */
+    onClick() {
+        if (isLeadActivityButtonOffline(this) && !this.popover.isOpen) {
+            return Promise.resolve();
+        }
+        return super.onClick(...arguments);
+    },
+});
+
+// -----------------------------------------------------------------------------
+// Guard: relational autocomplete of the lead form (partner field)
+// -----------------------------------------------------------------------------
+
 function isLeadAutocomplete(autocomplete) {
     return autocomplete.env.model?.root?.resModel === "crm.lead";
 }
@@ -1770,6 +1688,26 @@ patch(Many2XAutocomplete.prototype, {
         return super.sources.map((source) => guardAutocompleteSource(this, source));
     },
 
+    /**
+     * Offline, a lead view's record search reads the relational-field cache only.
+     * The framework search issues `web_name_search` first and falls back to the
+     * same cache once the lost connection refuses it, so every offline query would
+     * still attempt a request. `searchMany2XRecords` resolves `undefined` without a
+     * secure context or the session's cache secret, which is read as no cached
+     * record.
+     *
+     * @param {string} name
+     * @returns {Promise<Object[]>}
+     */
+    search(name) {
+        if (this.crmOfflineInlineSearch) {
+            return this.offlinePlugin
+                .searchMany2XRecords(this.props.resModel, name)
+                .then((records) => records || []);
+        }
+        return super.search(...arguments);
+    },
+
     onSearchMore() {
         if (this.crmOfflineInlineSearch) {
             return Promise.resolve();
@@ -1785,10 +1723,6 @@ patch(Many2XAutocomplete.prototype, {
     },
 });
 
-/**
- * @param {Object} [option] an option normalized by AutoComplete
- * @returns {boolean} whether it is a guarded lead option that is inert now
- */
 function isInertGuardedOption(option) {
     return Boolean(option?.[CRM_OFFLINE_GUARDED_OPTION] && option.unselectable);
 }

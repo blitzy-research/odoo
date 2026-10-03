@@ -1,15 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <templates xml:space="preserve">
 
-    <!--
-        Bottom-sheet quick create of the CRM mobile pipeline (CrmMobileQuickCreate).
-        It captures exactly six crm.lead fields and nothing else: no "Edit" or
-        "Create and edit" flow, no onchange. Every field and both buttons carry
-        data-available-offline on the interactive element itself, so the offline
-        plugin never disables them and the sheet stays usable offline.
-        novalidate lets the component's own name check run instead of the browser
-        bubble; Save submits the form, which calls onSubmit -> onSave.
-    -->
+    <!-- Component validation replaces native bubbles; submit through onSubmit. -->
     <t t-name="crm.CrmMobileQuickCreate">
         <form class="o_crm_mobile_quick_create d-flex flex-column gap-2 p-1"
             t-att-aria-labelledby="this.fieldId('title')"
@@ -91,14 +83,23 @@
                 <label class="form-label" t-att-for="this.fieldId('stage_id')">Stage</label>
                 <!-- .number keeps state.stage_id a number: options are selected by strict equality with stage.id -->
                 <select class="form-select o_crm_mobile_quick_create_field"
+                    t-att-class="{ 'is-invalid o_field_invalid': this.state.invalidStage }"
                     t-att-id="this.fieldId('stage_id')"
                     name="stage_id"
+                    t-ref="this.stageRef"
                     t-model.proxy.number="this.state.stage_id"
+                    t-on-change="this.onStageChange"
+                    t-att-aria-invalid="this.state.invalidStage ? 'true' : false"
+                    t-att-aria-describedby="this.state.invalidStage ? this.fieldId('stage_id_feedback') : false"
                     data-available-offline="1">
                     <option t-foreach="this.props.stages" t-as="stage" t-key="stage.id"
                         t-att-value="stage.id"
                         t-out="stage.display_name"/>
                 </select>
+                <div t-if="this.state.invalidStage"
+                    class="invalid-feedback d-block"
+                    role="alert"
+                    t-att-id="this.fieldId('stage_id_feedback')">Select a stage from the list.</div>
             </div>
 
             <div class="o_crm_mobile_quick_create_buttons d-flex gap-2 mt-2">

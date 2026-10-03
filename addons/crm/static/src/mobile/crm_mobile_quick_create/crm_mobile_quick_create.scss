@@ -1,19 +1,7 @@
-// Bottom-sheet quick create of the CRM mobile pipeline (`crm.CrmMobileQuickCreate`).
-//
-// The form is rendered only inside the small-screen bottom sheet, so every rule is
-// nested under its root class and nothing here can match a desktop screen. The sheet
-// itself (`.o_bottom_sheet`) and the look of offline-disabled controls
-// (`.o_disabled_offline`) keep the framework's styling and are never overridden here.
-//
-// Block-axis spacing is written with logical properties: in the sheet's horizontal
-// writing mode `margin-block-start`, `margin-block-end` and `padding-block-end` are
-// `margin-top`, `margin-bottom` and `padding-bottom`. All spacing is a multiple of
-// Bootstrap's `$spacer`.
+// Mobile quick-create styles; logical spacing follows the sheet's writing direction.
 
 .o_crm_mobile_quick_create {
-    // Spacing between the rows, between the two buttons, and around the button row.
     --CrmMobileQuickCreate-gap: #{$spacer * 0.5};
-    // Minimum width and height of every field and button: the 44 x 44 px touch target.
     --CrmMobileQuickCreate-touchTarget: 44px;
 
     display: flex;
@@ -21,7 +9,6 @@
     gap: var(--CrmMobileQuickCreate-gap);
     width: 100%;
 
-    // One label above its control.
     .o_crm_mobile_quick_create_row {
         display: flex;
         flex-direction: column;
@@ -32,7 +19,6 @@
         }
     }
 
-    // The six fields: five inputs and the stage select.
     .o_crm_mobile_quick_create_field {
         width: 100%;
         min-width: var(--CrmMobileQuickCreate-touchTarget);
@@ -43,7 +29,6 @@
         font-size: #{"max(1rem, 16px)"};
     }
 
-    // Save and Cancel, side by side across the full width of the sheet.
     .o_crm_mobile_quick_create_buttons {
         display: flex;
         gap: var(--CrmMobileQuickCreate-gap);

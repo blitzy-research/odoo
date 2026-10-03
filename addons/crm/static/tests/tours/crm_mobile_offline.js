@@ -2,43 +2,17 @@ import { registry } from "@web/core/registry";
 import { stepUtils } from "@web_tour/tour_utils";
 
 /**
- * Tour `crm_mobile_offline`: the full offline write-and-replay cycle of the CRM
- * mobile pipeline on a phone-sized browser.
+ * Tour `crm_mobile_offline`, run by `TestCrmOffline.test_crm_mobile_offline_tour`
+ * (addons/crm/tests/test_crm_offline.py) at 375x667 with touch, logged in as
+ * `user_sales_salesman`.
  *
- * Runner: `addons/crm/tests/test_crm_offline.py`,
- * `TestCrmOffline.test_crm_mobile_offline_tour`, which calls
- * `start_tour("/odoo", "crm_mobile_offline", login="user_sales_salesman")` with
- * `browser_size = "375x667"` and `touch_enabled = True`, so `ui.isSmall` holds and
- * the mobile pipeline renders. The runner asserts the server state once the tour
- * has succeeded, and the tour only ends after the offline queue is empty.
- *
- * Fixture contract with the runner (both files must keep these values):
- * - "Synced Lead": `type='opportunity'`, `user_id = user_sales_salesman`,
- *   `stage_id = stage_gen_1` ("Generic stage", the first pipeline group of this
- *   user, who is in no sales team), with one open `mail.mail_activity_data_todo`
- *   activity, summary "Fixture Activity", assigned to the salesman.
- * - Offline edit of "Synced Lead": `expected_revenue` set to 4242.
- * - Offline quick create: name "Offline Lead", stage "Generic stage", every other
- *   field left empty.
- * - Offline "Log a call" on "Synced Lead" with the sheet's defaults (Call type
- *   `mail.mail_activity_data_call`, summary "Call", deadline today, assignee the
- *   session user), left unedited.
- * - Offline: "Fixture Activity" marked done, then "Synced Lead" marked Won.
- *
- * The connection is cut by making every XMLHttpRequest fail like a lost network:
- * the RPC layer turns the `error` event into a `ConnectionLostError`, which puts
- * the offline plugin offline. Reconnecting restores the original `send` and asks
- * the offline systray to check the connection, which replays the queue in
- * timestamp order.
- *
- * Offline, the framework's cached root loads still try the network in the
- * background, and the error service logs each resulting `ConnectionLostError`
- * with `console.error`. The runner ignores `connectionlosterror:` messages only
- * once the tour has ended (odoo/tests/common.py:118-122, 2055), so from going
- * offline until the queue has replayed the tour logs exactly those messages with
- * `console.info` instead. Every other error still fails the tour, and a lost
- * connection during the replay keeps calls queued, which fails the queue-empty
- * step.
+ * Fixture contract with the runner (both files must keep these values): the
+ * salesman's "Synced Lead" in "Generic stage", with the "Fixture Activity" To-Do.
+ * Offline, the tour then:
+ * - edits its expected revenue to 4242;
+ * - quick-creates "Offline Lead" in the same stage;
+ * - saves "Log a call" with its default Call;
+ * - marks the fixture activity done, then the lead Won.
  */
 
 const SYNCED_CARD = ".o_crm_mobile_lead_card:contains(Synced Lead)";
@@ -67,8 +41,9 @@ function isConnectionLostLog(value) {
  * Cuts the connection: every later XMLHttpRequest fails with an asynchronous
  * `error` event, as a real network failure does. The window `offline` event makes
  * the offline plugin check the connection at once, instead of waiting for the
- * next request. From now on the expected `ConnectionLostError` logs go to
- * `console.info` (see the module comment).
+ * next request. HttpCase filters `ConnectionLostError` logs only after the tour
+ * has ended, so until the queue-empty checkpoint the tour redirects only those
+ * logs to `console.info`.
  *
  * @returns {Object} tour step
  */
@@ -123,8 +98,8 @@ function goOnline() {
 }
 
 /**
- * Once the queue has replayed, every request issued offline has settled and been
- * logged, so `console.error` is restored: from here on any error fails the tour.
+ * Restore console.error after the queue-empty checkpoint, ending the expected
+ * ConnectionLostError filter.
  *
  * @returns {Object} tour step
  */

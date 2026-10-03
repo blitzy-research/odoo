@@ -7,14 +7,8 @@ import { ConnectionLostError } from "@web/core/network/rpc";
 export class CrmColumnProgress extends RottingColumnProgress {
     static template = "crm.ColumnProgress";
     setup() {
-        // `super.setup()` provides `this.offlinePlugin` (web `ColumnProgress`), the only
-        // connectivity source read here.
         super.setup();
-        // Result of the `crm.group_use_recurring_revenues` probe. Visibility is derived from
-        // it by the `showRecurringRevenue` getter, which must not be assigned (getter-only).
         this.hasRecurringRevenueGroup = false;
-        // True when the probe could not run because the connection was lost: the effect
-        // below then issues it once, on the first online render.
         this.crmRecurringProbePending = false;
         const rrField = this.props.progressBarState.progressAttributes.recurring_revenue_sum_field;
 
@@ -32,9 +26,8 @@ export class CrmColumnProgress extends RottingColumnProgress {
                     "crm.group_use_recurring_revenues"
                 );
             } catch (error) {
-                // A connection lost during the probe hides the aggregate instead of failing
-                // the column, and defers the probe to the reconnection; online, no
-                // ConnectionLostError occurs, so the online result and errors are unchanged.
+                // Only ConnectionLostError hides MRR and defers the advisory probe; rethrow every
+                // other error.
                 if (!(error instanceof ConnectionLostError)) {
                     throw error;
                 }
@@ -71,12 +64,8 @@ export class CrmColumnProgress extends RottingColumnProgress {
     }
 
     /**
-     * Whether the recurring-revenue (MRR) aggregate is rendered. PART 2 #5, SKIP offline: no
-     * `has_group` request is issued and no MRR node is rendered while offline.
-     *
-     * Reading the `isOffline` signal during render subscribes the component, so a column
-     * mounted online hides the aggregate as soon as the connection drops and shows it again
-     * on reconnection, without a remount. Online, the value equals the probe result.
+     * MRR is visible only with cached group access and a live connection; the connectivity signal
+     * updates an already-mounted column.
      *
      * @returns {boolean}
      */

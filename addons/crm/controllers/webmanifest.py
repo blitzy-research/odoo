@@ -8,21 +8,10 @@ from odoo.addons.web.controllers import webmanifest
 class WebManifest(webmanifest.WebManifest):
 
     def _get_shortcuts(self):
-        """ Append the CRM "My Pipeline" and "New Lead" PWA shortcuts.
-
-        The two shortcuts follow the parent entries, which are kept in order and
-        unmodified. They are appended only when the parent result holds the CRM
-        app entry: a public user (who gets no shortcut at all) or a user who
-        cannot see the CRM menus gets the parent list unchanged.
-
-        Both open the "My Pipeline" menu, so their URL keeps the
-        ``/odoo?menu_id=`` shape of every manifest shortcut. The
-        ``crm_quick_create`` flag of "New Lead" is consumed by the mobile
-        pipeline, which then opens its quick-create sheet once.
-
-        The manifest is one response for every device, so the shortcuts are not
-        gated on screen size: on a wide screen "New Lead" opens the unchanged
-        desktop pipeline, which ignores the flag.
+        """ Append My Pipeline and New Lead after the parent shortcuts only when a CRM app entry
+        exists. Both target the pipeline menu; on a phone, New Lead consumes ``crm_quick_create``
+        once to open its sheet. Manifest metadata is cross-device, so a wide screen opens the
+        desktop pipeline without the sheet.
         """
         shortcuts = super()._get_shortcuts()
         if not shortcuts:

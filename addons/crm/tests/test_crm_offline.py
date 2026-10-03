@@ -13,6 +13,7 @@ from odoo.tests.common import tagged
 from odoo.tools import file_open
 
 from odoo.addons.crm.tests.common import TestCrmCommon
+from odoo.addons.mail.tests.common import mail_new_test_user
 from odoo.addons.web.controllers.webmanifest import WebManifest as WebManifestBase
 
 
@@ -102,14 +103,12 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         parent = parent_results[-1]
         shortcuts = data['shortcuts']
 
-        # parent entries: present, unchanged, first, and holding the CRM app entry
         self.assertEqual(shortcuts[:len(parent)], parent)
         self.assertEqual(len(shortcuts), len(parent) + 2, "Exactly two CRM shortcuts are appended")
         crm_app_url = '/odoo?menu_id=%s' % self.env.ref('crm.crm_menu_root').id
         crm_app_entries = [shortcut for shortcut in parent if shortcut['url'] == crm_app_url]
         self.assertEqual(len(crm_app_entries), 1, "The parent lists the CRM app")
 
-        # appended entries: names, order and shape
         pipeline_shortcut, new_lead_shortcut = shortcuts[len(parent):]
         self.assertEqual(pipeline_shortcut['name'], "My Pipeline")
         self.assertEqual(new_lead_shortcut['name'], "New Lead")
@@ -122,19 +121,16 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
                 self.assertTrue(shortcut['url'].startswith('/odoo?menu_id='))
                 self.assertEqual(shortcut['icons'], expected_icons)
 
-        # appended entries: both open "My Pipeline", "New Lead" with the quick create flag
         pipeline_url = '/odoo?menu_id=%s' % self.env.ref('crm.menu_crm_opportunities').id
         self.assertEqual(pipeline_shortcut['url'], pipeline_url)
         self.assertTrue(new_lead_shortcut['url'].startswith(pipeline_url))
         self.assertTrue(new_lead_shortcut['url'].endswith('&crm_quick_create=1'))
         self.assertEqual(new_lead_shortcut['url'], pipeline_url + '&crm_quick_create=1')
 
-        # the shortcut icon is served
         icon_response = self.url_open(expected_icons[0]['src'])
         self.assertEqual(icon_response.status_code, 200)
         self.assertTrue(icon_response.headers['Content-Type'].startswith('image/png'))
 
-        # the rest of the manifest is unchanged
         self.assertEqual(data['background_color'], '#714B67')
         self.assertEqual(data['theme_color'], '#714B67')
         self.assertIn('share_target', data)
@@ -150,6 +146,44 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers['Content-Type'], 'application/manifest+json')
         self.assertEqual(response.json()['shortcuts'], [])
+
+    def test_webmanifest_crm_shortcuts_without_crm_menus(self):
+        """ An internal user who cannot see the CRM menus gets the shortcuts of
+        their other apps from the parent but no CRM app entry, so CRM appends
+        nothing and the parent list is returned unchanged. """
+        user_employee = mail_new_test_user(
+            self.env, login='user_employee_no_crm',
+            name='Ernest Employee', email='employee_no_crm@test.example.com',
+            groups='base.group_user',
+        )
+        crm_root = self.env.ref('crm.crm_menu_root')
+        self.assertNotIn(crm_root, self.env['ir.ui.menu'].with_user(user_employee).get_user_roots())
+        self.authenticate('user_employee_no_crm', 'user_employee_no_crm')
+
+        original_get_shortcuts = WebManifestBase._get_shortcuts
+        parent_results = []
+
+        def spy_get_shortcuts(controller):
+            result = original_get_shortcuts(controller)
+            parent_results.append(copy.deepcopy(result))
+            return result
+
+        with patch.object(WebManifestBase, '_get_shortcuts', spy_get_shortcuts):
+            response = self.url_open('/web/manifest.webmanifest')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers['Content-Type'], 'application/manifest+json')
+        self.assertTrue(parent_results, "The CRM override must build on the web controller's shortcuts")
+        parent = parent_results[-1]
+        parent_urls = [shortcut['url'] for shortcut in parent]
+        discuss_url = '/odoo?menu_id=%s' % self.env.ref('mail.menu_root_discuss').id
+        self.assertIn(discuss_url, parent_urls, "The parent lists the user's other apps")
+        self.assertNotIn('/odoo?menu_id=%s' % crm_root.id, parent_urls, "The parent has no CRM app entry")
+
+        shortcuts = response.json()['shortcuts']
+        self.assertEqual(shortcuts, parent, "Without the CRM app entry the parent list is returned unchanged")
+        pipeline_url = '/odoo?menu_id=%s' % self.env.ref('crm.menu_crm_opportunities').id
+        self.assertNotIn(pipeline_url, [shortcut['url'].split('&')[0] for shortcut in shortcuts])
 
     # ------------------------------------------------------------
     # Replay of the calls queued offline
@@ -229,11 +263,14 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
     def test_offline_mark_won_replay(self):
         """ Won clicked offline queues ``action_set_won [[resId]]`` with the form
         context, never ``action_set_won_rainbowman``: the server picks the won
-        stage when the call replays. """
+        stage when the call replays. The replayed lead must end in the same state
+        as a twin lead won online through the form's ``action_set_won_rainbowman``. """
         salesman = self.user_sales_salesman
         lead = self._create_salesman_opportunity('Offline Won Lead', expected_revenue=500)
+        online_lead = self._create_salesman_opportunity('Online Won Lead', expected_revenue=500)
         self.assertEqual(lead.won_status, 'pending')
         self.assertFalse(lead.stage_id.is_won)
+        self.assertEqual(online_lead.won_status, 'pending')
 
         result = lead.with_user(salesman).with_context(self.pipeline_context).action_set_won()
         self.assertTrue(result)
@@ -244,14 +281,28 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self.assertEqual(lead.stage_id, self.stage_gen_won)
         self.assertEqual(lead.probability, 100)
 
+        # online twin: the Won button, whose returned rainbowman effect is UI only
+        online_result = online_lead.with_user(salesman).with_context(self.pipeline_context).action_set_won_rainbowman()
+        self.assertTrue(online_result)
+
+        online_lead.invalidate_recordset()
+        for fname in ('won_status', 'stage_id', 'probability', 'active', 'user_id', 'team_id'):
+            self.assertEqual(lead[fname], online_lead[fname], f'Replayed and online Won differ on lead {fname}')
+        for won_lead in (lead, online_lead):
+            with self.subTest(lead=won_lead.name):
+                self.assertTrue(won_lead.date_closed, 'Won sets the closing date')
+
     def test_offline_activity_create_replay(self):
         """ "Log a call" and "Schedule follow-up" offline queue a ``mail.activity``
         ``create`` naming the document by ``res_model`` only, as the client has no
         ``ir.model`` id offline. ``res_model`` is a readonly related field, so the
         activity is linked to its lead only through CRM's ``create`` override,
-        which resolves ``res_model_id``: without it this test fails. """
+        which resolves ``res_model_id``: without it this test fails. The replay
+        must give the activity and lead activity state that the online "Schedule
+        Activity" dialog gives a twin lead for the same values. """
         salesman = self.user_sales_salesman
         lead = self._create_salesman_opportunity('Offline Activity Lead')
+        online_lead = self._create_salesman_opportunity('Online Activity Lead')
         today = fields.Date.today()
 
         # the queued values, JSON-serialized: the deadline is a "YYYY-MM-DD" string
@@ -277,15 +328,156 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self.assertIn(activity, lead.activity_ids)
         self.assertIn(activity, lead.with_user(salesman).activity_ids)
 
+        # online twin: the web client's "Schedule Activity" dialog (chatter, card
+        # activities) is the mail.activity.schedule wizard, saved with these values
+        scheduler = self.env['mail.activity.schedule'].with_user(salesman).with_context(
+            active_model='crm.lead', active_ids=[online_lead.id], active_id=online_lead.id,
+        ).create({
+            'activity_type_id': self.call_type.id,
+            'summary': 'Call',
+            'date_deadline': fields.Date.to_string(today),
+            'activity_user_id': salesman.id,
+        })
+        scheduler.action_schedule_activities()
+
+        self.env.invalidate_all()
+        online_activity = online_lead.activity_ids
+        self.assertEqual(len(online_activity), 1)
+        self.assertEqual(online_activity.res_id, online_lead.id)
+        self.assertIn(online_activity, online_lead.with_user(salesman).activity_ids)
+        # ir.model is not readable by salespersons: the activities are compared as superuser
+        for fname in (
+            'res_model_id', 'res_model', 'activity_type_id', 'summary', 'note', 'date_deadline',
+            'user_id', 'automated', 'state',
+        ):
+            self.assertEqual(
+                activity.sudo()[fname], online_activity.sudo()[fname],
+                f'Replayed and online activities differ on {fname}',
+            )
+        for fname in ('activity_state', 'activity_date_deadline', 'activity_summary', 'activity_type_id', 'activity_user_id'):
+            self.assertEqual(lead[fname], online_lead[fname], f'Replayed and online activities differ on lead {fname}')
+
+    def test_offline_activity_create_replay_batch(self):
+        """ The resolution is made per value of a ``create`` batch: each value
+        naming a ``crm.lead`` by ``res_model`` only gets its ``res_model_id``,
+        a value that already carries ``res_model_id`` keeps it, even when it
+        also names ``crm.lead`` by ``res_model``, and a value of another model
+        is left on that model. The second ``res_model``-only value comes last,
+        after the values that carry ``res_model_id``. """
+        salesman = self.user_sales_salesman
+        call_lead, resolved_lead, follow_up_lead = (
+            self._create_salesman_opportunity(name)
+            for name in ('Batch Call Lead', 'Batch Resolved Lead', 'Batch Follow-up Lead')
+        )
+        partner, call_back_partner = self.contact_2, self.contact_1
+        # ir.model is not readable by salespersons: the model ids are read as superuser
+        crm_lead_model = self.env['ir.model']._get('crm.lead')
+        partner_model = self.env['ir.model']._get('res.partner')
+        today = fields.Date.today()
+        follow_up_day = today + timedelta(days=3)
+
+        activities = self.env['mail.activity'].with_user(salesman).create([{
+            'res_model': 'crm.lead',
+            'res_id': call_lead.id,
+            'activity_type_id': self.call_type.id,
+            'summary': 'Call',
+            'date_deadline': fields.Date.to_string(today),
+            'user_id': salesman.id,
+        }, {
+            'res_model_id': crm_lead_model.id,
+            'res_id': resolved_lead.id,
+            'activity_type_id': self.call_type.id,
+            'summary': 'Resolved Call',
+            'date_deadline': fields.Date.to_string(today),
+            'user_id': salesman.id,
+        }, {
+            'res_model_id': partner_model.id,
+            'res_id': partner.id,
+            'activity_type_id': self.todo_type.id,
+            'summary': 'Partner Follow-up',
+            'date_deadline': fields.Date.to_string(follow_up_day),
+            'user_id': salesman.id,
+        }, {
+            'res_model': 'crm.lead',
+            'res_model_id': partner_model.id,
+            'res_id': call_back_partner.id,
+            'activity_type_id': self.call_type.id,
+            'summary': 'Partner Call Back',
+            'date_deadline': fields.Date.to_string(today),
+            'user_id': salesman.id,
+        }, {
+            'res_model': 'crm.lead',
+            'res_id': follow_up_lead.id,
+            'activity_type_id': self.todo_type.id,
+            'summary': 'Follow-up',
+            'date_deadline': fields.Date.to_string(follow_up_day),
+            'user_id': salesman.id,
+        }])
+
+        self.env.invalidate_all()
+        expected = [
+            (crm_lead_model, call_lead, self.call_type, 'Call', today),
+            (crm_lead_model, resolved_lead, self.call_type, 'Resolved Call', today),
+            (partner_model, partner, self.todo_type, 'Partner Follow-up', follow_up_day),
+            (partner_model, call_back_partner, self.call_type, 'Partner Call Back', today),
+            (crm_lead_model, follow_up_lead, self.todo_type, 'Follow-up', follow_up_day),
+        ]
+        self.assertEqual(len(activities), len(expected))
+        for activity, (model, document, activity_type, summary, date_deadline) in zip(activities, expected):
+            with self.subTest(summary=summary):
+                self.assertEqual(activity.sudo().res_model_id.model, document._name)
+                self.assertEqual(activity.sudo().res_model_id, model)
+                self.assertEqual(activity.res_model, document._name)
+                self.assertEqual(activity.res_id, document.id)
+                self.assertEqual(activity.activity_type_id, activity_type)
+                self.assertEqual(activity.summary, summary)
+                self.assertEqual(activity.date_deadline, date_deadline)
+                self.assertEqual(activity.user_id, salesman)
+                self.assertEqual(document.activity_ids, activity)
+                self.assertEqual(document.with_user(salesman).activity_ids, activity)
+
+    def test_offline_activity_create_replay_invalid_deadline(self):
+        """ A replayed activity ``create`` the ORM rejects fails as it would
+        without CRM's override, which neither swallows nor replaces the error:
+        a deadline that is not a date raises the ``ValueError`` of the date
+        conversion, and no activity is left on the lead. """
+        salesman = self.user_sales_salesman
+        lead = self._create_salesman_opportunity('Invalid Deadline Lead')
+        with self.assertRaises(ValueError) as conversion_error:
+            fields.Date.to_date('not-a-date')
+
+        with self.assertRaises(ValueError) as create_error, self.cr.savepoint():
+            self.env['mail.activity'].with_user(salesman).create([{
+                'res_model': 'crm.lead',
+                'res_id': lead.id,
+                'activity_type_id': self.call_type.id,
+                'summary': 'Call',
+                'date_deadline': 'not-a-date',
+                'user_id': salesman.id,
+            }])
+        self.assertEqual(create_error.exception.args, conversion_error.exception.args)
+
+        self.env.invalidate_all()
+        self.assertFalse(self.env['mail.activity'].with_context(active_test=False).search([
+            ('res_model', '=', 'crm.lead'),
+            ('res_id', '=', lead.id),
+        ]))
+        self.assertFalse(lead.activity_ids)
+
     def test_offline_activity_done_replay(self):
         """ "Mark done" offline queues ``mail.activity`` ``action_done
         [[activityId]]``: a state change only, with no feedback, attachment or
-        next activity. Replayed, the activity leaves the lead's activities. """
+        next activity. Replayed, the activity leaves the lead's activities. The
+        replay must give the outcome of the online "Mark Done" on a twin lead. """
         salesman = self.user_sales_salesman
         lead = self._create_salesman_opportunity('Offline Done Lead')
         activity = lead.activity_schedule('mail.mail_activity_data_todo', summary='Done Me', user_id=salesman.id)
         self.assertEqual(lead.activity_ids, activity)
         self.assertFalse(self._get_activity_done_messages(lead, self.todo_type))
+        online_lead = self._create_salesman_opportunity('Online Done Lead')
+        online_activity = online_lead.activity_schedule('mail.mail_activity_data_todo', summary='Done Me', user_id=salesman.id)
+        self.assertEqual(online_lead.activity_ids, online_activity)
+        self.assertFalse(self._get_activity_done_messages(online_lead, self.todo_type))
 
         activity.with_user(salesman).action_done()
 
@@ -294,12 +486,32 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self.assertFalse(activity.exists() and activity.active, 'A done activity is archived or unlinked')
         self.assertEqual(len(self._get_activity_done_messages(lead, self.todo_type)), 1, 'Marking done posts its message')
 
+        # online twin: the web client's "Mark Done" with no feedback typed calls
+        # action_feedback with the empty attachment list only
+        online_activity.with_user(salesman).action_feedback(attachment_ids=[])
+
+        online_lead.invalidate_recordset(['activity_ids'])
+        self.assertNotIn(online_activity, online_lead.activity_ids)
+        self.assertEqual(
+            (bool(activity.exists()), activity.exists().active),
+            (bool(online_activity.exists()), online_activity.exists().active),
+            'Replayed and online Mark Done differ on keeping the done activity',
+        )
+        replayed_message = self._get_activity_done_messages(lead, self.todo_type)
+        online_message = self._get_activity_done_messages(online_lead, self.todo_type)
+        self.assertEqual(len(online_message), 1)
+        for fname in ('message_type', 'subtype_id', 'mail_activity_type_id', 'author_id', 'body', 'attachment_ids'):
+            self.assertEqual(replayed_message[fname], online_message[fname], f'Replayed and online Mark Done differ on message {fname}')
+        for fname in ('activity_ids', 'activity_state', 'activity_date_deadline', 'activity_type_id'):
+            self.assertEqual(lead[fname], online_lead[fname], f'Replayed and online Mark Done differ on lead {fname}')
+
     def test_offline_quick_create_replay(self):
         """ The mobile quick create queues ``web_save [[], vals]`` with the six
         fields it captures and ``{context: <pipeline list context>,
         specification: {}}``. The server fills the rest at replay, with the
         pipeline's ``default_type``, so the lead stays in the opportunity-only
-        pipeline. """
+        pipeline. The replayed lead must match a twin quick create saved online,
+        which reads its fields back. """
         salesman = self.user_sales_salesman
         vals = {
             'name': 'Quick Offline Lead',
@@ -332,21 +544,56 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
             'The created lead is listed by the pipeline action',
         )
 
+        # online twin: the same values saved online, with the fields read back
+        online_result = self.env['crm.lead'].with_user(salesman).with_context(self.pipeline_context).browse().web_save(
+            dict(vals, name='Quick Online Lead'), specification={
+                'name': {},
+                'contact_name': {},
+                'phone': {},
+                'email_from': {},
+                'expected_revenue': {},
+                'stage_id': {'fields': {'display_name': {}}},
+                'type': {},
+                'user_id': {'fields': {'display_name': {}}},
+            },
+        )
+        self.assertEqual(len(online_result), 1)
+        online_lead = self.env['crm.lead'].with_user(salesman).browse(online_result[0]['id'])
+        self.assertNotEqual(online_lead, lead)
+        self.assertEqual(online_result, [{
+            'id': online_lead.id,
+            'name': 'Quick Online Lead',
+            'contact_name': 'Quick Contact',
+            'phone': '+32 494 55 55 55',
+            'email_from': 'quick@example.com',
+            'expected_revenue': 777.0,
+            'stage_id': {'id': self.stage_gen_1.id, 'display_name': self.stage_gen_1.display_name},
+            'type': 'opportunity',
+            'user_id': {'id': salesman.id, 'display_name': salesman.display_name},
+        }])
+        for fname in (
+            'type', 'stage_id', 'user_id', 'team_id', 'company_id', 'probability', 'contact_name',
+            'phone', 'email_from', 'expected_revenue', 'active', 'partner_id',
+        ):
+            self.assertEqual(lead[fname], online_lead[fname], f'Replayed and online quick creates differ on {fname}')
+        self.assertEqual(
+            self.env['crm.lead'].with_user(salesman).search(self.pipeline_domain + [('id', 'in', (lead + online_lead).ids)]),
+            lead + online_lead,
+            'The pipeline action lists the replayed and the online lead alike',
+        )
+
     # ------------------------------------------------------------
     # Wiring
     # ------------------------------------------------------------
 
     def test_offline_wiring(self):
-        """ The lead kanban arches use the mobile pipeline view and give their
-        activities the Call type, the lead form keeps Won usable offline and
-        gives its activity sheet the Call type, no arch declares a new field,
-        every new file is bundled where it runs, and the version is bumped.
-
-        Each view record's own arch is parsed, not the combined one, because
-        other addons may inherit these views. """
+        """ Check mobile view classes and Call-type options, offline Won, the
+        two kanban arches' expected field sets, bundle membership and manifest
+        version 1.10. Parse each view's own arch because installed addons may
+        extend it. """
         call_type_id = self.env.ref('mail.mail_activity_data_call').id
 
-        # fields declared by both lead kanban arches before the mobile pipeline
+        # expected kanban fields: mobile-only additions belong in load variants, not arch declarations
         base_kanban_fields = {
             'crm.view_crm_lead_kanban': {
                 'name', 'contact_name', 'tag_ids', 'priority', 'activity_ids', 'user_id',
@@ -435,13 +682,22 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         )
         self.assertEqual(synced_lead.activity_ids, fixture_activity)
         self.assertFalse(self.env['crm.lead'].with_context(active_test=False).search_count([('name', '=', 'Offline Lead')]))
+        # the OdooBot onboarding chat would open full screen on the phone
+        # viewport at an unpredictable moment and cover the tour
+        if 'odoobot_state' in self.env['res.users']._fields:
+            salesman.odoobot_state = 'disabled'
 
-        self.start_tour('/odoo', 'crm_mobile_offline', login='user_sales_salesman')
+        # the first page of a new browser is not controlled by the service
+        # worker, so the web client clears every offline cache once the worker
+        # activates: the tour starts after that, or what it caches online is lost
+        self.start_tour(
+            '/odoo', 'crm_mobile_offline', login='user_sales_salesman',
+            ready="odoo.isTourReady('crm_mobile_offline') && navigator.serviceWorker.ready.then(() => true)",
+        )
 
         self.env.invalidate_all()
         lead = synced_lead.with_user(salesman)
 
-        # offline edit, then queued action_set_won
         self.assertEqual(lead.expected_revenue, 4242)
         self.assertEqual(lead.won_status, 'won')
         self.assertTrue(lead.stage_id.is_won)
@@ -462,12 +718,10 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self.assertTrue(call_activity.date_deadline)
         self.assertLessEqual(abs(call_activity.date_deadline - fields.Date.today()), timedelta(days=1))
 
-        # "Mark done" on the fixture activity
         self.assertNotIn(fixture_activity, lead.activity_ids)
         self.assertTrue(not fixture_activity.exists() or not fixture_activity.active)
         self.assertEqual(len(self._get_activity_done_messages(synced_lead, self.todo_type)), 1)
 
-        # mobile quick create: an opportunity of the salesperson in the chosen stage
         offline_lead = self.env['crm.lead'].with_user(salesman).search([('name', '=', 'Offline Lead')])
         self.assertEqual(len(offline_lead), 1)
         self.assertEqual(offline_lead.type, 'opportunity')
