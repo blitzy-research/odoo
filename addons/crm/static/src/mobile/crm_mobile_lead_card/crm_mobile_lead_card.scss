@@ -4,12 +4,20 @@
 .o_crm_mobile_lead_activities_sheet,
 .o_crm_mobile_activities_button {
     --CrmMobileLeadCard-touchTarget: 44px;
+    // Secondary text, solid instead of the backend's translucent muted colour: it keeps the
+    // WCAG AA 4.5:1 text contrast on the white card and on the sheet background.
+    --CrmMobileLeadCard-secondaryColor: #{$o-gray-700};
+    // Field and select borders keep the WCAG AA 3:1 component boundary contrast.
+    --CrmMobileLeadCard-fieldBorderColor: #{$o-gray-600};
 }
 
 .o_crm_mobile_lead_card {
     display: flex;
     flex-direction: column;
     width: 100%;
+    // Square cards that share one border with the next one, as framework kanban
+    // cards do: each card overlaps the following one by its border width.
+    margin-block-end: -$border-width;
 
     button,
     select,
@@ -18,9 +26,21 @@
         min-height: var(--CrmMobileLeadCard-touchTarget);
     }
 
+    // A link button has no hover or pressed background of its own: Bootstrap's state
+    // custom properties give it a tint on hover and while pressed. On a touch screen,
+    // the touch rule below keeps a tap from leaving the hover tint behind. The tint
+    // bleeds into the card's inline padding, so the text stays aligned with the rows
+    // below; the card's column stretches the button across that bleed. A disabled
+    // (provisional) button keeps Bootstrap's disabled background and receives no
+    // pointer state.
     .o_crm_mobile_lead_open {
-        width: 100%;
+        --CrmMobileLeadCard-openBleed: #{$spacer * 0.25};
+        --#{$prefix}btn-hover-bg: #{$gray-100};
+        --#{$prefix}btn-active-bg: #{$gray-200};
+
         min-height: var(--CrmMobileLeadCard-touchTarget);
+        margin-inline: calc(-1 * var(--CrmMobileLeadCard-openBleed));
+        padding-inline: var(--CrmMobileLeadCard-openBleed);
         text-align: start;
     }
 
@@ -32,6 +52,10 @@
         white-space: nowrap;
     }
 
+    .o_crm_mobile_lead_partner {
+        color: var(--CrmMobileLeadCard-secondaryColor);
+    }
+
     .o_crm_mobile_lead_actions {
         .o_crm_mobile_lead_stage {
             flex: 1 1 auto;
@@ -40,6 +64,12 @@
             // floor is the touch target, not 0: the select is an interactive element
             // of the card and must stay at least 44 px wide.
             min-width: var(--CrmMobileLeadCard-touchTarget);
+            // The size of the quick-create fields: at least 16px, so iOS Safari does
+            // not zoom the page into the focused select.
+            font-size: #{"max(1rem, 16px)"};
+            // Bootstrap's border colour property, not `border-color`, so the focus, hover
+            // and invalid border colours still apply.
+            --#{$prefix}border-color: var(--CrmMobileLeadCard-fieldBorderColor);
         }
 
         .o_crm_mobile_lead_activities_button {
@@ -62,6 +92,31 @@
         --#{$prefix}border-style: dashed;
         border-style: dashed;
     }
+
+    // Sample records of an empty pipeline are dimmed, as the framework kanban dims
+    // its sample records. A provisional card is a real lead created offline: it
+    // keeps its normal look.
+    .o_view_sample_data &:not(.o_crm_mobile_lead_card_provisional) {
+        @include o-sample-data-disabled;
+    }
+}
+
+// The framework sheet holding the activities. Its `min-height: var(--sheet-height)`
+// keeps it as tall as its last measurement, and stays applied while the framework
+// re-measures it on a viewport change, so that height could only grow: the sheet
+// would keep the room of a closed schedule form. It takes its content's height
+// instead; its `max-height` still caps it at the viewport.
+.o_bottom_sheet_sheet:has(> .o_bottom_sheet_body > .o_crm_mobile_lead_activities_sheet) {
+    min-height: auto;
+}
+
+// The framework sheet body, the one scroll container of the activities (the sheet's
+// rail scrolls the whole sheet). Its block-end scroll padding is the sticky row of
+// buttons (a touch-target button between the row's block paddings) and the form's
+// gap above it, so a control scrolled into view stops above that row, focus ring
+// included, instead of under it.
+.o_bottom_sheet_body:has(> .o_crm_mobile_lead_activities_sheet) {
+    scroll-padding-block-end: calc(44px + #{$spacer} + var(--offcanvas-padding-y));
 }
 
 .o_crm_mobile_lead_activities_sheet {
@@ -70,6 +125,15 @@
     input {
         min-width: var(--CrmMobileLeadCard-touchTarget);
         min-height: var(--CrmMobileLeadCard-touchTarget);
+    }
+
+    .o_crm_mobile_activities_lead_name,
+    .o_crm_mobile_activity_details,
+    .o_crm_mobile_activities_more,
+    .o_crm_mobile_activities_more_count,
+    .o_crm_mobile_activities_notice,
+    .o_crm_mobile_activity_types_notice {
+        color: var(--CrmMobileLeadCard-secondaryColor);
     }
 
     .o_crm_mobile_activity_row {
@@ -99,26 +163,128 @@
         }
     }
 
-    // "Log a call" and "Schedule follow-up" share the width of the sheet: a zero flex
-    // basis splits the row equally, whatever the length of each label.
-    .o_crm_mobile_activity_actions > .btn {
-        flex: 1 1 0;
+    // The list stays in the sheet's flex column while it has no row, as the live
+    // region announcing the rows added to it, but takes no gap of its own: what
+    // follows it starts one gap (the sheet's `gap-3`) below the header, where a
+    // first row would. The start margin cancels the gap, as the template's `mb-0`
+    // fixes the end one.
+    .o_crm_mobile_lead_activities:not(:has(> li)) {
+        margin-block-start: -$spacer;
+    }
+
+    // "No activities": muted, with a text colour that keeps a contrast of at least
+    // 4.5:1 on the sheet background.
+    .o_crm_mobile_activities_empty {
+        margin: 0;
+        padding-block: $spacer * 0.5;
+        color: $gray-700;
+    }
+
+    // "Log a call" / "Schedule follow-up", or the form's Save / Cancel, sticky at the
+    // bottom of the sheet body, so they stay in view while the activities and the
+    // form scroll. The body's padding insets its sticky area, hence the negative
+    // `bottom` and margins: the row reaches the body's padding edges, its bottom is
+    // the sheet's, and no scrolled content shows below or beside it; its own padding
+    // keeps the buttons where the body's padding would.
+    .o_crm_mobile_activity_actions,
+    .o_crm_mobile_activity_form_buttons {
+        position: sticky;
+        bottom: calc(-1 * var(--offcanvas-padding-y));
+        z-index: 1;
+        flex-wrap: wrap;
+        margin-inline: calc(-1 * var(--offcanvas-padding-x));
+        margin-block-end: calc(-1 * var(--offcanvas-padding-y));
+        padding: #{$spacer * 0.5} var(--offcanvas-padding-x) var(--offcanvas-padding-y);
+        background-color: $dropdown-bg;
+
+        // The buttons share the width of the sheet: a zero flex basis splits the
+        // row equally, whatever the length of each label. The `max-content` floor
+        // keeps a label on one line: a row too narrow for both labels wraps a whole
+        // button instead.
+        > .btn {
+            flex: 1 1 0;
+            min-width: max-content;
+        }
     }
 
     .o_crm_mobile_activity_form {
+        // Darker error text keeps the WCAG AA 4.5:1 text contrast on the sheet background;
+        // the invalid field border keeps the standard danger colour.
+        --#{$prefix}form-invalid-color: #{shade-color($form-feedback-invalid-color, 20%)};
+
+        .form-label {
+            margin-block-end: $spacer * 0.25;
+        }
+
         .form-control,
         .form-select {
             width: 100%;
+            // The size of the quick-create fields: at least 16px, so iOS Safari does
+            // not zoom the page into a focused control.
+            font-size: #{"max(1rem, 16px)"};
+            // One radius for the inputs and the selects: the backend resets the
+            // radius of text inputs (not of selects) over `.form-control`'s.
+            border-radius: $input-border-radius;
+            // Bootstrap's border colour property, not `border-color`, so the focus, hover
+            // and invalid border colours still apply.
+            --#{$prefix}border-color: var(--CrmMobileLeadCard-fieldBorderColor);
+
+            // Placeholder text keeps the WCAG AA 4.5:1 text contrast on the sheet background.
+            &::placeholder {
+                color: var(--CrmMobileLeadCard-secondaryColor);
+            }
+
+            // One focus ring for every field: `.form-select` has a halo only, where
+            // `.form-control` adds a solid ring. An invalid field keeps Bootstrap's
+            // invalid focus style.
+            &:focus:not(.is-invalid) {
+                border-color: $input-focus-border-color;
+                box-shadow: $input-focus-box-shadow;
+            }
+
+            // Required fields are outlined darker than the optional summary, as the
+            // framework's phone form outlines its required fields, unless invalid or
+            // focused. Every field already has that form's required grey, for its
+            // contrast, so required ones take the darkest grey, which keeps about
+            // that form's contrast between the two outlines.
+            &:required:not(.is-invalid):not(:focus) {
+                border-color: var(--gray-900);
+            }
         }
     }
 }
 
-// The lead form's phone "Activities" button is a flex item of the control panel's
-// breadcrumbs row. Its explicit touch-target `min-width` replaces the item's automatic
-// minimum (the width of its label), so it must not shrink: the label stays inside
-// the button.
+// The lead form's phone "Activities" icon button is a flex item of the control panel's
+// breadcrumbs row and must not shrink below its touch-target width. Its visual box
+// keeps the height of its row neighbours (New and the gear and bolt menus), so it
+// neither sticks out of the row nor stretches the pager. The hit area still covers
+// the touch target: a transparent `::before` extends the button vertically, by half
+// the missing height on each side, without changing the layout. A pseudo-element
+// hit-tests as its button. Interpolated because LibSass cannot evaluate `min()`
+// across px and a percentage.
 .o_crm_mobile_activities_button {
+    position: relative;
     flex: 0 0 auto;
     min-width: var(--CrmMobileLeadCard-touchTarget);
-    min-height: var(--CrmMobileLeadCard-touchTarget);
+
+    &::before {
+        content: "";
+        position: absolute;
+        inset-block: #{"min(0px, calc((100% - var(--CrmMobileLeadCard-touchTarget)) / 2))"};
+        inset-inline: 0;
+    }
+}
+
+// A touch screen keeps `:hover` on the last tapped element, and the sheet opens under
+// the finger that tapped its opener, so Bootstrap's hover colours would stay on the
+// tapped button there. On a touch-primary screen that cannot hover, a hovered button
+// keeps its own colours; the pressed (`:active`) state is unchanged.
+@media (hover: none) and (pointer: coarse) {
+    .o_crm_mobile_lead_card .btn:hover,
+    .o_crm_mobile_lead_activities_sheet .btn:hover,
+    .o_crm_mobile_activities_button:hover {
+        --#{$prefix}btn-hover-color: var(--#{$prefix}btn-color);
+        --#{$prefix}btn-hover-bg: var(--#{$prefix}btn-bg);
+        --#{$prefix}btn-hover-border-color: var(--#{$prefix}btn-border-color);
+    }
 }

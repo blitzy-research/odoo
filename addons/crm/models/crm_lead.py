@@ -80,6 +80,13 @@ PARTNER_ADDRESS_FIELDS_TO_SYNC = [
 PLS_COMPUTE_BATCH_STEP = 50000  # PREFETCH_MAX = 1000 but larger cluster can speed up global computation
 PLS_UPDATE_BATCH_STEP = 5000
 
+# Delivery key of a lead create sent by the mobile quick create, online or replayed
+# from the offline queue (context key, see `web_save`), and the external identifier
+# module under which it is registered with the lead it created.
+CRM_OFFLINE_CREATE_KEY = 'crm_offline_create_key'
+CRM_OFFLINE_CREATE_MODULE = '__crm_offline__'
+CRM_OFFLINE_CREATE_KEY_RE = re.compile(r'[0-9a-f]{32}')
+
 
 class CrmLead(models.Model):
     _name = 'crm.lead'
@@ -981,6 +988,62 @@ class CrmLead(models.Model):
                 'res_model_id': False,
             })
         return super().unlink()
+
+    def web_save(self, vals, specification, next_id=None):
+        """ Create a lead at most once per delivery key of the mobile quick create.
+
+        The web client replays its offline queue at least once: a create whose
+        answer was lost (the server committed it, then the connection dropped)
+        stays queued and is sent again verbatim, possibly from another tab or
+        after a reload. The quick create therefore sends a delivery key of 32
+        lowercase hexadecimal digits in the ``CRM_OFFLINE_CREATE_KEY`` context
+        key, the same for every delivery of one create. The first delivery
+        creates the lead and registers the key as its external identifier
+        ``__crm_offline__.<key>``: an ``ir.model.data`` row, so the lead model
+        gains no field. A later delivery of that key by the lead's creator
+        creates and writes nothing and answers as the first one did; a key
+        registered by another user is refused. The unique ``(module, name)``
+        index makes two concurrent deliveries of one key fail rather than
+        create two leads.
+
+        Everything runs under the caller's rights except the ``ir.model.data``
+        lookup and registration, made as superuser on that fixed module with a
+        validated key. Deleting a lead deletes its external identifiers (base
+        ``unlink``), so a delivery after the deletion creates the lead again.
+        Writes, and creates without a valid key (desktop, lead forms, any other
+        caller), keep the base behaviour.
+        """
+        key = self.env.context.get(CRM_OFFLINE_CREATE_KEY)
+        if self or not isinstance(key, str) or not CRM_OFFLINE_CREATE_KEY_RE.fullmatch(key):
+            return super().web_save(vals, specification, next_id=next_id)
+
+        # the key only selects the delivery: the save itself sees the caller's context
+        leads = self.with_context({k: v for k, v in self.env.context.items() if k != CRM_OFFLINE_CREATE_KEY})
+        IrModelData = self.env['ir.model.data'].sudo()
+        data = IrModelData.search([('module', '=', CRM_OFFLINE_CREATE_MODULE), ('name', '=', key)], limit=1)
+        if data:
+            delivered = self.sudo().browse(data.res_id).exists() if data.model == self._name else None
+            if delivered is None or (delivered and delivered.create_uid.id != self.env.uid):
+                raise AccessError(_("This lead was already created by another user."))
+            if delivered:
+                return leads.browse(next_id or delivered.id).with_context(bin_size=True).web_read(specification)
+
+        # with a next_id, base web_save would answer that record: keep the created id
+        result = super(CrmLead, leads).web_save(vals, {} if next_id else specification)
+        if data:
+            # an external identifier left by a lead deleted without the ORM
+            data.res_id = result[0]['id']
+        else:
+            IrModelData.create({
+                'module': CRM_OFFLINE_CREATE_MODULE,
+                'name': key,
+                'model': self._name,
+                'res_id': result[0]['id'],
+                'noupdate': True,
+            })
+        if next_id:
+            return leads.browse(next_id).with_context(bin_size=True).web_read(specification)
+        return result
 
     @api.model
     def _read_group_stage_ids(self, stages, domain):

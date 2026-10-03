@@ -25,6 +25,7 @@
 import { Component, xml } from "@odoo/owl";
 import {
     advanceTime,
+    after,
     beforeEach,
     expect,
     mockDate,
@@ -73,6 +74,7 @@ import { Composer } from "@mail/core/common/composer";
 import { ActivityButton } from "@mail/core/web/activity_button";
 import {
     CRM_MOBILE_ACTIVITY_LIMIT,
+    CRM_OFFLINE_CREATE_KEY,
     CRM_OFFLINE_DISABLED_ACTIONS,
     CRM_OFFLINE_DISABLED_MENUS,
     useCrmOffline,
@@ -84,17 +86,21 @@ import {
 import { CrmFormController } from "@crm/views/crm_form/crm_form";
 import { CrmPlsTooltipButton } from "@crm/views/crm_form/crm_pls_tooltip_button";
 import { CrmShareTargetItem } from "@crm/webclient/share_target/crm_share_target_item";
+import { AutoComplete } from "@web/core/autocomplete/autocomplete";
 import { browser } from "@web/core/browser/browser";
 import { router } from "@web/core/browser/router";
 import { ConnectionLostError, RPCError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { registry } from "@web/core/registry";
+import { registerTemplate } from "@web/core/templates";
 import { user } from "@web/core/user";
 import { useService } from "@web/core/utils/hooks";
 import { ActionMenus } from "@web/search/action_menus/action_menus";
 import { computeM2OProps, Many2One } from "@web/views/fields/many2one/many2one";
 import { buildM2OFieldDescription, Many2OneField } from "@web/views/fields/many2one/many2one_field";
 import { Many2ManyTagsField } from "@web/views/fields/many2many_tags/many2many_tags_field";
+import { PhoneField } from "@web/views/fields/phone/phone_field";
+import { Many2XAutocomplete } from "@web/views/fields/relational_utils";
 import { KanbanRecord } from "@web/views/kanban/kanban_record";
 import { View } from "@web/views/view";
 import { AnimatedNumber } from "@web/views/view_components/animated_number";
@@ -274,8 +280,11 @@ class CrmLead extends models.Model {
     contact_name = fields.Char();
     email_from = fields.Char({ string: "Email" });
     phone = fields.Char();
-    partner_email_update = fields.Boolean();
-    partner_phone_update = fields.Boolean();
+    // Readonly computed fields on the server: never written by a save.
+    partner_email_update = fields.Boolean({ readonly: true });
+    partner_phone_update = fields.Boolean({ readonly: true });
+    phone_sanitized = fields.Char({ string: "Sanitized Number", readonly: true });
+    phone_formatted = fields.Char({ string: "Formatted Number", readonly: true });
     is_blacklisted = fields.Boolean();
     phone_blacklisted = fields.Boolean();
     expected_revenue = fields.Float({ string: "Expected Revenue", aggregator: "sum" });
@@ -1317,18 +1326,93 @@ async function flushStartupSync() {
 const JSVAT_SCRIPT = "/partner_autocomplete/static/lib/jsvat.js";
 
 /**
+ * Template of `PartnerAutoCompleteStandIn`, registered for each test: a primary
+ * inherit of `web.AutoComplete` adding the partner autocomplete's "Search Worldwide"
+ * row, rendered below the options unless `shouldSearchWorldwide` is set.
+ */
+const PARTNER_AUTOCOMPLETE_TEMPLATE = "crm.test.OfflinePartnerAutoComplete";
+const PARTNER_AUTOCOMPLETE_ARCH = /* xml */ `
+    <t t-name="${PARTNER_AUTOCOMPLETE_TEMPLATE}" t-inherit="web.AutoComplete" t-inherit-mode="primary">
+        <xpath expr="//ul" position="inside">
+            <t t-if="this.sources &amp;&amp; this.sources.at(-1)?.options.length !== 0 &amp;&amp; !this.shouldSearchWorldwide">
+                <li
+                    class="o-autocomplete--dropdown-item ui-menu-item d-block"
+                    t-on-pointerdown="() => this.ignoreBlur = true"
+                    t-on-mouseleave="() => this.onOptionMouseLeave()"
+                    t-on-click="(ev) => this.searchWorldwide(ev)"
+                >
+                    <a
+                        t-attf-id="{{this.props.id or 'autocomplete'}}_{{this.source_index}}_{{this.option_index}}"
+                        role="option"
+                        href="#"
+                        class="dropdown-item ui-menu-item-wrapper text-truncate text-info"
+                        t-att-class="{ 'ui-state-active': this.isActiveSourceOption([this.source_index, this.option_index]) }"
+                        t-att-aria-selected="this.isActiveSourceOption([this.source_index, this.option_index]) ? 'true' : 'false'"
+                    >
+                        Search Worldwide 🌎
+                    </a>
+                </li>
+            </t>
+        </xpath>
+    </t>`;
+
+/**
+ * Stand-in for the partner autocomplete's AutoComplete (`PartnerAutoComplete`):
+ * `setup` assigns `shouldSearchWorldwide`, function sources receive it with the
+ * request, and its "Search Worldwide" row sets it and reloads the options.
+ */
+class PartnerAutoCompleteStandIn extends AutoComplete {
+    static template = PARTNER_AUTOCOMPLETE_TEMPLATE;
+
+    setup() {
+        super.setup();
+        this.shouldSearchWorldwide = false;
+    }
+
+    loadOptions(options, request) {
+        if (typeof options === "function") {
+            return options(request, this.shouldSearchWorldwide);
+        }
+        return options;
+    }
+
+    async searchWorldwide(ev) {
+        this.shouldSearchWorldwide = true;
+        ev.preventDefault();
+        super.close();
+        super.open(true);
+    }
+}
+
+class PartnerMany2XAutocompleteStandIn extends Many2XAutocomplete {
+    static components = {
+        ...Many2XAutocomplete.components,
+        AutoComplete: PartnerAutoCompleteStandIn,
+    };
+}
+
+class PartnerMany2OneStandIn extends Many2One {
+    static components = {
+        ...Many2One.components,
+        Many2XAutocomplete: PartnerMany2XAutocompleteStandIn,
+    };
+}
+
+/**
  * Stand-in for the `res_partner_many2one` widget (`PartnerAutoCompleteMany2one`),
  * registered under that arch name for each test. Its addon, `partner_autocomplete`,
  * auto-installs with CRM's dependencies but is outside CRM's `depends`, so the
  * unit-test module set of `@crm` does not load it, and CRM (this file included)
  * imports nothing from it. The stand-in keeps the widget's contract: a many2one whose
- * `otherSources` adds the paid enrichment source, which loads the `jsvat` script
- * (stepped here) then calls `res.partner.autocomplete_by_name`, for queries longer
- * than two characters and only when the field can create.
+ * autocomplete renders the "Search Worldwide" row, and whose `otherSources` adds the
+ * paid enrichment source, which loads the `jsvat` script (stepped here) then calls
+ * `res.partner.autocomplete_by_name` with the country to search (`false` for the
+ * company's, `0` worldwide), for queries longer than two characters and only when
+ * the field can create.
  */
 class EnrichmentPartnerMany2One extends Component {
     static template = xml`<Many2One t-props="this.m2oProps"/>`;
-    static components = { Many2One };
+    static components = { Many2One: PartnerMany2OneStandIn };
     static props = { ...Many2OneField.props };
 
     setup() {
@@ -1345,15 +1429,16 @@ class EnrichmentPartnerMany2One extends Component {
         }
         return [
             {
-                options: async (request) => {
+                options: async (request, shouldSearchWorldwide) => {
                     if (!request || request.length <= 2) {
                         return [];
                     }
                     expect.step(JSVAT_SCRIPT);
+                    const queryCountryId = shouldSearchWorldwide ? 0 : false;
                     const suggestions = await this.orm.silent.call(
                         "res.partner",
                         "autocomplete_by_name",
-                        [request, false]
+                        [request, queryCountryId]
                     );
                     return suggestions.map((suggestion) => ({
                         cssClass: "partner_autocomplete_dropdown_many2one",
@@ -1370,6 +1455,13 @@ class EnrichmentPartnerMany2One extends Component {
 
 beforeEach(() => {
     patchWithCleanup(AnimatedNumber, { enableAnimations: false });
+    after(
+        registerTemplate(
+            PARTNER_AUTOCOMPLETE_TEMPLATE,
+            "/crm/static/tests/crm_offline.test.js",
+            PARTNER_AUTOCOMPLETE_ARCH
+        )
+    );
     // Restored after each test with the rest of the registries.
     registry
         .category("fields")
@@ -1623,6 +1715,771 @@ test("[Offline] queued lead write includes forced email and phone", async () => 
     });
 });
 
+/** View ids of `LEAD_CONTACT_LIST_ARCH` and `LEAD_CONTACT_FORM_ARCH`, registered per test. */
+const LEAD_CONTACT_LIST_VIEW_ID = 502;
+const LEAD_CONTACT_FORM_VIEW_ID = 503;
+
+/**
+ * Lead list showing each lead's partner: an online visit caches the partners it shows
+ * in the relational-field cache, which the partner field searches offline.
+ */
+const LEAD_CONTACT_LIST_ARCH = /* xml */ `
+    <list>
+        <field name="name"/>
+        <field name="partner_id"/>
+    </list>`;
+
+/**
+ * Lead form with the contact fields of `crm_lead_view_form`: the partner and the flags
+ * the CRM save reads to force the email and phone, and the phone widget with the
+ * sanitized and formatted numbers it dials and shows. The server marks `partner_id`
+ * and `phone` as `on_change` fields, as computed fields depend on them; the mock
+ * server defines no onchange for them, so the arch carries the attribute.
+ */
+const LEAD_CONTACT_FORM_ARCH = /* xml */ `
+    <form js_class="crm_form">
+        <sheet>
+            <field name="name"/>
+            <field name="partner_id" on_change="1"/>
+            <field name="partner_email_update" invisible="1"/>
+            <field name="partner_phone_update" invisible="1"/>
+            <field name="email_from"/>
+            <field name="phone_sanitized" invisible="1"/>
+            <field name="phone_formatted" invisible="1"/>
+            <field name="phone" widget="phone" on_change="1"/>
+        </sheet>
+    </form>`;
+
+/** Leads list and form of the contact fields (`LEAD_CONTACT_*_ARCH`). */
+const LEAD_CONTACT_ACTION = {
+    id: 46,
+    xml_id: "crm.crm_lead_all_leads",
+    name: "Leads",
+    res_model: "crm.lead",
+    views: [
+        [LEAD_CONTACT_LIST_VIEW_ID, "list"],
+        [LEAD_CONTACT_FORM_VIEW_ID, "form"],
+    ],
+};
+
+/**
+ * Online, opens the leads list of the contact fields, then the lead named `name` in
+ * its form: both are cached, with the partners the list shows.
+ *
+ * @param {string} name
+ */
+async function openLeadContactForm(name) {
+    registerInlineViewArchs("crm.lead", {
+        [`list,${LEAD_CONTACT_LIST_VIEW_ID}`]: LEAD_CONTACT_LIST_ARCH,
+        [`form,${LEAD_CONTACT_FORM_VIEW_ID}`]: LEAD_CONTACT_FORM_ARCH,
+    });
+    defineActions([LEAD_CONTACT_ACTION]);
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(LEAD_CONTACT_ACTION.id);
+    await contains(`.o_data_row:contains(${name}) .o_data_cell`).click();
+    await flushStartupSync();
+}
+
+test("[Offline] partner change queues no stale forced email and phone", async () => {
+    stepWebSave();
+    const setOffline = mockOffline();
+    const { env } = await makeMockServer();
+    const oldPartnerId = env["res.partner"].create({
+        name: "Old Partner",
+        email: "old.partner@example.com",
+        phone: "+32 470 10 10 10",
+    });
+    const newPartnerId = env["res.partner"].create({
+        name: "New Partner",
+        email: "new.partner@example.com",
+        phone: "+32 470 99 99 99",
+    });
+    // The lead's own email and phone differ from its partner's: both flags are set.
+    env["crm.lead"].write([2], {
+        partner_id: oldPartnerId,
+        email_from: "lead.own@example.com",
+        phone: "+32 494 12 12 12",
+        partner_email_update: true,
+        partner_phone_update: true,
+    });
+    // Another lead of the new partner, so the list caches that partner.
+    env["crm.lead"].write([3], { partner_id: newPartnerId });
+    await openLeadContactForm("Lead 2");
+    expect.verifySteps([]);
+
+    // Offline, the new partner is selected from the cache. Its onchange is lost, so
+    // the flags loaded for the old partner must not force the lead's email and phone,
+    // which the server would write over the new partner's on replay. The server
+    // computes them from the new partner instead, as the online onchange does.
+    await setOffline(true);
+    await searchPartner("New");
+    await contains(`${PARTNER_OPTIONS}:contains(New Partner)`).click();
+    expect(PARTNER_INPUT).toHaveValue("New Partner");
+    await contains(".o_form_button_save").click();
+    const kwargs = { context: callContext(), specification: {} };
+    expect(queuedCalls("crm.lead")).toEqual([
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [[2], { partner_id: newPartnerId }],
+            kwargs,
+        },
+    ]);
+
+    // A later offline save of the lead adds its own edit, still with nothing forced.
+    await contains(".o_field_widget[name=name] input").edit("Lead 2 renamed");
+    await contains(".o_form_button_save").click();
+    const save = {
+        model: "crm.lead",
+        method: "web_save",
+        args: [[2], { partner_id: newPartnerId, name: "Lead 2 renamed" }],
+        kwargs,
+    };
+    expect(queuedCalls("crm.lead")).toEqual([save]);
+    expect.verifySteps([]);
+
+    // On reconnection the queued save replays as queued, and nothing else is saved:
+    // the mock server, which computes nothing, keeps the lead's email and phone.
+    await reconnect(setOffline);
+    await expect.waitForSteps([save]);
+    await runAllTimers();
+    await animationFrame();
+    expect.verifySteps([]);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(env["crm.lead"].browse(2)[0]).toMatchObject({
+        name: "Lead 2 renamed",
+        partner_id: newPartnerId,
+        email_from: "lead.own@example.com",
+        phone: "+32 494 12 12 12",
+    });
+});
+
+/**
+ * Gives lead 2 the partner "Old Partner" and its own email and phone, which differ
+ * from the partner's, so both flags of the CRM force-save are set, and makes "New
+ * Partner" the partner of lead 3, so the leads list caches it for an offline search.
+ *
+ * @param {Object} env the mock server environment
+ * @returns {number} the id of "New Partner"
+ */
+function setupLeadOwnContacts(env) {
+    const oldPartnerId = env["res.partner"].create({
+        name: "Old Partner",
+        email: "old.partner@example.com",
+        phone: "+32 470 10 10 10",
+    });
+    const newPartnerId = env["res.partner"].create({
+        name: "New Partner",
+        email: "new.partner@example.com",
+        phone: "+32 470 99 99 99",
+    });
+    env["crm.lead"].write([2], {
+        partner_id: oldPartnerId,
+        email_from: "lead.own@example.com",
+        phone: "+32 494 12 12 12",
+        partner_email_update: true,
+        partner_phone_update: true,
+    });
+    env["crm.lead"].write([3], { partner_id: newPartnerId });
+    return newPartnerId;
+}
+
+/** Selects the cached "New Partner" in the lead form's partner field. */
+async function selectNewPartner() {
+    await searchPartner("New");
+    await contains(`${PARTNER_OPTIONS}:contains(New Partner)`).click();
+    expect(PARTNER_INPUT).toHaveValue("New Partner");
+}
+
+test("[Offline] partner change after a forced save does not replay the forced email and phone", async () => {
+    stepWebSave();
+    const setOffline = mockOffline();
+    const { env } = await makeMockServer();
+    const newPartnerId = setupLeadOwnContacts(env);
+    await openLeadContactForm("Lead 2");
+    expect.verifySteps([]);
+
+    // Offline, a save of the lead with its partner forces its email and phone.
+    await setOffline(true);
+    await contains(".o_field_widget[name=name] input").edit("Lead 2 renamed");
+    await contains(".o_form_button_save").click();
+    const kwargs = { context: callContext(), specification: {} };
+    expect(queuedCalls("crm.lead")).toEqual([
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [
+                [2],
+                {
+                    name: "Lead 2 renamed",
+                    email_from: "lead.own@example.com",
+                    phone: "+32 494 12 12 12",
+                },
+            ],
+            kwargs,
+        },
+    ]);
+
+    // Another partner is then chosen offline. The lead's saves are merged into one
+    // queued write, which no longer forces the email and phone of the previous
+    // partner: replayed, they would overwrite the new partner's.
+    await selectNewPartner();
+    await contains(".o_form_button_save").click();
+    const save = {
+        model: "crm.lead",
+        method: "web_save",
+        args: [[2], { name: "Lead 2 renamed", partner_id: newPartnerId }],
+        kwargs,
+    };
+    expect(queuedCalls("crm.lead")).toEqual([save]);
+    expect.verifySteps([]);
+
+    // On reconnection the queued write replays as queued, and nothing else is saved.
+    await reconnect(setOffline);
+    await expect.waitForSteps([save]);
+    await runAllTimers();
+    await animationFrame();
+    expect.verifySteps([]);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(env["crm.lead"].browse(2)[0]).toMatchObject({
+        name: "Lead 2 renamed",
+        partner_id: newPartnerId,
+    });
+});
+
+test("[Offline] partner change on a reopened lead drops the restored forced email and phone", async () => {
+    // Offline root loads served from the cache: back to the list and the reopened lead.
+    expect.errors(2);
+    stepWebSave();
+    const setOffline = mockOffline();
+    const { env } = await makeMockServer();
+    const newPartnerId = setupLeadOwnContacts(env);
+    await openLeadContactForm("Lead 2");
+
+    await setOffline(true);
+    await contains(".o_field_widget[name=name] input").edit("Lead 2 renamed");
+    await contains(".o_form_button_save").click();
+    const kwargs = { context: callContext(), specification: {} };
+    expect(queuedCalls("crm.lead")).toEqual([
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [
+                [2],
+                {
+                    name: "Lead 2 renamed",
+                    email_from: "lead.own@example.com",
+                    phone: "+32 494 12 12 12",
+                },
+            ],
+            kwargs,
+        },
+    ]);
+
+    // Reopened offline, the lead's queued save is restored in the form, forced email
+    // and phone included. A new partner then drops them from the queued write.
+    await goBack();
+    await contains(".o_data_row:contains(Lead 2) .o_data_cell").click();
+    expect(".o_field_widget[name=name] input").toHaveValue("Lead 2 renamed");
+    expect(".o_field_widget[name=email_from] input").toHaveValue("lead.own@example.com");
+    await selectNewPartner();
+    await contains(".o_form_button_save").click();
+    const save = {
+        model: "crm.lead",
+        method: "web_save",
+        args: [[2], { name: "Lead 2 renamed", partner_id: newPartnerId }],
+        kwargs,
+    };
+    expect(queuedCalls("crm.lead")).toEqual([save]);
+    expect.verifySteps([]);
+
+    await reconnect(setOffline);
+    await expect.waitForSteps([save]);
+    await runAllTimers();
+    await animationFrame();
+    expect.verifySteps([]);
+    expect(queued("crm.lead")).toEqual([]);
+    expect.verifyErrors([LEAD_LIST_LOAD, LEAD_RECORD_LOAD]);
+});
+
+test("[Offline] email typed before an offline partner change is superseded by the partner", async () => {
+    stepWebSave();
+    const setOffline = mockOffline();
+    const { env } = await makeMockServer();
+    const newPartnerId = setupLeadOwnContacts(env);
+    await openLeadContactForm("Lead 2");
+    const emailInput = ".o_field_widget[name=email_from] input";
+
+    // Online, the partner onchange replaces an email typed before it with the
+    // partner's. Offline, the field shows the stored email again, and the save
+    // writes the partner only: on replay the server derives the lead's email from
+    // the new partner, instead of writing the typed one over the partner's.
+    await setOffline(true);
+    await contains(emailInput).edit("lead.typed@example.com");
+    await selectNewPartner();
+    expect(emailInput).toHaveValue("lead.own@example.com");
+    await contains(".o_form_button_save").click();
+    expect(emailInput).toHaveValue("lead.own@example.com");
+    const save = {
+        model: "crm.lead",
+        method: "web_save",
+        args: [[2], { partner_id: newPartnerId }],
+        kwargs: { context: callContext(), specification: {} },
+    };
+    expect(queuedCalls("crm.lead")).toEqual([save]);
+    expect.verifySteps([]);
+
+    await reconnect(setOffline);
+    await expect.waitForSteps([save]);
+    await runAllTimers();
+    await animationFrame();
+    expect.verifySteps([]);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(env["crm.lead"].browse(2)[0]).toMatchObject({
+        email_from: "lead.own@example.com",
+        partner_id: newPartnerId,
+        phone: "+32 494 12 12 12",
+    });
+    expect(env["res.partner"].browse(newPartnerId)[0]).toMatchObject({
+        email: "new.partner@example.com",
+        phone: "+32 470 99 99 99",
+    });
+});
+
+test("[Offline] email saved before an offline partner change is superseded by the partner", async () => {
+    stepWebSave();
+    const setOffline = mockOffline();
+    const { env } = await makeMockServer();
+    const newPartnerId = setupLeadOwnContacts(env);
+    await openLeadContactForm("Lead 2");
+    const emailInput = ".o_field_widget[name=email_from] input";
+    const kwargs = { context: callContext(), specification: {} };
+
+    // Offline, a saved email is queued, with the phone forced for the partner.
+    await setOffline(true);
+    await contains(emailInput).edit("lead.typed@example.com");
+    await contains(".o_form_button_save").click();
+    expect(queuedCalls("crm.lead")).toEqual([
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [[2], { email_from: "lead.typed@example.com", phone: "+32 494 12 12 12" }],
+            kwargs,
+        },
+    ]);
+
+    // A partner chosen afterwards supersedes it: the field shows the stored email
+    // again, also once saved, and the merged queued write holds the partner only.
+    await selectNewPartner();
+    expect(emailInput).toHaveValue("lead.own@example.com");
+    await contains(".o_form_button_save").click();
+    expect(emailInput).toHaveValue("lead.own@example.com");
+    const save = {
+        model: "crm.lead",
+        method: "web_save",
+        args: [[2], { partner_id: newPartnerId }],
+        kwargs,
+    };
+    expect(queuedCalls("crm.lead")).toEqual([save]);
+    expect.verifySteps([]);
+
+    await reconnect(setOffline);
+    await expect.waitForSteps([save]);
+    await runAllTimers();
+    await animationFrame();
+    expect.verifySteps([]);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(env["crm.lead"].browse(2)[0]).toMatchObject({
+        email_from: "lead.own@example.com",
+        partner_id: newPartnerId,
+    });
+});
+
+test("[Offline] email typed after an offline partner change is kept", async () => {
+    stepWebSave();
+    const setOffline = mockOffline();
+    const { env } = await makeMockServer();
+    const newPartnerId = setupLeadOwnContacts(env);
+    await openLeadContactForm("Lead 2");
+    const emailInput = ".o_field_widget[name=email_from] input";
+    const kwargs = { context: callContext(), specification: {} };
+
+    // Offline, an email typed after the partner change is an edit of the user, which
+    // the save keeps; the phone, which nothing changed, is not forced.
+    await setOffline(true);
+    await selectNewPartner();
+    expect(emailInput).toHaveValue("lead.own@example.com");
+    await contains(emailInput).edit("lead.typed@example.com");
+    await contains(".o_form_button_save").click();
+    expect(queuedCalls("crm.lead")).toEqual([
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [[2], { partner_id: newPartnerId, email_from: "lead.typed@example.com" }],
+            kwargs,
+        },
+    ]);
+
+    // A later save of the lead keeps the queued email.
+    await contains(".o_field_widget[name=name] input").edit("Lead 2 renamed");
+    await contains(".o_form_button_save").click();
+    expect(emailInput).toHaveValue("lead.typed@example.com");
+    const save = {
+        model: "crm.lead",
+        method: "web_save",
+        args: [
+            [2],
+            {
+                partner_id: newPartnerId,
+                email_from: "lead.typed@example.com",
+                name: "Lead 2 renamed",
+            },
+        ],
+        kwargs,
+    };
+    expect(queuedCalls("crm.lead")).toEqual([save]);
+    expect.verifySteps([]);
+
+    await reconnect(setOffline);
+    await expect.waitForSteps([save]);
+    await runAllTimers();
+    await animationFrame();
+    expect.verifySteps([]);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(env["crm.lead"].browse(2)[0]).toMatchObject({
+        name: "Lead 2 renamed",
+        email_from: "lead.typed@example.com",
+        partner_id: newPartnerId,
+        phone: "+32 494 12 12 12",
+    });
+});
+
+test("[Offline] online save after an offline partner change writes no stale forced email and phone", async () => {
+    // Offline root loads served from the cache: back to the list and the reopened lead.
+    expect.errors(2);
+    const rejection = rejectReplay("crm.lead", "web_save", "Save refused");
+    onRpc("crm.lead", "web_save", ({ args }) => {
+        expect.step(`web_save ${JSON.stringify(args)}`);
+    });
+    const setOffline = mockOffline();
+    const { env } = await makeMockServer();
+    const newPartnerId = setupLeadOwnContacts(env);
+    await openLeadContactForm("Lead 2");
+    const forced = {
+        name: "Lead 2 renamed",
+        email_from: "lead.own@example.com",
+        phone: "+32 494 12 12 12",
+    };
+
+    // Offline, a rename forces the email and phone into the queued save, which
+    // reopening the lead restores into the form. A new partner is then chosen, and
+    // its onchange is lost.
+    await setOffline(true);
+    await contains(".o_field_widget[name=name] input").edit("Lead 2 renamed");
+    await contains(".o_form_button_save").click();
+    expect(queuedCalls("crm.lead")).toEqual([
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [[2], forced],
+            kwargs: { context: callContext(), specification: {} },
+        },
+    ]);
+    await goBack();
+    await contains(".o_data_row:contains(Lead 2) .o_data_cell").click();
+    expect(".o_field_widget[name=email_from] input").toHaveValue("lead.own@example.com");
+    await selectNewPartner();
+
+    // Back online, the queued save replays and is refused: it stays parked, and the
+    // form keeps the changes restored from it.
+    rejection.reject = true;
+    await reconnect(setOffline);
+    expectParked("crm.lead", "Save refused");
+    expect.verifySteps([`web_save ${JSON.stringify([[2], forced])}`]);
+    rejection.reject = false;
+
+    // The save of the form, now online, writes the rename and the new partner only:
+    // the email and phone forced for the previous partner would overwrite the new
+    // partner's. The parked save no longer holds them either, and stays parked.
+    await contains(".o_form_button_save").click();
+    await expect.waitForSteps([
+        `web_save ${JSON.stringify([[2], { name: "Lead 2 renamed", partner_id: newPartnerId }])}`,
+    ]);
+    expect(env["crm.lead"].browse(2)[0]).toMatchObject({
+        name: "Lead 2 renamed",
+        partner_id: newPartnerId,
+        email_from: "lead.own@example.com",
+        phone: "+32 494 12 12 12",
+    });
+    expectParked("crm.lead", "Save refused");
+    expect(queuedCalls("crm.lead")).toEqual([
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [[2], { name: "Lead 2 renamed" }],
+            kwargs: { context: callContext(), specification: {} },
+        },
+    ]);
+    expect.verifyErrors([LEAD_LIST_LOAD, LEAD_RECORD_LOAD]);
+});
+
+test("[Offline] save as the connection returns writes and replays no stale forced email and phone", async () => {
+    // Offline root loads served from the cache: back to the list and the reopened lead.
+    expect.errors(2);
+    onRpc("crm.lead", "web_save", ({ args }) => {
+        expect.step(`web_save ${JSON.stringify(args)}`);
+    });
+    // The connection, which can come back before the framework notices it.
+    const network = { down: false };
+    onRpc("/*", () => {
+        if (network.down) {
+            return new Response("", { status: 502 });
+        }
+    });
+    const { env } = await makeMockServer();
+    const newPartnerId = setupLeadOwnContacts(env);
+    await openLeadContactForm("Lead 2");
+
+    // Offline, a rename forces the email and phone into the queued save, which
+    // reopening the lead restores into the form. A new partner is then chosen, and
+    // its onchange is lost.
+    network.down = true;
+    getService(OfflinePlugin).setOffline(true);
+    await animationFrame();
+    await contains(".o_field_widget[name=name] input").edit("Lead 2 renamed");
+    await contains(".o_form_button_save").click();
+    expect(queuedCalls("crm.lead")).toEqual([
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [
+                [2],
+                {
+                    name: "Lead 2 renamed",
+                    email_from: "lead.own@example.com",
+                    phone: "+32 494 12 12 12",
+                },
+            ],
+            kwargs: { context: callContext(), specification: {} },
+        },
+    ]);
+    await goBack();
+    await contains(".o_data_row:contains(Lead 2) .o_data_cell").click();
+    await selectNewPartner();
+    expect(getService(OfflinePlugin).isOffline()).toBe(true);
+
+    // The connection is back, and the form is saved before the framework notices
+    // it: the save writes the rename and the new partner, and the queued save, which
+    // its success replays next, the rename only. Neither writes the email and phone
+    // forced for the previous partner over the new partner's.
+    network.down = false;
+    await contains(".o_form_button_save").click();
+    await runAllTimers();
+    await animationFrame();
+    expect.verifySteps([
+        `web_save ${JSON.stringify([[2], { name: "Lead 2 renamed", partner_id: newPartnerId }])}`,
+        `web_save ${JSON.stringify([[2], { name: "Lead 2 renamed" }])}`,
+    ]);
+    expect(getService(OfflinePlugin).isOffline()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(env["crm.lead"].browse(2)[0]).toMatchObject({
+        name: "Lead 2 renamed",
+        partner_id: newPartnerId,
+    });
+    expect.verifyErrors([LEAD_LIST_LOAD, LEAD_RECORD_LOAD]);
+});
+
+test("[Offline] replay reconciliation after an offline partner change writes no superseded email", async () => {
+    onRpc("crm.lead", "web_save", ({ args }) => {
+        expect.step(`web_save ${JSON.stringify(args)}`);
+    });
+    const setOffline = mockOffline();
+    const { env } = await makeMockServer();
+    const newPartnerId = setupLeadOwnContacts(env);
+    await openLeadContactForm("Lead 2");
+    const typed = { email_from: "lead.typed@example.com", phone: "+32 494 12 12 12" };
+
+    // Offline, a saved email is queued; a partner chosen afterwards, without saving,
+    // gives the field its stored email back.
+    await setOffline(true);
+    await contains(".o_field_widget[name=email_from] input").edit(typed.email_from);
+    await contains(".o_form_button_save").click();
+    await selectNewPartner();
+    expect(".o_field_widget[name=email_from] input").toHaveValue("lead.own@example.com");
+
+    // The replay writes the queued email. The reconciliation then reads the lead and
+    // saves the new partner only: the email the partner change superseded is not
+    // written over the new partner's, although the lead read back holds another one.
+    await reconnect(setOffline);
+    await runAllTimers();
+    await animationFrame();
+    expect.verifySteps([
+        `web_save ${JSON.stringify([[2], typed])}`,
+        `web_save ${JSON.stringify([[2], { partner_id: newPartnerId }])}`,
+    ]);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(env["crm.lead"].browse(2)[0]).toMatchObject({
+        partner_id: newPartnerId,
+        email_from: typed.email_from,
+    });
+});
+
+test("[Offline] partner change saved after a later write of the lead queues no stale forced email and phone", async () => {
+    // Offline root loads served from the cache: back to the list and the reopened lead.
+    expect.errors(2);
+    stepWebSave();
+    const setOffline = mockOffline();
+    const { env } = await makeMockServer();
+    const newPartnerId = setupLeadOwnContacts(env);
+    await openLeadContactForm("Lead 2");
+    const kwargs = { context: callContext(), specification: {} };
+    const phoneInput = ".o_field_widget[name=phone] input";
+
+    // T1: offline, a rename forces the lead's email and phone for its partner.
+    await setOffline(true);
+    await contains(".o_field_widget[name=name] input").edit("Lead 2 renamed");
+    await contains(".o_form_button_save").click();
+    const [formSave] = queued("crm.lead");
+    expect(formSave.value.args).toEqual([
+        [2],
+        { name: "Lead 2 renamed", email_from: "lead.own@example.com", phone: "+32 494 12 12 12" },
+    ]);
+    // T2 = T1 + 1 min: the lead's form of another action (another Record) saves another
+    // name and phone, queued as the framework queues a form save.
+    const otherSave = getService(OfflinePlugin).scheduleORM(
+        "crm.lead",
+        "web_save",
+        [[2], { name: "Lead 2 elsewhere", phone: "+32 470 55 55 55" }],
+        kwargs,
+        {
+            extras: {
+                actionId: TEAM_LEADS_ACTION_ID,
+                actionName: TEAM_LEADS_ACTION.name,
+                viewType: "form",
+                displayName: "Lead 2 elsewhere",
+                timeStamp: formSave.value.extras.timeStamp + 60_000,
+                changes: { name: "Lead 2 elsewhere", phone: "+32 470 55 55 55" },
+                originalValues: { name: "Lead 2", phone: "+32 494 12 12 12" },
+            },
+        }
+    );
+
+    // A new partner is chosen, then a phone typed after it is saved. The later write
+    // also writes the phone and the name the form's queued save holds: that save keeps
+    // its time, and the phone is queued again after the later write, in a follow-up
+    // write. Neither the queued save nor the follow-up holds the email and phone
+    // forced for the previous partner, which would overwrite the new partner's.
+    await selectNewPartner();
+    await contains(phoneInput).edit("+32 470 77 77 77", { confirm: "tab" });
+    await contains(".o_form_button_save").click();
+    expect(".o_field_widget[name=email_from] input").toHaveValue("lead.own@example.com");
+    expect(phoneInput).toHaveValue("+32 470 77 77 77");
+    const formWrite = {
+        model: "crm.lead",
+        method: "web_save",
+        args: [
+            [2],
+            { name: "Lead 2 renamed", phone: "+32 470 77 77 77", partner_id: newPartnerId },
+        ],
+        kwargs,
+    };
+    const laterWrite = {
+        model: "crm.lead",
+        method: "web_save",
+        args: [[2], { name: "Lead 2 elsewhere", phone: "+32 470 55 55 55" }],
+        kwargs,
+    };
+    const followUp = {
+        model: "crm.lead",
+        method: "web_save",
+        args: [[2], { phone: "+32 470 77 77 77" }],
+        kwargs,
+    };
+    expect(queuedCalls("crm.lead")).toEqual([formWrite, laterWrite, followUp]);
+    const entries = queued("crm.lead");
+    expect(entries.slice(0, 2).map(({ key }) => key)).toEqual([formSave.key, otherSave]);
+    expect(entries[0].value.extras.timeStamp).toBe(formSave.value.extras.timeStamp);
+    expect(entries[2].value.extras.crmFollowUp).toBe(true);
+
+    // Reopened offline, the lead shows the phone of its last queued write.
+    await goBack();
+    await contains(".o_data_row:contains(Lead 2) .o_data_cell").click();
+    expect(phoneInput).toHaveValue("+32 470 77 77 77");
+    expect(PARTNER_INPUT).toHaveValue("New Partner");
+    expect(queuedCalls("crm.lead")).toEqual([formWrite, laterWrite, followUp]);
+    expect.verifySteps([]);
+
+    // On reconnection the three writes replay in order, and nothing else is saved.
+    await reconnect(setOffline);
+    await expect.waitForSteps([formWrite, laterWrite, followUp]);
+    await runAllTimers();
+    await animationFrame();
+    expect.verifySteps([]);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(env["crm.lead"].browse(2)[0]).toMatchObject({
+        name: "Lead 2 elsewhere",
+        partner_id: newPartnerId,
+        email_from: "lead.own@example.com",
+        phone: "+32 470 77 77 77",
+    });
+    expect(env["res.partner"].browse(newPartnerId)[0]).toMatchObject({
+        email: "new.partner@example.com",
+        phone: "+32 470 99 99 99",
+    });
+    expect.verifyErrors([LEAD_LIST_LOAD, LEAD_RECORD_LOAD]);
+});
+
+test("[Offline] phone edit shows the saved number", async () => {
+    // Offline root loads served from the cache: back to the list and the reopened lead.
+    expect.errors(2);
+    const phoneFields = [];
+    patchWithCleanup(PhoneField.prototype, {
+        setup() {
+            super.setup(...arguments);
+            phoneFields.push(this);
+        },
+    });
+    patchWithCleanup(browser, { open: (url) => expect.step(`open ${url}`) });
+    const setOffline = mockOffline();
+    const { env } = await makeMockServer();
+    env["crm.lead"].write([2], {
+        phone: "+32 470 12 34 56",
+        phone_formatted: "+32 470 12 34 56",
+        phone_sanitized: "+32470123456",
+    });
+    await openLeadContactForm("Lead 2");
+    const phoneInput = ".o_field_widget[name=phone] input";
+    expect(phoneInput).toHaveValue("+32 470 12 34 56");
+    expect(phoneFields.at(-1).phoneHref).toBe("tel:+32470123456");
+
+    // Offline the onchange of the new number is lost: the loaded formatted and
+    // sanitized numbers are dropped, so the field shows and dials the new number.
+    await setOffline(true);
+    await contains(phoneInput).edit("+32 470 65 43 21", { confirm: "tab" });
+    expect(phoneInput).toHaveValue("+32 470 65 43 21");
+    expect(phoneFields.at(-1).phoneHref).toBe("tel:+32470654321");
+    await contains(".o_form_button_save").click();
+    expect(phoneInput).toHaveValue("+32 470 65 43 21");
+    expect(phoneFields.at(-1).phoneHref).toBe("tel:+32470654321");
+    const save = {
+        model: "crm.lead",
+        method: "web_save",
+        args: [[2], { phone: "+32 470 65 43 21" }],
+        kwargs: { context: callContext(), specification: {} },
+    };
+    expect(queuedCalls("crm.lead")).toEqual([save]);
+
+    // Reopened offline, the lead shows the queued number, and its Call opens it.
+    await goBack();
+    await contains(".o_data_row:contains(Lead 2) .o_data_cell").click();
+    expect(phoneInput).toHaveValue("+32 470 65 43 21");
+    expect(phoneFields.at(-1).phoneHref).toBe("tel:+32470654321");
+    phoneFields.at(-1).onLinkClicked();
+    expect.verifySteps(["open tel:+32470654321"]);
+    expect(queuedCalls("crm.lead")).toEqual([save]);
+    expect.verifyErrors([LEAD_LIST_LOAD, LEAD_RECORD_LOAD]);
+});
+
 test("[Offline] lead create and edit queue and replay", async () => {
     // The framework's cached root loads (list back, form reopen, form reload after
     // the discard) raise their lost network fallback offline; the CRM code adds none.
@@ -1709,6 +2566,43 @@ test("[Offline] lead create and edit queue and replay", async () => {
     expect(env["crm.lead"].browse(2)[0].name).toBe("Lead 2 edited offline");
     expect.verifySteps([]);
     expect.verifyErrors([LEAD_LIST_LOAD, LEAD_RECORD_LOAD, LEAD_RECORD_LOAD]);
+});
+
+test.tags("desktop");
+test("[Offline] lead form reopened offline after a replayed edit shows the server values on desktop", async () => {
+    // The framework's cached root loads offline: the form, the pipeline back, and
+    // the form reopened after the replay.
+    expect.errors(3);
+    const reads = [];
+    onRpc("crm.lead", "web_read", (params) => {
+        reads.push(callPayload(params));
+    });
+    const setOffline = mockOffline();
+    await openPipeline();
+    await flushStartupSync();
+    await openLead(2);
+    await goBack();
+    const formRead = reads.find(({ args }) => args[0][0] === 2);
+    expect(formRead.kwargs.specification).not.toInclude("activity_ids");
+
+    // Edited offline in its form, then left.
+    await setOffline(true);
+    await openLead(2);
+    await contains(".o_field_widget[name=name] input").edit("Lead 2 edited offline");
+    await contains(".o_form_button_save").click();
+    await goBack();
+
+    // The replay of the edit requests the form's cached read again, as the form did.
+    reads.splice(0);
+    await reconnect(setOffline);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(reads).toEqual([formRead]);
+
+    // Offline again, the form shows the replayed value.
+    await setOffline(true);
+    await openLead(2);
+    expect(".o_field_widget[name=name] input").toHaveValue("Lead 2 edited offline");
+    expect.verifyErrors([LEAD_RECORD_LOAD, LEAD_GROUPS_LOAD, LEAD_RECORD_LOAD]);
 });
 
 test("[Offline] lead form create can be discarded or parked", async () => {
@@ -2180,6 +3074,82 @@ test("[Online] kanban stage move reloads the source column", async () => {
     ]);
     expect(".o_kanban_group:eq(0) .o_kanban_record").toHaveCount(2);
     expect(".o_kanban_group:eq(0) .o_kanban_record:contains(Lead 3)").toHaveCount(1);
+});
+
+/** Pipeline whose cards hold their `kanban_activity` button (a `<button>`). */
+const ACTIVITY_PIPELINE_ACTION = {
+    type: "ir.actions.act_window",
+    name: "Pipeline",
+    res_model: "crm.lead",
+    views: [[ACTIVITY_KANBAN_VIEW_ID, "kanban"]],
+    context: { default_type: "opportunity" },
+};
+
+test.tags("desktop");
+test("[Offline] kanban drag of a lead not opened online moves it and queues one web_save", async () => {
+    stepWebSave();
+    const setOffline = mockOffline();
+    stepRoutes((route) => route.includes("/crm.lead/"));
+    // Through the web client, for the offline systray.
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(ACTIVITY_PIPELINE_ACTION);
+    await flushStartupSync();
+    expect.verifySteps([
+        "/web/dataset/call_kw/crm.lead/get_views",
+        "/web/dataset/call_kw/crm.lead/web_read_group",
+    ]);
+
+    // Lead 1's form was never opened: offline, the framework disables its card and
+    // its activity button (`.o_disabled_offline`, with `pointer-events: auto !important`).
+    await setOffline(true);
+    const lead1 = ".o_kanban_record:contains(Lead 1)";
+    expect(`.o_kanban_group:eq(0) ${lead1}`).toHaveClass("o_disabled_offline");
+
+    const { drop, moveTo } = await contains(`.o_kanban_group:eq(0) ${lead1}`).drag();
+    await moveTo(".o_kanban_group:eq(1)");
+
+    // While dragged, neither the card nor its disabled controls take the pointer, so
+    // a real pointer reaches the columns under the card instead of the card itself.
+    const dragged = ".o_kanban_record.o_dragged";
+    expect(`${dragged}:contains(Lead 1)`).toHaveCount(1);
+    expect(dragged).toHaveClass("o_disabled_offline");
+    expect(dragged).toHaveStyle({ "pointer-events": "none" });
+    expect(`${dragged} .o_disabled_offline`).not.toHaveCount(0);
+    expect(`${dragged} .o_disabled_offline`).toHaveStyle({ "pointer-events": "none" });
+    const draggedEl = queryFirst(dragged);
+    const { x, y, width, height } = draggedEl.getBoundingClientRect();
+    const hitEl = document.elementFromPoint(x + width / 2, y + height / 2);
+    expect(draggedEl.contains(hitEl)).toBe(false, {
+        message: "the dragged card is not the element under its own centre",
+    });
+
+    await drop();
+
+    // The card moved at once with one queued write; the release opened no form, so
+    // nothing else was requested.
+    expect(`.o_kanban_group:eq(0) ${lead1}`).toHaveCount(0);
+    expect(`.o_kanban_group:eq(1) ${lead1}`).toHaveCount(1);
+    expect(dragged).toHaveCount(0);
+    expect(".o_form_view").toHaveCount(0);
+    const move = {
+        model: "crm.lead",
+        method: "web_save",
+        args: [[1], { stage_id: STAGE_QUALIFIED }],
+        kwargs: {
+            context: callContext(ACTIVITY_PIPELINE_ACTION.context, {
+                default_stage_id: STAGE_NEW,
+            }),
+            specification: {},
+        },
+    };
+    expect(queuedCalls("crm.lead")).toEqual([move]);
+    expect.verifySteps(["/web/dataset/call_kw/crm.lead/web_save"]);
+
+    await reconnect(setOffline);
+    await expect.waitForSteps(["/web/dataset/call_kw/crm.lead/web_save", move]);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(STAGE_QUALIFIED);
+    expect.verifySteps([]);
 });
 
 /** "My Pipeline" (`crm.crm_lead_action_pipeline`): the lead kanban and form. */
@@ -2982,8 +3952,6 @@ test("[Offline] mark won on an unsynced new lead queues its create only", async 
                 email_from: false,
                 expected_revenue: 12,
                 name: "Unsynced Lead",
-                partner_email_update: false,
-                partner_phone_update: false,
                 phone: false,
                 probability: 0,
                 stage_id: false,
@@ -3019,6 +3987,71 @@ test("[Offline] mark won on an unsynced new lead queues its create only", async 
     await animationFrame();
     expect.verifySteps([]);
     expect.verifyErrors([LEAD_GROUPS_LOAD]);
+});
+
+test("[Offline] non-secure origin disables Won, which queues and shows nothing", async () => {
+    const setOffline = mockOffline();
+    stepRoutes(
+        (route) =>
+            route === RAINBOWMAN_ROUTE ||
+            /\/crm\.lead\/(web_save|action_set_won|action_set_won_rainbowman)$/.test(route)
+    );
+    let controller = null;
+    patchWithCleanup(CrmFormController.prototype, {
+        setup() {
+            super.setup(...arguments);
+            controller = this;
+        },
+    });
+    await openPipeline();
+    // A non-secure origin (a plain-http LAN address), where the framework queue
+    // refuses every call: set before the form renders, as it holds for a whole
+    // session, and after the web client started, so its caches stay as opened.
+    patchWithCleanup(window, { isSecureContext: false });
+    await openLead(1);
+    await flushStartupSync();
+
+    // Online, "Won" is unchanged.
+    const wonButton = ".o_form_statusbar button[name=action_set_won_rainbowman]";
+    expectUnguarded(wonButton, 1);
+    expect(wonButton).toHaveAttribute("data-available-offline", "1");
+
+    // Offline it is a DISABLE button: framework-disabled, without the attribute
+    // by which the framework would enable it again, and inert by pointer, keyboard
+    // and hotkey.
+    await setOffline(true);
+    expectGuarded(wonButton, 1);
+    expect(wonButton).not.toHaveAttribute("data-available-offline");
+    await activateByPointerAndKeyboard(wonButton);
+    await press(["alt", "w"]);
+    await animationFrame();
+    expect(".ribbon:contains(Won)").toHaveCount(0);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(".o_notification").toHaveCount(0);
+    expect.verifySteps([]);
+
+    // A direct call is refused by the framework queue before any local won state.
+    await expect(controller.crmQueueMarkWon()).rejects.toThrow(/non-secure context/);
+    await animationFrame();
+    expect(".ribbon:contains(Won)").toHaveCount(0);
+    expect(".o_field_widget[name=probability] input").toHaveValue("10.00");
+    expect(queued("crm.lead")).toEqual([]);
+    expect.verifySteps([]);
+
+    // Online again, "Won" is enabled and marks the lead won on the server.
+    await setOffline(false);
+    await animationFrame();
+    expectUnguarded(wonButton, 1);
+    expect(wonButton).toHaveAttribute("data-available-offline", "1");
+    await contains(wonButton).click();
+    await expect.waitForSteps([
+        buttonRoute("crm.lead", "action_set_won_rainbowman"),
+        "action_set_won_rainbowman [1]",
+    ]);
+    await animationFrame();
+    expect(".ribbon:contains(Won)").toHaveCount(1);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(".o_notification").toHaveCount(0);
 });
 
 /**
@@ -3225,12 +4258,16 @@ function pipelineLeadNames() {
 
 /**
  * Stage names of the pipeline: the column titles on desktop; on the mobile pipeline,
- * the stage header of each stage, browsed with "Next stage" from the first one.
+ * the stage header of each stage, browsed with "Next stage" from the first one (the
+ * pipeline shows again the stage it was left at, so "Previous stage" reaches it first).
  */
 async function pipelineStageNames() {
     if (!isSmall()) {
         // A column title is followed by its record count, e.g. "New\n(3)".
         return queryAllTexts(".o_kanban_group .o_column_title").map((text) => text.split("\n")[0]);
+    }
+    while (queryFirst(".o_crm_mobile_pipeline_prev:enabled")) {
+        await contains(".o_crm_mobile_pipeline_prev").click();
     }
     const names = [queryFirst(".o_crm_mobile_pipeline_stage_name").textContent];
     while (queryFirst(".o_crm_mobile_pipeline_next:enabled")) {
@@ -3505,6 +4542,19 @@ async function activateByPointerAndKeyboard(selector) {
         }
     }
     await animationFrame();
+}
+
+/**
+ * Forces the activation of a button the framework disabled offline, as a script can:
+ * its `disabled` attribute is removed, then it is clicked at once, before the
+ * framework disables it again.
+ *
+ * @param {string} selector
+ */
+function forceClick(selector) {
+    const el = queryFirst(selector);
+    el.removeAttribute("disabled");
+    el.click();
 }
 
 /**
@@ -3954,6 +5004,10 @@ test("[Offline] CRM wizards and bound actions unreachable", async () => {
 test("[Offline] wizard opened online cannot be applied", async () => {
     const setOffline = mockOffline();
     stepRoutes((route) => route.startsWith("/web/dataset/call_button/"));
+    // The wizards' `web_save` requests, stepped while offline and on the reconnection:
+    // a transient record is neither saved nor queued offline, so none is replayed.
+    const transientSaves = stepRoutes((route) => route.endsWith("/web_save"));
+    transientSaves.active = false;
     await mountWithCleanup(WebClient);
     await getService("action").doAction(LEADS_ACTION.id);
     await flushStartupSync();
@@ -4016,6 +5070,7 @@ test("[Offline] wizard opened online cannot be applied", async () => {
         expect(".modal .o_form_view").toHaveCount(1);
         await enter();
         await setOffline(true);
+        transientSaves.active = true;
 
         // The apply button is disabled and inert; a direct call issues nothing.
         const apply = `.modal footer button[name=${method}]`;
@@ -4039,10 +5094,20 @@ test("[Offline] wizard opened online cannot be applied", async () => {
         expectEntered();
         expect(queued(model)).toEqual([]);
         expect.verifySteps([]);
+        // A forced activation of the disabled button stops before the wizard's record
+        // is saved: no `web_save` is attempted or queued.
+        forceClick(apply);
+        await settle();
+        expect(".modal .o_form_view").toHaveCount(1);
+        expectEntered();
+        expect(queued(model)).toEqual([]);
+        expect.verifySteps([]);
 
-        // Back online, it applies.
-        await setOffline(false);
-        await animationFrame();
+        // Back online, nothing is replayed, and it applies.
+        await reconnect(setOffline);
+        expect(queued(model)).toEqual([]);
+        expect.verifySteps([]);
+        transientSaves.active = false;
         expect(apply).toBeEnabled();
         await contains(apply).click();
         await expect.waitForSteps([buttonRoute(model, method), `${method} [1]`]);
@@ -4368,6 +5433,14 @@ test("[Offline] forecast, reports and analysis views unreachable after an online
     await getService("menu").selectMenu(4);
     await getService("action").switchView("list");
     expect(currentView()).toBe("crm.crm_lead_action_forecast/list");
+    // A lead form opened from the forecast, and the pipeline report's list: each
+    // marks a view of its action visited, which alone would leave its navbar entry
+    // enabled offline.
+    await contains(".o_data_row:contains(Lead 1) .o_data_cell:eq(0)").click();
+    await expectCurrentView("crm.crm_lead_action_forecast/form");
+    await getService("menu").selectMenu(5);
+    await getService("action").switchView("list");
+    expect(currentView()).toBe("crm.crm_opportunity_report_action/list");
     /** Actions opened online, with the context they were opened with. */
     const visits = [
         { action: FORECAST_ACTION },
@@ -4405,18 +5478,25 @@ test("[Offline] forecast, reports and analysis views unreachable after an online
 
     await setOffline(true);
     stepping.active = true;
-    // The forecast views are never marked available, even after a visit.
+    // The forecast views are never marked available, even after a visit...
     const offlinePlugin = getService(OfflinePlugin);
     expect(offlinePlugin.isAvailableOffline(FORECAST_ACTION.id, "kanban")).toBe(false);
     expect(offlinePlugin.isAvailableOffline(FORECAST_ACTION.id, "list")).toBe(false);
+    // ... but the visited registry holds the forecast through its lead form, the
+    // pipeline report through its list, and the recurring plans through theirs.
+    expect(offlinePlugin.isAvailableOffline(FORECAST_ACTION.id)).toBe(true);
+    expect(offlinePlugin.isAvailableOffline(OPPORTUNITY_REPORT_ACTION.id, "list")).toBe(true);
+    expect(offlinePlugin.isAvailableOffline(RECURRING_PLAN_ACTION.id, "list")).toBe(true);
 
-    // Navbar: the forecast and report entries are dimmed (never-marked views); every
-    // entry is inert by click, Enter, Space and a direct `selectMenu` (id or menu).
-    for (const { id, section, xmlid, view } of DISABLED_MENUS) {
+    // Navbar: every entry is dimmed whatever view of its action was visited, and is
+    // inert by click, Enter, Space and a direct `selectMenu` (id or menu). The
+    // visited pipeline entry keeps the framework's state.
+    expect(".o_menu_sections .o_nav_entry[data-menu-xmlid='crm.crm_menu_sales']").not.toHaveClass(
+        "o_disabled_offline"
+    );
+    for (const { id, section, xmlid } of DISABLED_MENUS) {
         const entry = await openNavbarEntry(section, xmlid);
-        if (/\/(kanban|graph)$/.test(view)) {
-            expect(entry).toHaveClass("o_disabled_offline");
-        }
+        expect(entry).toHaveClass("o_disabled_offline");
         await click(queryFirst(entry));
         await settle();
         expect(currentView()).toBe("crm.crm_lead_action_pipeline/kanban");
@@ -4439,8 +5519,8 @@ test("[Offline] forecast, reports and analysis views unreachable after an online
         expect(currentView()).toBe("crm.crm_lead_action_pipeline/kanban");
     }
     expect(Object.keys(offlinePlugin._ormToSync())).toEqual([]);
-    // Direct `doAction` by `xml_id` and by numeric id (identified through the
-    // disk-cached action loaded online with the same context).
+    // Direct `doAction` by `xml_id` and by numeric id (identified, with no request,
+    // from the web client's own online load of that action).
     for (const { action, context } of visits) {
         expect(CRM_OFFLINE_DISABLED_ACTIONS.has(action.xml_id)).toBe(true);
         await getService("action").doAction(action.xml_id, { additionalContext: context });
@@ -4568,6 +5648,116 @@ test("[Offline] forecast, reports and analysis views unreachable after an online
     expect.verifyErrors([LEAD_LIST_LOAD]);
 });
 
+test.tags("mobile");
+test("[Offline] phone sidebar entries of blocked views are dimmed after an online visit", async () => {
+    defineMenus([
+        ...CRM_MENUS,
+        {
+            id: 20,
+            name: "Other app",
+            xmlid: "test.other_menu_root",
+            actionID: STAGE_ACTION.id,
+            appID: 20,
+            children: [
+                {
+                    id: 21,
+                    name: "Stages",
+                    xmlid: "test.other_menu_stages",
+                    actionID: STAGE_ACTION.id,
+                    appID: 20,
+                },
+                {
+                    id: 22,
+                    name: "Teams",
+                    xmlid: "test.other_menu_teams",
+                    actionID: TEAM_ACTION.id,
+                    appID: 20,
+                },
+            ],
+        },
+    ]);
+    const setOffline = mockOffline();
+    await mountWithCleanup(WebClient);
+    await getService("menu").selectMenu(2);
+    expect(currentView()).toBe("crm.crm_lead_action_pipeline/kanban");
+
+    // Online visit of every entry, a lead form opened from the forecast and the
+    // pipeline report's list: each marks a view of its action visited.
+    for (const { id, view } of DISABLED_MENUS) {
+        await getService("menu").selectMenu(id);
+        await expectCurrentView(view);
+    }
+    await getService("menu").selectMenu(4);
+    await getService("action").switchView("list");
+    await contains(".o_data_row:contains(Lead 1) .o_data_cell:eq(0)").click();
+    await expectCurrentView("crm.crm_lead_action_forecast/form");
+    await getService("menu").selectMenu(5);
+    await getService("action").switchView("list");
+    expect(currentView()).toBe("crm.crm_opportunity_report_action/list");
+    await getService("menu").selectMenu(2);
+    expect(currentView()).toBe("crm.crm_lead_action_pipeline/kanban");
+    await flushStartupSync();
+
+    // The sidebar is rendered in a portal on the body, outside the test fixture.
+    const inBody = { root: document.body };
+    const entrySelector = (xmlid) => `.o_app_menu_sidebar li[data-menu-xmlid='${xmlid}']`;
+    const sidebarEntry = (xmlid) => queryAll(entrySelector(xmlid), inBody);
+    const pipelineEntry = () => sidebarEntry("crm.crm_menu_sales");
+    // Online, the sidebar renders the framework's entries.
+    await contains("a.o_menu_toggle").click();
+    for (const { xmlid } of DISABLED_MENUS) {
+        expect(sidebarEntry(xmlid)).toHaveAttribute("class", "py-2");
+        expect(sidebarEntry(xmlid)).not.toHaveAttribute("aria-disabled");
+    }
+    expect(pipelineEntry()).toHaveAttribute("class", "fw-bold text-900 py-3");
+
+    // Offline, the open sidebar dims every entry at once; the visited pipeline entry
+    // keeps the framework's state.
+    await setOffline(true);
+    for (const { xmlid } of DISABLED_MENUS) {
+        expect(sidebarEntry(xmlid)).toHaveClass("o_disabled_offline");
+        expect(sidebarEntry(xmlid)).toHaveAttribute("aria-disabled", "true");
+    }
+    expect(pipelineEntry()).not.toHaveClass("o_disabled_offline");
+    expect(pipelineEntry()).not.toHaveAttribute("aria-disabled");
+    // A tap on an entry closes the sidebar and leaves the current view in place.
+    for (const { xmlid } of DISABLED_MENUS) {
+        if (!sidebarEntry(xmlid).length) {
+            await contains("a.o_menu_toggle").click();
+        }
+        expect(sidebarEntry(xmlid)).toHaveClass("o_disabled_offline");
+        await click(sidebarEntry(xmlid)[0]);
+        await settle();
+        expect(queryAll(".o_app_menu_sidebar", inBody)).toHaveCount(0);
+        expect(currentView()).toBe("crm.crm_lead_action_pipeline/kanban");
+    }
+    expect(Object.keys(getService(OfflinePlugin)._ormToSync())).toEqual([]);
+
+    // Online again, the entries are the framework's, and a tap opens the view.
+    await setOffline(false);
+    await animationFrame();
+    await contains("a.o_menu_toggle").click();
+    for (const { xmlid } of DISABLED_MENUS) {
+        expect(sidebarEntry(xmlid)).toHaveAttribute("class", "py-2");
+        expect(sidebarEntry(xmlid)).not.toHaveAttribute("aria-disabled");
+    }
+    await contains(entrySelector("crm.crm_menu_forecast"), inBody).click();
+    await expectCurrentView(`${FORECAST_ACTION.xml_id}/kanban`);
+
+    // Another app's phone sidebar is left as the framework renders it, even for an
+    // entry whose action was never visited.
+    await getService("menu").selectMenu(21);
+    await expectCurrentView(`${STAGE_ACTION.xml_id}/list`);
+    await setOffline(true);
+    expect(getService(OfflinePlugin).isAvailableOffline(TEAM_ACTION.id)).toBe(false);
+    await contains("a.o_menu_toggle").click();
+    for (const xmlid of ["test.other_menu_stages", "test.other_menu_teams"]) {
+        expect(sidebarEntry(xmlid)).toHaveCount(1);
+        expect(sidebarEntry(xmlid)).not.toHaveClass("o_disabled_offline");
+        expect(sidebarEntry(xmlid)).not.toHaveAttribute("aria-disabled");
+    }
+});
+
 test("[Offline] URL and breadcrumb restoration of blocked views fails closed", async () => {
     const setOffline = mockOffline();
     const stepping = stepRoutes(
@@ -4643,8 +5833,8 @@ test("[Offline] blocked actions requested by a numeric-string id stay closed", a
 
     await setOffline(true);
     stepping.active = true;
-    // Each disabled action is identified through its disk-cached load (the same
-    // string request): the pipeline stays, with no helper, dialog or request.
+    // Each disabled action is identified from its online load (the same string
+    // request): the pipeline stays, with no helper, dialog or request.
     for (const [action] of blocked) {
         expect(CRM_OFFLINE_DISABLED_ACTIONS.has(action.xml_id)).toBe(true);
         await getService("action").doAction(String(action.id));
@@ -4669,6 +5859,81 @@ test("[Offline] blocked actions requested by a numeric-string id stay closed", a
     await getService("action").doAction(String(FORECAST_ACTION.id));
     await expectCurrentView("crm.crm_lead_action_forecast/kanban");
     expect(".o_action_manager .o_view_nocontent .fa-chain-broken").toHaveCount(0);
+});
+
+/**
+ * Contacts (`contacts.action_contacts`): an action of another app. Its id, like that
+ * of `CUSTOMERS_ACTION`, is used by no other action of this file: the mock server
+ * merges every action sharing an id into one.
+ */
+const CONTACTS_ACTION = {
+    id: 48,
+    xml_id: "contacts.action_contacts",
+    name: "Contacts",
+    res_model: "res.partner",
+    views: [[false, "list"]],
+};
+
+/** Customers (`base.action_partner_form`): another action of another app. */
+const CUSTOMERS_ACTION = {
+    id: 47,
+    xml_id: "base.action_partner_form",
+    name: "Customers",
+    res_model: "res.partner",
+    views: [[false, "list"]],
+};
+
+defineActions([CONTACTS_ACTION, CUSTOMERS_ACTION]);
+
+test("[Offline] other apps' action loads issue only the original's requests", async () => {
+    const setOffline = mockOffline();
+    const stepping = stepRoutes((route) => route === "/web/action/load");
+    stepping.active = false;
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(PIPELINE_ACTION.id);
+    await expectCurrentView("crm.crm_lead_action_pipeline/kanban");
+    await flushStartupSync();
+    const lostLoad = /Connection to "\/web\/action\/load" couldn't be established/;
+    const lostBreadcrumbs = /Connection to "\/web\/action\/load_breadcrumbs" couldn't be/;
+
+    await setOffline(true);
+    stepping.active = true;
+    // An action id the CRM guards do not know (never loaded): the original's own
+    // load alone is attempted, and its failure is the original's.
+    await expect(getService("action").doAction(CONTACTS_ACTION.id)).rejects.toThrow(lostLoad);
+    expect.verifySteps(["/web/action/load"]);
+    // A URL state of a single unknown action: the original's own load alone...
+    const singleState = {
+        action: CUSTOMERS_ACTION.id,
+        actionStack: [{ action: CUSTOMERS_ACTION.id }],
+    };
+    await expect(getService("action").loadState(singleState)).rejects.toThrow(lostLoad);
+    expect.verifySteps(["/web/action/load"]);
+    // ... and of an unknown multi-level route (`/odoo/<action>/1/<action>`): none,
+    // as the original fails first on its breadcrumbs.
+    const nestedState = {
+        action: CUSTOMERS_ACTION.id,
+        active_id: 1,
+        actionStack: [
+            { action: CONTACTS_ACTION.id },
+            { action: CUSTOMERS_ACTION.id, active_id: 1 },
+        ],
+    };
+    await expect(getService("action").loadState(nestedState)).rejects.toThrow(lostBreadcrumbs);
+    await settle();
+    expect.verifySteps([]);
+    expect(currentView()).toBe("crm.crm_lead_action_pipeline/kanban");
+    expect(".o_kanban_renderer").toHaveCount(1);
+    expect(".modal").toHaveCount(0);
+
+    // Online, each request passes through to the original with its one load.
+    await reconnect(setOffline);
+    await getService("action").doAction(CONTACTS_ACTION.id);
+    await expectCurrentView("contacts.action_contacts/list");
+    expect.verifySteps(["/web/action/load"]);
+    expect(await getService("action").loadState(singleState)).toBe(true);
+    await expectCurrentView("base.action_partner_form/list");
+    expect.verifySteps(["/web/action/load"]);
 });
 
 test("[Offline] view blocked at mount: a failed reconnection load is retried or reported once", async () => {
@@ -4819,6 +6084,12 @@ test("[Offline] partner opportunities and CRM settings buttons inert", async () 
     stepRoutes(
         (route) => route === "/web/action/load" || route.startsWith("/web/dataset/call_button/")
     );
+    // The settings' `web_save` requests, stepped while forced button activations run
+    // offline and on the reconnection that follows them.
+    const settingsSaves = stepRoutes(
+        (route) => route === "/web/dataset/call_kw/res.config.settings/web_save"
+    );
+    settingsSaves.active = false;
     const { env } = await makeMockServer();
     const partnerId = env["res.partner"].create({ name: "Azure Interior", opportunity_count: 2 });
     await mountWithCleanup(WebClient);
@@ -4895,6 +6166,23 @@ test("[Offline] partner opportunities and CRM settings buttons inert", async () 
         context: { module: "crm" },
     });
     expect(".o_field_widget[name=group_use_recurring_revenues] input").toBeChecked();
+    // A forced activation of each disabled button stops before the settings record
+    // (transient, and changed) is saved: no `web_save` is attempted, queued or replayed.
+    await setOffline(true);
+    settingsSaves.active = true;
+    for (const { selector } of settingsButtons) {
+        await revealFormControl(selector);
+        forceClick(selector);
+        await settle();
+    }
+    expect(".modal").toHaveCount(0);
+    expect(queued("res.config.settings")).toEqual([]);
+    expect.verifySteps([]);
+    await reconnect(setOffline);
+    expect(queued("res.config.settings")).toEqual([]);
+    expect.verifySteps([]);
+    settingsSaves.active = false;
+    expect(".o_field_widget[name=group_use_recurring_revenues] input").toBeChecked();
 
     // CRM settings opened offline: the offline helper, with no view or data request
     // (an action without `xml_id`, so that only the view-mount guard applies).
@@ -4933,6 +6221,196 @@ test("[Offline] partner opportunities and CRM settings buttons inert", async () 
     await contains("button[name='crm.crm_recurring_plan_action']").click();
     await expect.waitForSteps(["/web/action/load"]);
     await expectCurrentView("crm.crm_recurring_plan_action/list");
+});
+
+/** View id of `CRM_SETTINGS_ARCH`, registered for the test that opens it. */
+const CRM_SETTINGS_VIEW_ID = 502;
+
+/** Inline app logo of `CRM_SETTINGS_ARCH`, so the settings page loads no image. */
+const SETTINGS_APP_LOGO =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z9DwHwAGBQKA3H7sNwAAAABJRU5ErkJggg==";
+
+/**
+ * CRM settings (`res_config_settings_view_form` with the CRM inherit) on the real
+ * settings view (`js_class="base_settings"`): its controller decides what a button
+ * saves, and its model, which reads no cache, reloads the page when a dialog opened
+ * from it closes.
+ */
+const CRM_SETTINGS_ARCH = /* xml */ `
+    <form string="Settings" class="oe_form_configuration o_base_settings" js_class="base_settings">
+        <app string="CRM" name="crm" logo="${SETTINGS_APP_LOGO}">
+            <block title="CRM">
+                <setting string="Recurring Revenues">
+                    <field name="group_use_recurring_revenues"/>
+                    <button type="action" name="crm.crm_recurring_plan_action" string="Recurring Plans" class="btn-link"/>
+                </setting>
+                <setting string="Predictive Lead Scoring">
+                    <button name="${PLS_UPDATE_ACTION.id}" type="action" string="Update Probabilities" class="btn-link"/>
+                </setting>
+                <setting string="Rule-Based Assignment">
+                    <field name="crm_use_auto_assignment"/>
+                    <button name="action_crm_assign_leads" type="object" string="Assign now" class="btn-link"/>
+                </setting>
+            </block>
+        </app>
+    </form>`;
+
+/**
+ * The CRM settings action (`crm.crm_config_settings_action`) on `CRM_SETTINGS_ARCH`.
+ * Its id is used by no other action of this file: the mock server merges every
+ * action sharing an id into one.
+ */
+const CRM_BASE_SETTINGS_ACTION = {
+    id: 56,
+    name: "Settings",
+    res_model: "res.config.settings",
+    views: [[CRM_SETTINGS_VIEW_ID, "form"]],
+    context: { module: "crm", bin_size: false },
+};
+
+defineActions([CRM_BASE_SETTINGS_ACTION]);
+
+test("[Offline] CRM settings page closes its dialogs and queues nothing", async () => {
+    registerInlineViewArchs("res.config.settings", {
+        [`form,${CRM_SETTINGS_VIEW_ID}`]: CRM_SETTINGS_ARCH,
+    });
+    onRpc("res.config.settings", "execute", ({ args }) => stepServerCall("execute", args[0]));
+    const setOffline = mockOffline();
+    stepRoutes();
+    await mountWithCleanup(WebClient);
+    await flushStartupSync();
+    await getService("action").doAction(CRM_BASE_SETTINGS_ACTION.id);
+    expect(".o-settings-form-view").toHaveCount(1);
+    expect.verifySteps([
+        "/web/action/load",
+        "/web/dataset/call_kw/res.config.settings/get_views",
+        "/web/dataset/call_kw/res.config.settings/onchange",
+    ]);
+    const recurringPlans = "button[name='crm.crm_recurring_plan_action']";
+    const update = `button[name='${PLS_UPDATE_ACTION.id}']`;
+    const assign = "button[name=action_crm_assign_leads]";
+    const save = ".o_control_panel .o_form_button_save";
+    const recurringRevenues = ".o_field_widget[name=group_use_recurring_revenues]";
+
+    // Offline, a forced activation of each disabled button stops before the settings
+    // record (transient) is saved, unchanged or changed, and so does the control panel
+    // Save: no request, nothing queued, no confirmation dialog.
+    await setOffline(true);
+    for (const selector of [recurringPlans, update, assign, save]) {
+        expect(selector).not.toBeEnabled();
+        forceClick(selector);
+        await settle();
+    }
+    await contains(`${recurringRevenues} input`).click();
+    for (const selector of [recurringPlans, update, assign, save]) {
+        forceClick(selector);
+        await settle();
+    }
+    expect(".modal").toHaveCount(0);
+    expect(`${recurringRevenues} input`).toBeChecked();
+    expect(queued("res.config.settings")).toEqual([]);
+    expect.verifySteps([]);
+    // Back online, nothing is replayed.
+    await reconnect(setOffline);
+    expect(queued("res.config.settings")).toEqual([]);
+    expect.verifySteps([]);
+
+    // Online, Save applies the changed settings, then reloads the page.
+    await contains(save).click();
+    await expect.waitForSteps([
+        "/web/dataset/call_kw/res.config.settings/web_save",
+        buttonRoute("res.config.settings", "execute"),
+        "execute [1]",
+        "/web/dataset/call_kw/res.config.settings/onchange",
+    ]);
+
+    // Online, "Update Probabilities" saves the settings, then opens its wizard.
+    await contains(update).click();
+    await expect.waitForSteps([
+        "/web/dataset/call_kw/res.config.settings/web_save",
+        "/web/action/load",
+        "/web/dataset/call_kw/crm.lead.pls.update/get_views",
+        "/web/dataset/call_kw/crm.lead.pls.update/onchange",
+    ]);
+    expect(".modal .o_form_view").toHaveCount(1);
+
+    // Offline, the dialog's close control closes it at once: the settings page,
+    // which has no cached load, is not reloaded, and stays as it is.
+    await setOffline(true);
+    await contains(".modal button[aria-label=Close]:visible").click();
+    expect(".modal").toHaveCount(0);
+    await settle();
+    expect(".modal").toHaveCount(0);
+    expect(`.o-settings-form-view ${recurringRevenues}`).toHaveCount(1);
+    expect(queued("res.config.settings")).toEqual([]);
+    expect.verifySteps([]);
+
+    // Online again, every button works. "Assign now" calls its method on the settings
+    // record saved before the wizard opened, then reloads the page.
+    await reconnect(setOffline);
+    expect.verifySteps([]);
+    await contains(assign).click();
+    await expect.waitForSteps([
+        buttonRoute("res.config.settings", "action_crm_assign_leads"),
+        "action_crm_assign_leads [2]",
+        "/web/dataset/call_kw/res.config.settings/onchange",
+    ]);
+    // Closing the wizard reloads the settings page, as before (the wizard's views are
+    // cached in memory).
+    await contains(update).click();
+    await expect.waitForSteps([
+        "/web/dataset/call_kw/res.config.settings/web_save",
+        "/web/action/load",
+        "/web/dataset/call_kw/crm.lead.pls.update/onchange",
+    ]);
+    await contains(".modal button[aria-label=Close]:visible").click();
+    await expect.waitForSteps(["/web/dataset/call_kw/res.config.settings/onchange"]);
+    expect(".modal").toHaveCount(0);
+    await contains(recurringPlans).click();
+    await expect.waitForSteps([
+        "/web/dataset/call_kw/res.config.settings/web_save",
+        "/web/action/load",
+        "/web/dataset/call_kw/crm.recurring.plan/get_views",
+        "/web/dataset/call_kw/crm.recurring.plan/web_search_read",
+        "/web/dataset/call_kw/res.users/has_group",
+    ]);
+    await expectCurrentView("crm.crm_recurring_plan_action/list");
+});
+
+test("[Offline] leaving the changed CRM settings page queues no settings save", async () => {
+    // Offline root load served from the cache: the list the settings page goes back to.
+    expect.errors(1);
+    registerInlineViewArchs("res.config.settings", {
+        [`form,${CRM_SETTINGS_VIEW_ID}`]: CRM_SETTINGS_ARCH,
+    });
+    const setOffline = mockOffline();
+    stepRoutes((route) => route === "/web/dataset/call_kw/res.config.settings/web_save");
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(LEADS_ACTION.id);
+    await flushStartupSync();
+    await getService("action").doAction(CRM_BASE_SETTINGS_ACTION.id);
+    expect(".o-settings-form-view").toHaveCount(1);
+
+    // Offline, the page is changed, then left through its breadcrumb. Its "Unsaved
+    // changes" confirmation, whose buttons are disabled offline, is dismissed: the
+    // changes are discarded and the page is saved again, which fails offline, so
+    // nothing is queued, and the page is left.
+    await setOffline(true);
+    await contains(".o_field_widget[name=group_use_recurring_revenues] input").click();
+    await contains(".o_control_panel .breadcrumb-item a, .o_back_button").click();
+    expect(".modal .modal-title").toHaveText("Unsaved changes");
+    await press("Escape");
+    await settle();
+    expect(".modal").toHaveCount(0);
+    expect(".o_list_view").toHaveCount(1);
+    expect.verifyErrors([LEAD_LIST_LOAD]);
+    expect.verifySteps(["/web/dataset/call_kw/res.config.settings/web_save"]);
+    expect(queued("res.config.settings")).toEqual([]);
+
+    // Back online, nothing is replayed.
+    await reconnect(setOffline);
+    expect(queued("res.config.settings")).toEqual([]);
+    expect.verifySteps([]);
 });
 
 /** Closes every open dropdown (Escape), whatever closed or kept them open before. */
@@ -6662,18 +8140,24 @@ test("[Offline] recurring revenue probe runs on reconnect after an offline mount
 const PARTNER_INPUT = ".o_form_view .o_field_widget[name=partner_id] input";
 const PARTNER_OPTIONS = ".o-autocomplete--dropdown-item";
 const ENRICHMENT_OPTION = ".o-autocomplete--dropdown-item.partner_autocomplete_dropdown_many2one";
+const SEARCH_WORLDWIDE = ".o-autocomplete--dropdown-item:contains(Search Worldwide)";
+const ENRICHMENT_LOADING =
+    ".o-autocomplete--dropdown-menu .o_loading:contains(Searching Autocomplete)";
 
 /**
  * Creates the partner "Azure Interior" and the enrichment lookup, then opens lead 1
- * in the full lead form.
+ * in the full lead form. The lookup steps its query and country (`false` or `0`
+ * worldwide); while `lookupGate.promise` is set, the lookup answers once it resolves.
  *
+ * @param {{ promise?: Promise<void> }} [lookupGate]
  * @returns {Promise<number>} the partner id
  */
-async function openLeadWithPartnerField() {
+async function openLeadWithPartnerField(lookupGate = {}) {
     const { env } = await makeMockServer();
     const partnerId = env["res.partner"].create({ name: "Azure Interior" });
-    onRpc("res.partner", "autocomplete_by_name", ({ args }) => {
-        expect.step(`autocomplete_by_name ${args[0]}`);
+    onRpc("res.partner", "autocomplete_by_name", async ({ args }) => {
+        expect.step(`autocomplete_by_name ${args[0]} ${args[1]}`);
+        await lookupGate.promise;
         return [{ name: "Azure Interior SA", vat: "BE0477472701" }];
     });
     await mountWithCleanup(WebClient);
@@ -6694,25 +8178,71 @@ test.tags("desktop");
 test("[Offline] partner field searches cache, no enrichment lookup, no create", async () => {
     const setOffline = mockOffline();
     stepRoutes((route) => route.includes("/res.partner/"));
-    const partnerId = await openLeadWithPartnerField();
-    // Online, a search caches the matching partner (and offers enrichment and creation).
+    const autoCompletes = [];
+    patchWithCleanup(PartnerAutoCompleteStandIn.prototype, {
+        setup() {
+            super.setup(...arguments);
+            autoCompletes.push(this);
+        },
+    });
+    const lookupGate = {};
+    const partnerId = await openLeadWithPartnerField(lookupGate);
+    // Online, a search caches the matching partner (and offers enrichment, the
+    // worldwide search and creation).
     await searchPartner("Azu");
     expect.verifySteps([
         JSVAT_SCRIPT,
         "/web/dataset/call_kw/res.partner/autocomplete_by_name",
         "/web/dataset/call_kw/res.partner/web_name_search",
-        "autocomplete_by_name Azu",
+        "autocomplete_by_name Azu false",
     ]);
     expect(queryAllTexts(PARTNER_OPTIONS)).toInclude("Azure Interior");
     expect(ENRICHMENT_OPTION).toHaveCount(1);
+    expect(SEARCH_WORLDWIDE).toHaveCount(1);
     expect(queryAllTexts(PARTNER_OPTIONS).some((text) => text.startsWith("Create"))).toBe(true);
+    // In the dropdown opened online, the worldwide search is removed when the
+    // connection drops (the enrichment suggestion turns inert) and is back online.
+    await setOffline(true);
+    expect(SEARCH_WORLDWIDE).toHaveCount(0);
+    expect(ENRICHMENT_OPTION).toHaveClass("o_disabled_offline");
+    await setOffline(false);
+    expect(SEARCH_WORLDWIDE).toHaveCount(1);
+    expect(ENRICHMENT_OPTION).not.toHaveClass("o_disabled_offline");
+    await press("Escape");
+    await contains(PARTNER_INPUT).clear({ confirm: false });
+    await animationFrame();
+
+    // An enrichment lookup still pending when the connection drops shows no loading
+    // row offline, and shows it again online while it is still pending.
+    const pendingLookup = Promise.withResolvers();
+    lookupGate.promise = pendingLookup.promise;
+    await searchPartner("Azur");
+    expect.verifySteps([
+        JSVAT_SCRIPT,
+        "/web/dataset/call_kw/res.partner/autocomplete_by_name",
+        "/web/dataset/call_kw/res.partner/web_name_search",
+        "autocomplete_by_name Azur false",
+    ]);
+    expect(ENRICHMENT_LOADING).toHaveCount(1);
+    await setOffline(true);
+    expect(ENRICHMENT_LOADING).toHaveCount(0);
+    expect(SEARCH_WORLDWIDE).toHaveCount(0);
+    expect(queryAllTexts(PARTNER_OPTIONS)).toInclude("Azure Interior");
+    await setOffline(false);
+    expect(ENRICHMENT_LOADING).toHaveCount(1);
+    lookupGate.promise = null;
+    pendingLookup.resolve();
+    await animationFrame();
+    expect(ENRICHMENT_LOADING).toHaveCount(0);
+    expect(ENRICHMENT_OPTION).toHaveCount(1);
+    expect(SEARCH_WORLDWIDE).toHaveCount(1);
     await press("Escape");
     await contains(PARTNER_INPUT).clear({ confirm: false });
     await animationFrame();
 
     // Offline: a new query (not the memoized one) is answered from the relational-field
     // cache alone, with no request attempted: no record search, no enrichment script or
-    // lookup, and no Create, Create and edit or Search more.
+    // lookup, no worldwide search, and no Create, Create and edit or Search more.
     await setOffline(true);
     // Registered after `mockOffline()`: records every route the search attempts,
     // including those the lost network refuses.
@@ -6723,20 +8253,57 @@ test("[Offline] partner field searches cache, no enrichment lookup, no create", 
             attemptedRoutes.push(new URL(request.url).pathname);
         }
     });
-    await contains(PARTNER_INPUT).edit("Interior", { confirm: false });
     // Past the autocomplete debounce only: the offline plugin's own connection check
     // (a timer) is not part of the search.
+    await contains(PARTNER_INPUT).edit("Nobody", { confirm: false });
     await advanceTime(500);
     await animationFrame();
+    expect(queryAllTexts(PARTNER_OPTIONS)).toEqual(["No records"]);
+    expect(SEARCH_WORLDWIDE).toHaveCount(0);
+    await contains(PARTNER_INPUT).edit("Interior", { confirm: false });
+    await advanceTime(500);
+    await animationFrame();
+    expect(queryAllTexts(PARTNER_OPTIONS)).toEqual(["Azure Interior"]);
+    expect(ENRICHMENT_OPTION).toHaveCount(0);
+    expect(SEARCH_WORLDWIDE).toHaveCount(0);
+    expect(".o_m2o_dropdown_option").toHaveCount(0);
+    // Called directly, the worldwide search does nothing but prevent its event's
+    // default action: the open dropdown is neither closed nor reloaded, a closed one
+    // stays closed, and the flag is not remembered for the next online lookup
+    // (checked below).
+    const partnerAutoComplete = autoCompletes.findLast((autoComplete) =>
+        autoComplete.inputRef()?.closest(".o_field_widget[name=partner_id]")
+    );
+    // Unguarded, the worldwide search would reopen the dropdown at once (no input
+    // debounce), so no time is advanced: the offline plugin's connection check (a
+    // timer) stays out.
+    const callSearchWorldwide = async () => {
+        const event = new MouseEvent("click", { cancelable: true });
+        await partnerAutoComplete.searchWorldwide(event);
+        await animationFrame();
+        expect(event.defaultPrevented).toBe(true);
+    };
+    // Offline, the record source is the only one.
+    const [loadedSource] = partnerAutoComplete.sources;
+    const loadedOptionIds = loadedSource.options.map(({ id }) => id);
+    await callSearchWorldwide();
+    expect(".o-autocomplete--dropdown-menu").toHaveCount(1);
+    expect(partnerAutoComplete.sources).toHaveLength(1);
+    expect(partnerAutoComplete.sources[0]).toBe(loadedSource);
+    expect(loadedSource.options.map(({ id }) => id)).toEqual(loadedOptionIds);
+    expect(queryAllTexts(PARTNER_OPTIONS)).toEqual(["Azure Interior"]);
+    expect(SEARCH_WORLDWIDE).toHaveCount(0);
+    // The cached partner is selected, which closes the dropdown.
+    await contains(`${PARTNER_OPTIONS}:contains(Azure Interior)`).click();
+    expect(PARTNER_INPUT).toHaveValue("Azure Interior");
+    expect(".o-autocomplete--dropdown-menu").toHaveCount(0);
+    await callSearchWorldwide();
+    expect(".o-autocomplete--dropdown-menu").toHaveCount(0);
+    expect(PARTNER_INPUT).toHaveValue("Azure Interior");
     expect(attemptedRoutes).toEqual([]);
     trackingAttempts = false;
     expect.verifySteps([]);
-    expect(queryAllTexts(PARTNER_OPTIONS)).toEqual(["Azure Interior"]);
-    expect(ENRICHMENT_OPTION).toHaveCount(0);
-    expect(".o_m2o_dropdown_option").toHaveCount(0);
-    // The cached partner is selected and saved through the queue.
-    await contains(`${PARTNER_OPTIONS}:contains(Azure Interior)`).click();
-    expect(PARTNER_INPUT).toHaveValue("Azure Interior");
+    // The selected partner is saved through the queue.
     await contains(".o_form_button_save").click();
     expect(queuedCalls("crm.lead")).toEqual([
         {
@@ -6748,26 +8315,52 @@ test("[Offline] partner field searches cache, no enrichment lookup, no create", 
     ]);
     expect(".modal").toHaveCount(0);
     expect.verifySteps([]);
+
+    // Online again, the next lookup still searches the company's country (`false`),
+    // and the worldwide search is offered again.
+    await reconnect(setOffline);
+    await searchPartner("Azure");
+    expect.verifySteps([
+        JSVAT_SCRIPT,
+        "/web/dataset/call_kw/res.partner/autocomplete_by_name",
+        "/web/dataset/call_kw/res.partner/web_name_search",
+        "autocomplete_by_name Azure false",
+    ]);
+    expect(SEARCH_WORLDWIDE).toHaveCount(1);
 });
 
 test.tags("desktop");
 test("[Online] partner field keeps enrichment source", async () => {
     stepRoutes((route) => route.includes("/res.partner/"));
     await openLeadWithPartnerField();
-    // Two characters: the record search only.
+    // Two characters: the record search only, with no suggestion to search worldwide.
     await searchPartner("Az");
     expect.verifySteps(["/web/dataset/call_kw/res.partner/web_name_search"]);
     expect(ENRICHMENT_OPTION).toHaveCount(0);
-    // Three characters: the enrichment source loads its script and looks the name up.
+    expect(SEARCH_WORLDWIDE).toHaveCount(0);
+    // Three characters: the enrichment source loads its script and looks the name up
+    // in the company's country (`false`), and the worldwide search is offered.
     await searchPartner("Azu");
     expect.verifySteps([
         JSVAT_SCRIPT,
         "/web/dataset/call_kw/res.partner/autocomplete_by_name",
         "/web/dataset/call_kw/res.partner/web_name_search",
-        "autocomplete_by_name Azu",
+        "autocomplete_by_name Azu false",
     ]);
     expect(ENRICHMENT_OPTION).toHaveCount(1);
     expect(ENRICHMENT_OPTION).toHaveText("Azure Interior SA");
+    expect(`${SEARCH_WORLDWIDE} a[role=option]`).toHaveCount(1);
+    // "Search Worldwide" looks the name up again in every country (`0`), then hides.
+    await contains(SEARCH_WORLDWIDE).click();
+    await runAllTimers();
+    await animationFrame();
+    expect.verifySteps([
+        JSVAT_SCRIPT,
+        "/web/dataset/call_kw/res.partner/autocomplete_by_name",
+        "autocomplete_by_name Azu 0",
+    ]);
+    expect(SEARCH_WORLDWIDE).toHaveCount(0);
+    expect(ENRICHMENT_OPTION).toHaveCount(1);
     await contains(ENRICHMENT_OPTION).click();
     expect.verifySteps(["enrichment selected: Azure Interior SA"]);
 });
@@ -6787,6 +8380,26 @@ function trackMailRequests() {
         }
     });
     return routes;
+}
+
+/**
+ * Records the lead thread fetches the store sends (`/mail/store` fetch parameters
+ * naming a `crm.lead` thread), as `"<name> <thread id>"`.
+ *
+ * @returns {string[]}
+ */
+function trackLeadThreadFetches() {
+    const fetches = [];
+    onRpc("/mail/store", async (request) => {
+        const { params } = await request.json();
+        for (const fetchParam of params.fetch_params) {
+            const [name, fetchParams] = typeof fetchParam === "string" ? [fetchParam] : fetchParam;
+            if (fetchParams?.thread_model === "crm.lead") {
+                fetches.push(`${name} ${fetchParams.thread_id}`);
+            }
+        }
+    });
+    return fetches;
 }
 
 /** Chatter top-bar controls: Send message, Log note, Activities, attach, followers. */
@@ -6954,6 +8567,210 @@ test("[Offline] open lead composer posts nothing after disconnect", async () => 
     await waitFor(".o-mail-Message:contains(Online hello)");
 });
 
+test("[Offline] same-record lead form reload fetches no thread, refetched online", async () => {
+    // Offline root reloads served from the cache: after the wizard closes, and after
+    // the systray discard.
+    expect.errors(2);
+    const pyEnv = await startServer();
+    pyEnv["mail.message"].create({
+        author_id: serverState.partnerId,
+        body: "Kick-off call done",
+        message_type: "comment",
+        model: "crm.lead",
+        res_id: 1,
+    });
+    const setOffline = mockOffline();
+    const mailRequests = trackMailRequests();
+    await start();
+    await getService("action").doAction(LEADS_ACTION.id);
+    await flushStartupSync();
+    await openLead(1);
+    await waitFor(".o-mail-Message:contains(Kick-off call done)");
+    const thread = getService("mail.store")["mail.thread"].get({ model: "crm.lead", id: 1 });
+    expect(thread.isLoaded).toBe(true);
+    // The Mark Lost wizard is opened online from the form (from its "More" menu on
+    // the mobile preset).
+    const lostButton = `button[name='${LOST_ACTION_ID}']`;
+    await revealFormControl(lostButton);
+    await contains(lostButton).click();
+    await waitFor(".modal .o_form_view");
+    const threadFetches = trackLeadThreadFetches();
+    mailRequests.length = 0;
+
+    // Offline, closing the wizard and discarding a queued save from the systray each
+    // reload the open lead (mail's MAIL:RELOAD-THREAD): its chatter requests nothing
+    // and its thread is left without a loading error.
+    await setOffline(true);
+    pyEnv["mail.message"].create({
+        author_id: serverState.partnerId,
+        body: "Posted from another device",
+        message_type: "comment",
+        model: "crm.lead",
+        res_id: 1,
+    });
+    await contains(".modal button[aria-label=Close]:visible").click();
+    await settle();
+    expect(".modal").toHaveCount(0);
+    await contains(".o_field_widget[name=contact_name] input").edit("Offline contact");
+    await contains(".o_form_button_save").click();
+    expect(queued("crm.lead")).toHaveLength(1);
+    await discardFromSystray("Lead 1");
+    await settle();
+    expect(queued("crm.lead")).toEqual([]);
+    expect(".o_field_widget[name=contact_name] input").toHaveValue("");
+    expect.verifyErrors([LEAD_RECORD_LOAD, LEAD_RECORD_LOAD]);
+    expect(mailRequests).toEqual([]);
+    expect(thread.hasLoadingFailed).toBe(false);
+    expect(".o-mail-Thread-error").toHaveCount(0);
+    expect(".o-mail-Message:contains(Kick-off call done)").toHaveCount(1);
+    expect(".o-mail-Message:contains(Posted from another device)").toHaveCount(0);
+
+    // Back online, the skipped reloads are run once: the thread data and the new
+    // messages of the lead.
+    await setOffline(false);
+    await waitFor(".o-mail-Message:contains(Posted from another device)");
+    await settle();
+    expect(mailRequests).toEqual(["/mail/store"]);
+    expect(threadFetches.sort()).toEqual(["/mail/thread/messages 1", "mail.thread 1"]);
+    expect(thread.hasLoadingFailed).toBe(false);
+    expect(".o-mail-Message:contains(Kick-off call done)").toHaveCount(1);
+    for (const button of CHATTER_BUTTONS) {
+        expect(button).toBeEnabled();
+    }
+});
+
+test("[Offline] lead opened offline with an unloaded thread loads it on reconnection", async () => {
+    // Offline root loads served from the cache: lead 2, then lead 1 through the pager.
+    expect.errors(2);
+    const pyEnv = await startServer();
+    pyEnv["mail.message"].create([
+        {
+            author_id: serverState.partnerId,
+            body: "Kick-off call done",
+            message_type: "comment",
+            model: "crm.lead",
+            res_id: 1,
+        },
+        {
+            author_id: serverState.partnerId,
+            body: "Second lead note",
+            message_type: "comment",
+            model: "crm.lead",
+            res_id: 2,
+        },
+    ]);
+    pyEnv["mail.followers"].create({
+        partner_id: serverState.partnerId,
+        res_id: 1,
+        res_model: "crm.lead",
+    });
+    const setOffline = mockOffline();
+    const mailRequests = trackMailRequests();
+    await start();
+    await getService("action").doAction(LEADS_ACTION.id);
+    await flushStartupSync();
+    // Online visits cache the forms of leads 2 and 1.
+    await getService("action").switchView("form", { resId: 2, resIds: [1, 2] });
+    await waitFor(".o-mail-Message:contains(Second lead note)");
+    await contains(".o_pager_previous").click();
+    await waitFor(".o-mail-Message:contains(Kick-off call done)");
+    await goBack();
+    // As after a new page load, the store holds neither thread: only the forms are
+    // cached.
+    const store = getService("mail.store");
+    for (const id of [1, 2]) {
+        store["mail.thread"].get({ model: "crm.lead", id }).delete();
+    }
+    const threadFetches = trackLeadThreadFetches();
+    mailRequests.length = 0;
+
+    // Offline, each lead opens with a read-only chatter and a followers button with
+    // neither an endless spinner nor a made-up count; nothing is requested.
+    await setOffline(true);
+    await getService("action").switchView("form", { resId: 2, resIds: [1, 2] });
+    await settle();
+    expect(".o_form_view .o_field_widget[name=name] input").toHaveValue("Lead 2");
+    for (const leadName of ["Lead 2", "Lead 1"]) {
+        if (leadName === "Lead 1") {
+            await contains(".o_pager_previous").click();
+            await settle();
+            expect(".o_form_view .o_field_widget[name=name] input").toHaveValue("Lead 1");
+        }
+        expect(".o-mail-Followers-button").toHaveCount(1);
+        expect(".o-mail-Followers-button .fa-spin").toHaveCount(0);
+        expect(".o-mail-Followers-counter").toHaveCount(0);
+        expect(".o-mail-Message").toHaveCount(0);
+        for (const button of CHATTER_BUTTONS) {
+            expect(button).not.toBeEnabled();
+        }
+    }
+    await advanceTime(10000);
+    expect(".o-mail-Followers-button .fa-spin").toHaveCount(0);
+    expect(mailRequests).toEqual([]);
+    expect.verifyErrors([LEAD_RECORD_LOAD, LEAD_RECORD_LOAD]);
+
+    // Back online, the displayed lead's thread loads once, without reopening it: its
+    // messages, its follower count and enabled controls. The lead left offline
+    // through the pager is not loaded.
+    await setOffline(false);
+    await waitFor(".o-mail-Message:contains(Kick-off call done)");
+    await waitFor(".o-mail-Followers-counter:contains(1)");
+    await settle();
+    expect(".o-mail-Followers-button .fa-spin").toHaveCount(0);
+    for (const button of CHATTER_BUTTONS) {
+        expect(button).toBeEnabled();
+    }
+    expect(mailRequests).toEqual(["/mail/store"]);
+    expect(threadFetches.sort()).toEqual(["/mail/thread/messages 1", "mail.thread 1"]);
+    expect(store["mail.thread"].get({ model: "crm.lead", id: 2 }).isLoaded).toBe(false);
+});
+
+test("[Offline] lead chatter scrolled to its older messages loads none", async () => {
+    const pyEnv = await startServer();
+    for (let index = 1; index <= 35; index++) {
+        pyEnv["mail.message"].create({
+            author_id: serverState.partnerId,
+            body: `Call note ${index}`,
+            message_type: "comment",
+            model: "crm.lead",
+            res_id: 1,
+        });
+    }
+    const setOffline = mockOffline();
+    const mailRequests = trackMailRequests();
+    await start();
+    await getService("action").doAction(LEADS_ACTION.id);
+    await flushStartupSync();
+    await openLead(1);
+    // Online, the chatter loads the newest page of messages.
+    await waitFor(".o-mail-Message:contains(Call note 35)");
+    expect(".o-mail-Message").toHaveCount(30);
+    const loadMore = ".o-mail-Thread button:contains(Load More)";
+    expect(loadMore).toHaveCount(1);
+    const thread = getService("mail.store")["mail.thread"].get({ model: "crm.lead", id: 1 });
+    mailRequests.length = 0;
+
+    // Offline, bringing "Load More" into view (which loads the older messages
+    // online) requests nothing and leaves the thread without a loading error.
+    await setOffline(true);
+    queryFirst(loadMore).scrollIntoView();
+    await settle();
+    await animationFrame();
+    expect(mailRequests).toEqual([]);
+    expect(thread.hasLoadingFailed).toBe(false);
+    expect(".o-mail-Thread-error").toHaveCount(0);
+    expect(".o-mail-Message").toHaveCount(30);
+    expect(loadMore).not.toBeEnabled();
+
+    // Online, "Load More" loads them.
+    await setOffline(false);
+    await animationFrame();
+    await contains(loadMore).click();
+    await waitUntil(() => queryAll(".o-mail-Message").length === 35);
+    expect(mailRequests).toEqual(["/mail/store"]);
+    expect(thread.hasLoadingFailed).toBe(false);
+});
+
 /**
  * Selector of a lead card of the pipeline: a kanban card on desktop; on the mobile
  * pipeline, the card in the stage that displays it (a card shows its queued stage),
@@ -7054,6 +8871,412 @@ test("[Offline] two distinct writes to one lead replay in order, last write wins
     expect(".modal").toHaveCount(0);
 });
 
+/**
+ * Steps each `crm.lead` `web_save` reaching the mock server as `web_save <ids> <values>`
+ * (`action_set_won` is stepped with its payload for every test).
+ */
+function stepLeadWrites() {
+    onRpc("crm.lead", "web_save", ({ args }) => {
+        expect.step(`web_save ${JSON.stringify(args[0])} ${JSON.stringify(args[1])}`);
+    });
+}
+
+/** The `action_set_won` payload the lead form queues for lead 1 of "My Pipeline". */
+function pipelineLeadWonCall() {
+    return {
+        model: "crm.lead",
+        method: "action_set_won",
+        args: [[1]],
+        kwargs: { context: callContext(PIPELINE_ACTION.context) },
+    };
+}
+
+test("[Offline] lead form saved again after a card move replays last, its last write wins", async () => {
+    // Offline root loads served from the cache: the pipeline groups (back from the
+    // form) and the reopened lead.
+    expect.errors(2);
+    stepLeadWrites();
+    mockDate("2026-10-02 09:00:00");
+    const setOffline = mockOffline();
+    await openPipeline();
+    await flushStartupSync();
+    await openLead(1);
+    await setOffline(true);
+
+    // T1: the lead form saves stage B (Qualified); T2 = T1 + 5 min: the pipeline card
+    // (another Record of the lead) moves it to C (Won).
+    await selectStage(STAGE_QUALIFIED, "Qualified");
+    await contains(".o_form_button_save").click();
+    await goBack();
+    const [formSave] = queued("crm.lead");
+    mockDate(new Date(formSave.value.extras.timeStamp + 5 * 60_000).toISOString());
+    await moveLeadCard("Lead 1", STAGE_WON, 2);
+    const cardMove = queued("crm.lead").find(({ key }) => key !== formSave.key);
+    expect(cardMove.value.args).toEqual([[1], { stage_id: STAGE_WON }]);
+
+    // Reopened, the form shows the card's later stage: the stage restored from its
+    // own (earlier) queued save is not an unsaved edit, and the queue is unchanged.
+    await openLead(1);
+    expect(currentStageSelector()).toHaveText("Won");
+    expect(".o_form_status_indicator_buttons").toHaveClass("invisible");
+    expect(queued("crm.lead").map(({ key }) => key)).toEqual([formSave.key, cardMove.key]);
+
+    // T3, the user's last write (stage A, New), on a clock held at T2: the form's queued
+    // save now replays after the card move.
+    await selectStage(STAGE_NEW, "New");
+    await contains(".o_form_button_save").click();
+    const entries = queued("crm.lead");
+    expect(entries.map(({ key }) => key)).toEqual([cardMove.key, formSave.key]);
+    expect(entries[1].value.args).toEqual([[1], { stage_id: STAGE_NEW }]);
+    expect(entries[1].value.extras.timeStamp).toBeGreaterThan(cardMove.value.extras.timeStamp);
+    expect.verifySteps([]);
+
+    await reconnect(setOffline);
+    await runAllTimers();
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_WON })}`,
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_NEW })}`,
+    ]);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(STAGE_NEW);
+    await animationFrame();
+    expect(currentStageSelector()).toHaveText("New");
+    expect(".modal").toHaveCount(0);
+    expect.verifyErrors([LEAD_GROUPS_LOAD, LEAD_RECORD_LOAD]);
+});
+
+test("[Offline] lead form opened after a card move shows its queued stage, not as an edit", async () => {
+    // Offline root loads served from the cache: the lead form, the pipeline groups back
+    // from it, and the lead form again.
+    expect.errors(3);
+    stepLeadWrites();
+    const setOffline = mockOffline();
+    await openPipeline();
+    await flushStartupSync();
+    // Visited online, so that its form is available offline.
+    await openLead(1);
+    await goBack();
+
+    await setOffline(true);
+    await moveLeadCard("Lead 1", STAGE_QUALIFIED, 1);
+    const [cardMove] = queued("crm.lead");
+    expect(cardMove.value.args).toEqual([[1], { stage_id: STAGE_QUALIFIED }]);
+
+    // The form has no queued save of its own: it shows the card's stage, unchanged.
+    await openLead(1);
+    expect(currentStageSelector()).toHaveText("Qualified");
+    expect(".o_form_status_indicator_buttons").toHaveClass("invisible");
+    await goBack();
+    expect(queued("crm.lead").map(({ key }) => key)).toEqual([cardMove.key]);
+
+    // A stage then saved in the form replays after the card move, even in the same
+    // millisecond.
+    await openLead(1);
+    patchWithCleanup(Date, { now: () => cardMove.value.extras.timeStamp });
+    await selectStage(STAGE_NEW, "New");
+    await contains(".o_form_button_save").click();
+    const [first, second] = queued("crm.lead");
+    expect(first.key).toBe(cardMove.key);
+    expect(second.value.args).toEqual([[1], { stage_id: STAGE_NEW }]);
+    expect(second.value.extras.timeStamp).toBe(cardMove.value.extras.timeStamp + 1);
+    expect.verifySteps([]);
+    expect.verifyErrors([LEAD_RECORD_LOAD, LEAD_GROUPS_LOAD, LEAD_RECORD_LOAD]);
+});
+
+test("[Offline] lead form edit after an offline won keeps the won last", async () => {
+    stepLeadWrites();
+    const setOffline = mockOffline();
+    await openPipeline();
+    await openLead(1);
+    await flushStartupSync();
+
+    // Stage B saved (T1), then Won (T2), then a revenue edit saved: the won call
+    // writes no revenue, so the edit joins the form's queued save, before the won.
+    await setOffline(true);
+    await selectStage(STAGE_QUALIFIED, "Qualified");
+    await contains(".o_form_button_save").click();
+    await contains(WON_BUTTON).click();
+    await contains(".o_field_widget[name=expected_revenue] input").edit("15");
+    await contains(".o_form_button_save").click();
+    const context = callContext(PIPELINE_ACTION.context);
+    expect(queuedCalls("crm.lead")).toEqual([
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [[1], { stage_id: STAGE_QUALIFIED, expected_revenue: 15 }],
+            kwargs: { context, specification: {} },
+        },
+        pipelineLeadWonCall(),
+    ]);
+
+    await reconnect(setOffline);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED, expected_revenue: 15 })}`,
+        pipelineLeadWonCall(),
+    ]);
+    await animationFrame();
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0]).toMatchObject({
+        stage_id: STAGE_WON,
+        won_status: "won",
+        probability: 100,
+        expected_revenue: 15,
+    });
+    await animationFrame();
+    expect(".ribbon:contains(Won)").toHaveCount(1);
+    expect.verifySteps([]);
+});
+
+test("[Offline] lead stage saved after an offline won replays after the won", async () => {
+    stepLeadWrites();
+    const setOffline = mockOffline();
+    await openPipeline();
+    await openLead(1);
+    await flushStartupSync();
+    // A held clock: every call is queued in the same millisecond.
+    const clock = Date.now();
+    patchWithCleanup(Date, { now: () => clock });
+
+    // Stage B saved, then Won, then stage A saved: the won call writes the stage, so
+    // the form's queued save (which holds nothing else the won writes) moves after it.
+    await setOffline(true);
+    await selectStage(STAGE_QUALIFIED, "Qualified");
+    await contains(".o_form_button_save").click();
+    await contains(WON_BUTTON).click();
+    const [formSave, won] = queued("crm.lead");
+    expect(won.value.method).toBe("action_set_won");
+    await selectStage(STAGE_NEW, "New");
+    await contains(".o_form_button_save").click();
+    const context = callContext(PIPELINE_ACTION.context);
+    expect(queuedCalls("crm.lead")).toEqual([
+        pipelineLeadWonCall(),
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [[1], { stage_id: STAGE_NEW }],
+            kwargs: { context, specification: {} },
+        },
+    ]);
+    const entries = queued("crm.lead");
+    expect(entries[1].key).toBe(formSave.key);
+    expect(entries[1].value.extras.timeStamp).toBe(won.value.extras.timeStamp + 1);
+
+    await reconnect(setOffline);
+    await expect.waitForSteps([
+        pipelineLeadWonCall(),
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_NEW })}`,
+    ]);
+    await animationFrame();
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(STAGE_NEW);
+});
+
+test("[Offline] reopened lead stage saved after a queued won is queued again after the won", async () => {
+    // Offline root loads served from the cache: back to the pipeline and the reopened
+    // lead, twice.
+    expect.errors(4);
+    stepLeadWrites();
+    const controllers = captureLeadForms();
+    const setOffline = mockOffline();
+    await openPipeline();
+    await openLead(1);
+    await flushStartupSync();
+
+    // Stage B and a probability saved (T1), then Won (T2); the lead is reopened.
+    await setOffline(true);
+    await selectStage(STAGE_QUALIFIED, "Qualified");
+    await contains(".o_field_widget[name=probability] input").edit("42");
+    await contains(".o_form_button_save").click();
+    await contains(WON_BUTTON).click();
+    const [formSave, won] = queued("crm.lead");
+    await goBack();
+    await openLead(1);
+    expect(".ribbon:contains(Won)").toHaveCount(1);
+    expect(currentStageSelector()).toHaveText("Qualified");
+
+    // Stage A saved: the form's queued save also holds the probability the won writes,
+    // so it keeps its time (its values stay before the won) and the stage is queued
+    // again in a follow-up write after the won.
+    await selectStage(STAGE_NEW, "New");
+    await contains(".o_form_button_save").click();
+    const context = callContext(PIPELINE_ACTION.context);
+    expect(queuedCalls("crm.lead")).toEqual([
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [[1], { stage_id: STAGE_NEW }],
+            kwargs: { context, specification: {} },
+        },
+        pipelineLeadWonCall(),
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [[1], { stage_id: STAGE_NEW }],
+            kwargs: { context, specification: {} },
+        },
+    ]);
+    const [, , followUp] = queued("crm.lead");
+    expect(queued("crm.lead")[0].key).toBe(formSave.key);
+    expect(queued("crm.lead")[0].value.extras.timeStamp).toBe(formSave.value.extras.timeStamp);
+    expect(followUp.value.extras).toMatchObject({
+        crmFollowUp: true,
+        viewType: "form",
+        changes: { stage_id: { id: STAGE_NEW, display_name: "New" } },
+    });
+    expect(followUp.value.extras.timeStamp).toBeGreaterThan(won.value.extras.timeStamp);
+
+    // Reopened again, the form restores its own queued save (not the follow-up),
+    // shows the follow-up's stage and holds no unsaved edit.
+    await goBack();
+    await openLead(1);
+    expect(controllers[0].model.root.offlineId).toBe(formSave.key);
+    expect(currentStageSelector()).toHaveText("New");
+    expect(".o_form_status_indicator_buttons").toHaveClass("invisible");
+    expect(queued("crm.lead")).toHaveLength(3);
+
+    await reconnect(setOffline);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_NEW })}`,
+        pipelineLeadWonCall(),
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_NEW })}`,
+    ]);
+    await animationFrame();
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(STAGE_NEW);
+    expect.verifyErrors([LEAD_GROUPS_LOAD, LEAD_RECORD_LOAD, LEAD_GROUPS_LOAD, LEAD_RECORD_LOAD]);
+});
+
+test("[Offline] lead form save overriding part of a later write keeps its older values first", async () => {
+    // Offline root loads served from the cache: back to the pipeline and the reopened
+    // lead.
+    expect.errors(2);
+    stepLeadWrites();
+    const setOffline = mockOffline();
+    await openPipeline();
+    await openLead(1);
+    await flushStartupSync();
+
+    // T1: the form saves a name and stage B.
+    await setOffline(true);
+    await contains(".o_field_widget[name=name] input").edit("Lead 1 form");
+    await selectStage(STAGE_QUALIFIED, "Qualified");
+    await contains(".o_form_button_save").click();
+    const [formSave] = queued("crm.lead");
+    expect(formSave.value.args).toEqual([[1], { name: "Lead 1 form", stage_id: STAGE_QUALIFIED }]);
+    // T2 = T1 + 1 min: the lead's form of another action (another Record) saves another
+    // name and stage C, queued as the framework queues a form save.
+    const otherSave = getService(OfflinePlugin).scheduleORM(
+        "crm.lead",
+        "web_save",
+        [[1], { name: "Lead 1 elsewhere", stage_id: STAGE_WON }],
+        { context: callContext(), specification: {} },
+        {
+            extras: {
+                actionId: TEAM_LEADS_ACTION_ID,
+                actionName: TEAM_LEADS_ACTION.name,
+                viewType: "form",
+                displayName: "Lead 1 elsewhere",
+                timeStamp: formSave.value.extras.timeStamp + 60_000,
+                changes: {
+                    name: "Lead 1 elsewhere",
+                    stage_id: { id: STAGE_WON, display_name: "Won" },
+                },
+                originalValues: {
+                    name: "Lead 1",
+                    stage_id: { id: STAGE_NEW, display_name: "New" },
+                },
+            },
+        }
+    );
+
+    // Reopened, the form shows the later name and stage, not as edits.
+    await goBack();
+    await openLead(1);
+    expect(".o_field_widget[name=name] input").toHaveValue("Lead 1 elsewhere");
+    expect(currentStageSelector()).toHaveText("Won");
+    expect(".o_form_status_indicator_buttons").toHaveClass("invisible");
+
+    // Stage A saved: the later write also writes the name, so the form's queued save
+    // keeps its time (its older name stays before the later one) and the stage is
+    // queued again after the later write.
+    await selectStage(STAGE_NEW, "New");
+    await contains(".o_form_button_save").click();
+    expect(queued("crm.lead").map(({ key, value }) => [key, value.args])).toEqual([
+        [formSave.key, [[1], { name: "Lead 1 form", stage_id: STAGE_NEW }]],
+        [otherSave, [[1], { name: "Lead 1 elsewhere", stage_id: STAGE_WON }]],
+        [queued("crm.lead")[2].key, [[1], { stage_id: STAGE_NEW }]],
+    ]);
+
+    await reconnect(setOffline);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ name: "Lead 1 form", stage_id: STAGE_NEW })}`,
+        `web_save [1] ${JSON.stringify({ name: "Lead 1 elsewhere", stage_id: STAGE_WON })}`,
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_NEW })}`,
+    ]);
+    await animationFrame();
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0]).toMatchObject({
+        name: "Lead 1 elsewhere",
+        stage_id: STAGE_NEW,
+    });
+    await animationFrame();
+    expect(".o_field_widget[name=name] input").toHaveValue("Lead 1 elsewhere");
+    expect(currentStageSelector()).toHaveText("New");
+    expect.verifyErrors([LEAD_GROUPS_LOAD, LEAD_RECORD_LOAD]);
+});
+
+test("[Offline] parked lead save handed to the form keeps its values over a later parked write", async () => {
+    // Offline root load served from the cache: the pipeline groups (back from the form).
+    expect.errors(1);
+    stepLeadWrites();
+    const rejection = rejectReplay("crm.lead", "web_save", "Save refused");
+    const setOffline = mockOffline();
+    await openPipeline();
+    await openLead(1);
+    await flushStartupSync();
+
+    // Offline, the form saves a name and stage B, then the pipeline card moves the lead
+    // to C; both replays are rejected and parked.
+    await setOffline(true);
+    await contains(".o_field_widget[name=name] input").edit("Lead 1 parked");
+    await selectStage(STAGE_QUALIFIED, "Qualified");
+    await contains(".o_form_button_save").click();
+    await goBack();
+    await moveLeadCard("Lead 1", STAGE_WON, 2);
+    const [formSave, cardMove] = queued("crm.lead");
+    expect(cardMove.value.args).toEqual([[1], { stage_id: STAGE_WON }]);
+    rejection.reject = true;
+    await reconnect(setOffline);
+    await runAllTimers();
+    rejection.reject = false;
+    expect(queued("crm.lead").map(({ key, value }) => [key, Boolean(value.extras.error)])).toEqual([
+        [formSave.key, true],
+        [cardMove.key, true],
+    ]);
+    expect.verifySteps([]);
+
+    // Retried from the systray online, the form's parked save is handed over with its
+    // own values as unsaved edits, the later parked card move does not replace them,
+    // and saving writes them.
+    await openSystray();
+    await contains(
+        ".o_offline_systray_content .o-dropdown-item:contains(Lead 1 parked) .text-truncate"
+    ).click();
+    await animationFrame();
+    expect(queued("crm.lead").map(({ key }) => key)).toEqual([cardMove.key]);
+    expect(".o_form_view .o_field_widget[name=name] input").toHaveValue("Lead 1 parked");
+    expect(currentStageSelector()).toHaveText("Qualified");
+    await contains(".o_form_button_save").click();
+    expect.verifySteps([
+        `web_save [1] ${JSON.stringify({ name: "Lead 1 parked", stage_id: STAGE_QUALIFIED })}`,
+    ]);
+    expect(MockServer.env["crm.lead"].browse(1)[0]).toMatchObject({
+        name: "Lead 1 parked",
+        stage_id: STAGE_QUALIFIED,
+    });
+    expect.verifyErrors([LEAD_GROUPS_LOAD]);
+});
+
 test("[Offline] rejected replay is parked in the offline systray", async () => {
     onRpc("crm.lead", "web_save", ({ args }) => {
         if (args[0][0] === 1) {
@@ -7122,6 +9345,451 @@ test("[Offline] rejected replay is parked in the offline systray", async () => {
     }
     expect(".modal").toHaveCount(0);
     expect(".o_notification").toHaveCount(0);
+});
+
+test("[Offline] parked CRM replay errors show their message only in the offline systray", async () => {
+    const uid = serverState.userId;
+    // Server messages as Odoo builds them: a deleted record (`odoo/orm/fields.py`), a
+    // validation, a record access error with its debug-mode record lines
+    // (`ir.access`), an activity access error (`mail.activity`) and a message made of
+    // ids only (`odoo/orm/fields_relational.py`'s record line).
+    const missingLead = `Record does not exist or has been deleted.\n(Record: crm.lead(1,), User: ${uid})`;
+    const lockedLead = "A lead in a Won stage cannot be lost. Move it to another stage first.";
+    const deniedLead = [
+        "Uh-oh! Looks like you have stumbled upon some top-secret records.",
+        "",
+        `Sorry, Mitchell Admin (id=${uid}) doesn't have 'write' access to:`,
+        "- Lead/Opportunity, Lead 3 (crm.lead: 3)",
+        "- Lead/Opportunity, Lead 3 bis (crm.lead: 30, company=YourCompany (BE))",
+        "",
+        "Contact your administrator to request access if necessary.",
+    ].join("\n");
+    const deniedActivity = [
+        "The requested operation cannot be completed due to security restrictions. Please contact your system administrator.",
+        "",
+        "(Document type: Activity, Operation: write)",
+        "",
+        `Records: [7], User: ${uid}`,
+    ].join("\n");
+    const idsOnly = `(Record: 4, User: ${uid})`;
+    const missingPartner = `Record does not exist or has been deleted.\n(Record: res.partner(9,), User: ${uid})`;
+    const leadErrors = {
+        1: { type: "MissingError", message: missingLead },
+        2: { type: "ValidationError", message: lockedLead },
+        3: { type: "AccessError", message: deniedLead },
+    };
+    // Every replay below is rejected, as the server would reject it.
+    onRpc("crm.lead", "web_save", ({ args }) => {
+        throw makeServerError(leadErrors[args[0][0]]);
+    });
+    onRpc("mail.activity", "action_done", () => {
+        throw makeServerError({ type: "AccessError", message: deniedActivity });
+    });
+    onRpc("mail.activity", "create", () => {
+        throw makeServerError({ type: "MissingError", message: idsOnly });
+    });
+    onRpc("res.partner", "web_save", () => {
+        throw makeServerError({ type: "MissingError", message: missingPartner });
+    });
+    registerInlineViewArchs("res.partner", { [`form,${PARTNER_FORM_VIEW_ID}`]: PARTNER_FORM_ARCH });
+    const setOffline = mockOffline();
+    const { env } = await makeMockServer();
+    const partnerId = env["res.partner"].create({ name: "Azure Interior" });
+    await mountWithCleanup(WebClient);
+    await flushStartupSync();
+    const offlinePlugin = getService(OfflinePlugin);
+
+    /** Reconnects and lets the framework replay its whole queue, one call per second. */
+    async function replayAll() {
+        await reconnect(setOffline);
+        while (offlinePlugin.syncingORM()) {
+            await runAllTimers();
+            await animationFrame();
+        }
+    }
+
+    // A non-CRM entry: a contact saved offline from its form, parked on replay.
+    await getService("action").doAction({
+        type: "ir.actions.act_window",
+        res_model: "res.partner",
+        res_id: partnerId,
+        views: [[PARTNER_FORM_VIEW_ID, "form"]],
+    });
+    await setOffline(true);
+    await contains(".o_field_widget[name=name] input").edit("Azure Interior (offline)");
+    await contains(".o_form_button_save").click();
+    expect(queuedCalls("res.partner").map(({ method, args }) => ({ method, args }))).toEqual([
+        { method: "web_save", args: [[partnerId], { name: "Azure Interior (offline)" }] },
+    ]);
+    await replayAll();
+
+    // CRM entries: three card moves and the two activity calls of the lead activity
+    // sheet, parked on replay.
+    await getService("action").doAction(PIPELINE_ACTION.id);
+    await setOffline(true);
+    await moveLeadCard("Lead 1", STAGE_QUALIFIED, 1);
+    await moveLeadCard("Lead 2", STAGE_WON, 2);
+    await moveLeadCard("Lead 3", STAGE_QUALIFIED, 1);
+    const kwargs = { context: user.context };
+    const extras = { timeStamp: Date.now(), actionName: "Pipeline", displayName: "Lead 4" };
+    offlinePlugin.scheduleORM("mail.activity", "action_done", [[7]], kwargs, { extras });
+    const activityVals = { res_model: "crm.lead", res_id: 4, summary: "Call" };
+    offlinePlugin.scheduleORM("mail.activity", "create", [[activityVals]], kwargs, {
+        extras: { ...extras, displayName: "Lead 4 call" },
+    });
+    await replayAll();
+
+    // The queue keeps the framework's errors, each entry parked.
+    const parkedErrors = (model) =>
+        Object.fromEntries(
+            queued(model).map(({ value }) => [JSON.stringify(value.args[0]), value.extras.error])
+        );
+    expect(parkedErrors("crm.lead")).toEqual({
+        "[1]": `odoo.exceptions.MissingError - ${missingLead}`,
+        "[2]": `odoo.exceptions.ValidationError - ${lockedLead}`,
+        "[3]": `odoo.exceptions.AccessError - ${deniedLead}`,
+    });
+    expect(parkedErrors("mail.activity")).toEqual({
+        "[7]": `odoo.exceptions.AccessError - ${deniedActivity}`,
+        [JSON.stringify([activityVals])]: `odoo.exceptions.MissingError - ${idsOnly}`,
+    });
+    expect(parkedErrors("res.partner")).toEqual({
+        [`[${partnerId}]`]: `odoo.exceptions.MissingError - ${missingPartner}`,
+    });
+
+    // The systray rows: the CRM ones tell the server message only (no exception
+    // class, no internal id, a generic message when only ids were given); the contact
+    // row keeps the framework's text.
+    await openSystray();
+    const errorRows = queryAll(".o_offline_systray_content .o-dropdown-item div.text-danger");
+    const tooltips = errorRows.map((row) => [row.textContent.trim(), row.dataset.tooltip]);
+    expect(Object.fromEntries(tooltips)).toEqual({
+        "Lead 1": "Record does not exist or has been deleted.",
+        "Lead 2": lockedLead,
+        "Lead 3": [
+            "Uh-oh! Looks like you have stumbled upon some top-secret records.",
+            "",
+            "Sorry, Mitchell Admin doesn't have 'write' access to:",
+            "- Lead/Opportunity, Lead 3",
+            "- Lead/Opportunity, Lead 3 bis",
+            "",
+            "Contact your administrator to request access if necessary.",
+        ].join("\n"),
+        "Lead 4": [
+            "The requested operation cannot be completed due to security restrictions. Please contact your system administrator.",
+            "",
+            "(Document type: Activity, Operation: write)",
+        ].join("\n"),
+        "Lead 4 call": "The server could not apply this change.",
+        "Azure Interior (offline)": `odoo.exceptions.MissingError - ${missingPartner}`,
+    });
+    expect(".o_offline_systray_content .o-dropdown-item .fa-exclamation-circle").toHaveCount(6);
+    expect(".o_menu_systray .o_offline_systray .fa-exclamation-circle").toHaveCount(1);
+    await press("Escape");
+    await animationFrame();
+    expect(".modal").toHaveCount(0);
+    expect(".o_notification").toHaveCount(0);
+});
+
+// -----------------------------------------------------------------------------
+// Replay delivery: one delivery per queued CRM call (several tabs, lost answers)
+// -----------------------------------------------------------------------------
+
+/**
+ * Keys of the queued calls the framework offline store holds.
+ *
+ * @param {OfflinePlugin} plugin
+ * @returns {Promise<string[]>}
+ */
+async function storedQueueKeys(plugin) {
+    const entries = await plugin._idb.getAllEntries(OfflinePlugin.ORM_SYNC_TABLE_NAME);
+    return entries.map(({ key }) => key);
+}
+
+/**
+ * The queued call the framework offline store holds under `key`, parsed.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {string} key
+ */
+async function storedQueueValue(plugin, key) {
+    return JSON.parse(await plugin._idb.read(OfflinePlugin.ORM_SYNC_TABLE_NAME, key));
+}
+
+/**
+ * Steps each removal of a queued call from the offline store as `store delete
+ * <key>`, and holds the removal of a key set in the returned map until its
+ * deferred is resolved.
+ *
+ * @param {OfflinePlugin} plugin
+ * @returns {Map<string, PromiseWithResolvers<void>>}
+ */
+function holdQueueRemovals(plugin) {
+    const held = new Map();
+    patchWithCleanup(plugin._idb, {
+        delete(table, key) {
+            if (table !== OfflinePlugin.ORM_SYNC_TABLE_NAME) {
+                return super.delete(...arguments);
+            }
+            expect.step(`store delete ${key}`);
+            const hold = held.get(key);
+            if (!hold) {
+                return super.delete(table, key);
+            }
+            return hold.promise.then(() => super.delete(table, key));
+        },
+    });
+    return held;
+}
+
+/**
+ * Emulates the server's lead create by delivery key (the `crm.lead` `web_save`
+ * override): a create (`web_save` without ids) whose context carries the key
+ * (`CRM_OFFLINE_CREATE_KEY`) of a lead already created answers with that lead and
+ * creates nothing. The mock server also decides the fate of the next lead creates,
+ * one per value pushed to the returned `losses`, in order: `null` when it answers
+ * the create, `true` when it handles the create before its answer is lost, `false`
+ * when the request never reaches it; a loss reaches the page as a lost connection
+ * (a 502). The creates after the last value are answered. Each create is
+ * stepped as `create <name>`, `create <name> (delivered)` when its key answered it,
+ * with ` (answer lost)` appended when its answer is lost, or as `create <name>
+ * (request lost)`. The payload (`callPayload`) of each create the server handles is
+ * appended to `received`, and any `crm.lead` `search` is stepped as `crm.lead search`.
+ *
+ * @returns {{losses: (boolean|null)[], received: Object[]}}
+ */
+function mockLeadCreatesByKey() {
+    const state = { losses: [], received: [] };
+    const leadIdsByKey = new Map();
+    onRpc("crm.lead", "web_save", async (params) => {
+        const { args, kwargs, parent } = params;
+        if (args[0].length) {
+            return;
+        }
+        const loss = state.losses.length ? state.losses.shift() : null;
+        if (loss === false) {
+            expect.step(`create ${args[1].name} (request lost)`);
+            return new Response("", { status: 502 });
+        }
+        state.received.push(callPayload(params));
+        const key = kwargs.context?.[CRM_OFFLINE_CREATE_KEY];
+        let step = `create ${args[1].name}`;
+        let result;
+        if (leadIdsByKey.has(key)) {
+            step += " (delivered)";
+            result = [{ id: leadIdsByKey.get(key) }];
+        } else {
+            result = await parent();
+            if (typeof key === "string") {
+                leadIdsByKey.set(key, result[0].id);
+            }
+        }
+        if (loss) {
+            expect.step(`${step} (answer lost)`);
+            return new Response("", { status: 502 });
+        }
+        expect.step(step);
+        return result;
+    });
+    onRpc("crm.lead", "search", () => {
+        expect.step("crm.lead search");
+    });
+    return state;
+}
+
+/**
+ * Queues a lead create as the mobile quick create does offline: the pipeline
+ * context with the create's delivery key, and an empty specification.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {Object} vals the lead values, completed with a stage and a revenue
+ * @param {string} key the delivery key
+ * @param {number} [timeStamp]
+ * @returns {string} its queue key
+ */
+function queueLeadCreate(plugin, vals, key, timeStamp = Date.now()) {
+    return plugin.scheduleORM(
+        "crm.lead",
+        "web_save",
+        [[], { stage_id: STAGE_QUALIFIED, expected_revenue: 30, ...vals }],
+        {
+            context: { default_type: "opportunity", [CRM_OFFLINE_CREATE_KEY]: key },
+            specification: {},
+        },
+        { extras: { displayName: vals.name, timeStamp } }
+    );
+}
+
+test("[Offline] a replayed CRM call has left the offline store when the replay ends", async () => {
+    onRpc("web_save", ({ model, args }) => {
+        expect.step(`${model} web_save ${args[1].name}`);
+    });
+    const setOffline = mockOffline();
+    await makeTestApp();
+    await flushStartupSync();
+    const plugin = getService(OfflinePlugin);
+    const held = holdQueueRemovals(plugin);
+    const { env } = MockServer;
+
+    // The last queued call is a lead save: once delivered, the replay holds the
+    // replay lock until the offline store no longer has the call, so a tab taking
+    // the lock next reads a store without it and does not send it again.
+    await setOffline(true);
+    const leadKey = plugin.scheduleORM(
+        "crm.lead",
+        "web_save",
+        [[1], { name: "Lead 1 replayed" }],
+        { context: {}, specification: {} },
+        { extras: { displayName: "Lead 1", timeStamp: Date.now() } }
+    );
+    held.set(leadKey, Promise.withResolvers());
+    await setOffline(false);
+    await expect.waitForSteps(["crm.lead web_save Lead 1 replayed", `store delete ${leadKey}`]);
+    await animationFrame();
+    expect(env["crm.lead"].browse(1)[0].name).toBe("Lead 1 replayed");
+    expect(plugin.syncingORM()).toBe(true);
+    expect(await storedQueueKeys(plugin)).toEqual([leadKey]);
+    held.get(leadKey).resolve();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(await storedQueueKeys(plugin)).toEqual([]);
+    expect(queued("crm.lead")).toEqual([]);
+    // The framework's own removal follows, on a store that no longer has the call.
+    expect.verifySteps([`store delete ${leadKey}`]);
+
+    // A call of another app is replayed as before: the replay ends while the
+    // removal of its call from the offline store is still running.
+    const partnerId = env["res.partner"].create({ name: "Partner" });
+    await setOffline(true);
+    const partnerKey = plugin.scheduleORM(
+        "res.partner",
+        "web_save",
+        [[partnerId], { name: "Partner replayed" }],
+        { context: {}, specification: {} },
+        { extras: { displayName: "Partner", timeStamp: Date.now() } }
+    );
+    held.set(partnerKey, Promise.withResolvers());
+    await setOffline(false);
+    await expect.waitForSteps([
+        "res.partner web_save Partner replayed",
+        `store delete ${partnerKey}`,
+    ]);
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(await storedQueueKeys(plugin)).toEqual([partnerKey]);
+    held.get(partnerKey).resolve();
+    await animationFrame();
+    expect(await storedQueueKeys(plugin)).toEqual([]);
+    expect(env["res.partner"].browse(partnerId)[0].name).toBe("Partner replayed");
+    expect.verifySteps([]);
+});
+
+test("[Offline] queued lead create whose replay answer is lost is sent again with its delivery key", async () => {
+    const server = mockLeadCreatesByKey();
+    const setOffline = mockOffline();
+    await makeTestApp();
+    await flushStartupSync();
+    const plugin = getService(OfflinePlugin);
+    const { env } = MockServer;
+    const countLeads = (name) => env["crm.lead"].search_count([["name", "=", name]]);
+    const deliveryKey = "0123456789abcdef".repeat(2);
+
+    // The replay's create reaches the server, which creates the lead, but its answer
+    // is lost: the replay stops, and the create stays queued (not parked), unchanged
+    // with its delivery key, in memory and in the offline store.
+    await setOffline(true);
+    const key = queueLeadCreate(plugin, { name: "Lost Lead" }, deliveryKey);
+    const queuedCall = JSON.parse(JSON.stringify(queuedCalls("crm.lead")));
+    server.losses.push(true);
+    await setOffline(false);
+    await expect.waitForSteps(["create Lost Lead (answer lost)"]);
+    await animationFrame();
+    expect(plugin.isOffline()).toBe(true);
+    expect(countLeads("Lost Lead")).toBe(1);
+    const [entry] = queued("crm.lead");
+    expect(entry.key).toBe(key);
+    expect(entry.value.extras.error).toBe(undefined);
+    expect(queuedCalls("crm.lead")).toEqual(queuedCall);
+    expect(await storedQueueValue(plugin, key)).toEqual(JSON.parse(JSON.stringify(entry.value)));
+
+    // The next replay sends the very same call, key included, which the server
+    // answers with the lead it created: one lead, and nothing left to replay. No
+    // lookup is sent.
+    await reconnect(setOffline);
+    await expect.waitForSteps(["create Lost Lead (delivered)"]);
+    expect(server.received).toHaveLength(2);
+    expect(server.received[1]).toEqual(server.received[0]);
+    expect(server.received[0].args).toEqual(queuedCall[0].args);
+    expect(server.received[0].kwargs.context).toMatchObject(queuedCall[0].kwargs.context);
+    expect(server.received[0].kwargs.context[CRM_OFFLINE_CREATE_KEY]).toBe(deliveryKey);
+    expect(countLeads("Lost Lead")).toBe(1);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(await storedQueueKeys(plugin)).toEqual([]);
+    expect(plugin.syncingORM()).toBe(false);
+    expect.verifySteps([]);
+});
+
+test("[Offline] lost lead creates: each delivery key is answered with its own lead only", async () => {
+    const server = mockLeadCreatesByKey();
+    const setOffline = mockOffline();
+    await makeTestApp();
+    await flushStartupSync();
+    const plugin = getService(OfflinePlugin);
+    const { env } = MockServer;
+    const prospects = () =>
+        env["crm.lead"]
+            .search_read([["name", "=", "Repeat Prospect"]], ["contact_name", "expected_revenue"])
+            .map(({ contact_name, expected_revenue }) => [contact_name, expected_revenue]);
+    const aliceKey = "0123456789abcdef".repeat(2);
+    const bobKey = "fedcba9876543210".repeat(2);
+
+    // Two creates of one name in one stage with other values, as two quick creates
+    // (in two tabs, say) queue them: each carries its own delivery key.
+    await setOffline(true);
+    const aliceCreate = { name: "Repeat Prospect", contact_name: "Alice", expected_revenue: 10 };
+    const bobCreate = { name: "Repeat Prospect", contact_name: "Bob", expected_revenue: 20 };
+    const aliceEntry = queueLeadCreate(plugin, aliceCreate, aliceKey);
+    const bobEntry = queueLeadCreate(plugin, bobCreate, bobKey, Date.now() + 1);
+
+    // Alice's lead is created, but the answer is lost: the replay stops.
+    server.losses.push(true);
+    await setOffline(false);
+    await expect.waitForSteps(["create Repeat Prospect (answer lost)"]);
+    await animationFrame();
+    expect(prospects()).toEqual([["Alice", 10]]);
+    expect(queued("crm.lead").map(({ key }) => key)).toEqual([aliceEntry, bobEntry]);
+
+    // Alice's create is answered with her lead. Bob's create is sent next, and its
+    // request is lost before it reaches the server: it stays queued, and is not
+    // taken for Alice's lead.
+    server.losses.push(null, false);
+    await setOffline(false);
+    await runAllTimers();
+    await expect.waitForSteps([
+        "create Repeat Prospect (delivered)",
+        "create Repeat Prospect (request lost)",
+    ]);
+    await animationFrame();
+    expect(prospects()).toEqual([["Alice", 10]]);
+    expect(queued("crm.lead").map(({ key }) => key)).toEqual([bobEntry]);
+    expect(queued("crm.lead")[0].value.extras.error).toBe(undefined);
+
+    // Reconnected, Bob's create makes his own lead: the user gets both leads.
+    await reconnect(setOffline);
+    await expect.waitForSteps(["create Repeat Prospect"]);
+    expect(prospects().sort()).toEqual([
+        ["Alice", 10],
+        ["Bob", 20],
+    ]);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(await storedQueueKeys(plugin)).toEqual([]);
+    expect(server.received.map(({ kwargs }) => kwargs.context[CRM_OFFLINE_CREATE_KEY])).toEqual([
+        aliceKey,
+        aliceKey,
+        bobKey,
+    ]);
+    expect(server.received[1]).toEqual(server.received[0]);
+    expect.verifySteps([]);
 });
 
 // -----------------------------------------------------------------------------
@@ -7810,4 +10478,113 @@ test("[Offline] parked lead save opened from the systray online is handed to the
         },
     ]);
     expect(MockServer.env["crm.lead"].browse(1)[0].name).toBe("Lead 1 parked");
+});
+
+/**
+ * Parks an offline save of lead 1's expected revenue and probability (its replay is
+ * rejected), changes the lead on the server, then opens the parked save from the
+ * offline systray online. The form shows its cached read with the parked save's
+ * changes, and the systray removes the entry, while the server's read is held; the
+ * server's changed read then updates the form, whose changes stay unsaved edits.
+ * Must be called after `stepLeadReads()`.
+ *
+ * @param {(offline: boolean) => Promise<void>} setOffline
+ * @param {{reject: boolean}} rejection the `rejectReplay` state of `web_save`
+ */
+async function retryParkedSaveAfterServerChange(setOffline, rejection) {
+    let heldRead = null;
+    onRpc("crm.lead", "web_read", () => heldRead?.promise);
+    await openPipeline();
+    await openLead(1);
+    await flushStartupSync();
+    expect.verifySteps(["web_read [1]"]);
+
+    await setOffline(true);
+    await contains(".o_field_widget[name=expected_revenue] input").edit("8333");
+    await contains(".o_field_widget[name=probability] input").edit("40");
+    await contains(".o_form_button_save").click();
+    rejection.reject = true;
+    await reconnect(setOffline);
+    rejection.reject = false;
+    expectParked("crm.lead", "Save refused");
+    await goBack();
+
+    MockServer.env["crm.lead"].write([1], { phone: "+32 470 00 00 77" });
+    heldRead = Promise.withResolvers();
+    const { resolve } = heldRead;
+    await openSystray();
+    await contains(
+        ".o_offline_systray_content .o-dropdown-item:contains(Lead 1) .text-truncate"
+    ).click();
+    await animationFrame();
+    expect(queued("crm.lead")).toEqual([]);
+    expect(".o_field_widget[name=phone] input").toHaveValue("+32 470 00 00 01");
+    expect(".o_field_widget[name=expected_revenue] input").toHaveValue("8,333.00");
+    expect(".o_field_widget[name=probability] input").toHaveValue("40.00");
+    expect(".o_form_status_indicator_buttons").not.toHaveClass("invisible");
+
+    heldRead = null;
+    resolve();
+    await animationFrame();
+    expect.verifySteps(["web_read [1]"]);
+    expect(".o_field_widget[name=phone] input").toHaveValue("+32 470 00 00 77");
+    expect(".o_field_widget[name=expected_revenue] input").toHaveValue("8,333.00");
+    expect(".o_field_widget[name=probability] input").toHaveValue("40.00");
+    expect(".o_form_status_indicator_buttons").not.toHaveClass("invisible");
+}
+
+test("[Offline] parked lead save retried from the systray after a server change is saved", async () => {
+    stepWebSave();
+    const rejection = rejectReplay("crm.lead", "web_save", "Save refused");
+    stepLeadReads();
+    const setOffline = mockOffline();
+    await retryParkedSaveAfterServerChange(setOffline, rejection);
+
+    await contains(".o_form_button_save").click();
+    expect.verifySteps([
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [[1], { expected_revenue: 8333, probability: 40 }],
+            kwargs: {
+                context: callContext(PIPELINE_ACTION.context),
+                specification: leadFormReadBack(),
+            },
+        },
+    ]);
+    const [lead] = MockServer.env["crm.lead"].browse(1);
+    expect([lead.expected_revenue, lead.probability, lead.phone]).toEqual([
+        8333,
+        40,
+        "+32 470 00 00 77",
+    ]);
+    expect(".o_form_status_indicator_buttons").toHaveClass("invisible");
+});
+
+test("[Offline] parked lead save retried from the systray after a server change is saved on leave", async () => {
+    stepWebSave();
+    const rejection = rejectReplay("crm.lead", "web_save", "Save refused");
+    stepLeadReads();
+    const setOffline = mockOffline();
+    await retryParkedSaveAfterServerChange(setOffline, rejection);
+
+    // Opened with cleared breadcrumbs, the form is left for another action.
+    await getService("action").doAction(PIPELINE_ACTION.id);
+    await animationFrame();
+    expect.verifySteps([
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [[1], { expected_revenue: 8333, probability: 40 }],
+            kwargs: { context: callContext(PIPELINE_ACTION.context), specification: {} },
+        },
+    ]);
+    const [lead] = MockServer.env["crm.lead"].browse(1);
+    expect([lead.expected_revenue, lead.probability, lead.phone]).toEqual([
+        8333,
+        40,
+        "+32 470 00 00 77",
+    ]);
+    expect(".o_form_view").toHaveCount(0);
+    expect(queued("crm.lead")).toEqual([]);
 });

@@ -114,17 +114,54 @@ export class CrmKanbanModel extends RelationalModel {
      * Offline, a root load of the mobile variant that could not be served is
      * retried once when the `crmUseDesktopSpec` hook asks for it (the hook switches
      * to the desktop variant); the error of that retry, like any other error,
-     * propagates as the framework raises it. The server-value snapshot needs no
-     * handling here: it belongs to the root the load builds.
+     * propagates as the framework raises it. Each variant is read as
+     * `_crmLoadRoot` reads it, so a load makes at most four attempts. The
+     * server-value snapshot needs no handling here: it belongs to the root the load
+     * builds.
      */
     async load(params = {}) {
         try {
-            await super.load(...arguments);
+            await this._crmLoadRoot(...arguments);
         } catch (error) {
             if (!(error instanceof ConnectionLostError) || !this.hooks.crmUseDesktopSpec?.()) {
                 throw error;
             }
+            await this._crmLoadRoot(...arguments);
+        }
+    }
+
+    /**
+     * The framework's root load. Offline, a load that sent the opening info of the
+     * groups and could not be served is retried once without it when the
+     * `crmLoadWithoutOpeningInfo` hook asks for it. The RPC cache keys a root load
+     * on its full request, and the model sends that info with every root load once
+     * a group was loaded on its own (e.g. by "Load more"): the cache holds no such
+     * request until one was answered online, but it holds the request of the last
+     * root load made before, which sent none. The model's configuration gets the
+     * info back once the retry ends, served or not, so the root loads that follow
+     * send it again, as the framework sends it: online, they keep the groups as they
+     * were loaded. Any other error, and that of the retry, propagates.
+     *
+     * @param {Object} [params]
+     * @returns {Promise<void>}
+     */
+    async _crmLoadRoot(params = {}) {
+        try {
             await super.load(...arguments);
+        } catch (error) {
+            if (
+                !(error instanceof ConnectionLostError) ||
+                !this.config.sendOpeningInfo ||
+                !this.hooks.crmLoadWithoutOpeningInfo?.()
+            ) {
+                throw error;
+            }
+            delete this.config.sendOpeningInfo;
+            try {
+                await super.load(...arguments);
+            } finally {
+                this.config.sendOpeningInfo = true;
+            }
         }
     }
 
@@ -256,9 +293,12 @@ export class CrmKanbanDynamicRecordList extends RelationalModel.DynamicRecordLis
      * Records the server stage and revenue of the received records into the
      * list's snapshot (see `recordCrmServerValues`) before `super` builds the
      * record datapoints. Fresh server data set on the current ungrouped root
-     * outside a root load first gives the root a new snapshot.
+     * outside a root load first gives the root a new snapshot. During a
+     * `crmLoadMissingRecords` load, first notes the root's opening-info flag,
+     * which the model sets right after this commit.
      */
     _setData(data) {
+        this._crmBeforeCommit?.();
         if (this.config.isRoot && isCurrentRoot(this)) {
             this._crmServerValues = new Map();
         }
@@ -280,6 +320,60 @@ export class CrmKanbanDynamicRecordList extends RelationalModel.DynamicRecordLis
             return;
         }
         return super._load(...arguments);
+    }
+
+    /**
+     * Loads the records of this group list while it holds none, with the request
+     * `Group.toggle` sends for a folded group, but without the toggle's effects
+     * on other datapoints: the group's fold state is not changed, and the root
+     * gets back the `sendOpeningInfo` flag it had. The model sets that flag on the
+     * root after every non-root load (`_updateConfig`), so that the next root
+     * request sends the opening info of every group; that request would then
+     * differ from the one the RPC cache holds, and could not be served offline.
+     * The flag is noted at this load's commit, right before the model sets it, on
+     * the root the model sets it on, even when a root load replaced the root
+     * meanwhile. The load runs in the model's mutex, as `load` does, so a "Load
+     * more" keeps the flag it sets. Offline, `_load` issues no request. Calls made
+     * while a load is pending share it. Used by the mobile pipeline only.
+     *
+     * @returns {Promise<void>}
+     */
+    crmLoadMissingRecords() {
+        if (!this._crmMissingRecordsLoad) {
+            this._crmMissingRecordsLoad = this.model.mutex
+                .exec(async () => {
+                    if (this.records.length) {
+                        return;
+                    }
+                    let restoreRootFlag = null;
+                    this._crmBeforeCommit = () => {
+                        const rootConfig = this.model.root?.config;
+                        if (!rootConfig) {
+                            return;
+                        }
+                        const hadFlag = Object.hasOwn(rootConfig, "sendOpeningInfo");
+                        const flag = rootConfig.sendOpeningInfo;
+                        restoreRootFlag = () => {
+                            if (hadFlag) {
+                                rootConfig.sendOpeningInfo = flag;
+                            } else {
+                                delete rootConfig.sendOpeningInfo;
+                            }
+                        };
+                    };
+                    try {
+                        // `_load`, not `load`: this already runs in the mutex.
+                        await this._load(this.offset, this.limit, this.orderBy, this.domain);
+                    } finally {
+                        this._crmBeforeCommit = null;
+                        restoreRootFlag?.();
+                    }
+                })
+                .finally(() => {
+                    this._crmMissingRecordsLoad = null;
+                });
+        }
+        return this._crmMissingRecordsLoad;
     }
 
     /**

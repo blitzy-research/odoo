@@ -1,32 +1,57 @@
 /** Shared CRM offline hooks and execution guards backed by the framework `OfflinePlugin`. */
 
-import { onMounted, onPatched, proxy, signal, untrack, useEffect, usePlugin } from "@odoo/owl";
+import {
+    computed,
+    immediateEffect,
+    onMounted,
+    onPatched,
+    onWillDestroy,
+    onWillPatch,
+    onWillUnmount,
+    proxy,
+    signal,
+    toRaw,
+    untrack,
+    useEffect,
+    useListener,
+    usePlugin,
+} from "@odoo/owl";
 import { ActivityButton } from "@mail/core/web/activity_button";
 import { AutoComplete } from "@web/core/autocomplete/autocomplete";
 import { browser } from "@web/core/browser/browser";
 // The `loadState()` guard must inspect the state the action service itself falls
 // back to when called without arguments (the web client's boot): `router.current`.
 import { router } from "@web/core/browser/router";
-import { ConnectionLostError } from "@web/core/network/rpc";
+import { getActiveHotkey } from "@web/core/hotkeys/hotkey_service";
+import { ConnectionLostError, rpcBus } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { registry } from "@web/core/registry";
+import { useActiveElement } from "@web/core/ui/ui_service";
 import { user } from "@web/core/user";
 import { mergeClasses } from "@web/core/utils/classname";
 import { useService } from "@web/core/utils/hooks";
+import { omit } from "@web/core/utils/objects";
 import { patch } from "@web/core/utils/patch";
+import { getTabableElements } from "@web/core/utils/ui";
+import { Record } from "@web/model/relational_model/record";
 import { getScheduleORMExtras } from "@web/model/relational_model/utils";
 import { useEnv } from "@web/owl2/utils";
 import { ActionMenus } from "@web/search/action_menus/action_menus";
 import { CardRenderer } from "@web/views/card/card_renderer";
 import { Many2ManyTagsField } from "@web/views/fields/many2many_tags/many2many_tags_field";
 import { Many2XAutocomplete } from "@web/views/fields/relational_utils";
+import { FormController } from "@web/views/form/form_controller";
 import { KanbanDropdownMenuWrapper } from "@web/views/kanban/kanban_dropdown_menu_wrapper";
 import { KanbanRecord } from "@web/views/kanban/kanban_record";
 import { OfflineActionHelper } from "@web/views/offline_action_helper";
 import { View } from "@web/views/view";
 import { ViewButton } from "@web/views/view_button/view_button";
+import { viewService } from "@web/views/view_service";
 import { actionService } from "@web/webclient/actions/action_service";
 import { menuService } from "@web/webclient/menus/menu_service";
+import { NavBar } from "@web/webclient/navbar/navbar";
+import { SettingsFormController } from "@web/webclient/settings_form_view/settings_form_controller";
+import { settingsFormView } from "@web/webclient/settings_form_view/settings_form_view";
 
 // -----------------------------------------------------------------------------
 // Frozen sets (generated from offline_inventory.md, "Generated sets")
@@ -253,9 +278,24 @@ export function isCrmOfflineButtonCall(params) {
 }
 
 /**
+ * Whether the framework offline queue can hold calls in this browsing context.
+ * `OfflinePlugin.scheduleORM` refuses every call outside a secure context (a
+ * plain-http LAN origin) with `NonSecureContextError`, so there a CRM control whose
+ * offline action queues a call can never work offline and must not claim
+ * `data-available-offline`. It makes the framework's own test, read on every call.
+ *
+ * @returns {boolean}
+ */
+export function isCrmOfflineQueueUsable() {
+    return Boolean(window.isSecureContext);
+}
+
+/**
  * Tells whether a view button is a CRM DISABLE control: an `object`/`action`
- * button not tagged `data-available-offline`, on a lead, team or stage record, or
- * the campaign's lead counter. Pure: it reads no signal.
+ * button on a lead, team or stage record, or the campaign's lead counter, not
+ * tagged `data-available-offline`, or tagged so where the offline queue its
+ * offline action needs cannot be used (`isCrmOfflineQueueUsable`, e.g. "Won").
+ * Pure: it reads no signal.
  *
  * @param {{resModel?: string}} [record]
  * @param {{type?: string, name?: string}} [clickParams]
@@ -267,7 +307,7 @@ export function isCrmOfflineGuarded(record, clickParams, attrs) {
     if (type !== "object" && type !== "action") {
         return false;
     }
-    if (attrs && "data-available-offline" in attrs) {
+    if (attrs && "data-available-offline" in attrs && isCrmOfflineQueueUsable()) {
         return false;
     }
     const resModel = record?.resModel;
@@ -276,6 +316,24 @@ export function isCrmOfflineGuarded(record, clickParams, attrs) {
     }
     return (
         resModel === "utm.campaign" && clickParams.name === "action_redirect_to_leads_opportunities"
+    );
+}
+
+/**
+ * Tells whether a form, or its record, holds a CRM transient record that only its
+ * buttons use: a CRM wizard, or the settings opened with `context.module` "crm" (the
+ * CRM settings page). Offline, saving or reloading such a record cannot work: its
+ * `web_save` is a transient write, never queued, and the settings model reads no
+ * cache. Pure: it reads no signal.
+ *
+ * @param {string} [resModel]
+ * @param {Object} [context]
+ * @returns {boolean}
+ */
+function isCrmOfflineTransientForm(resModel, context) {
+    return (
+        CRM_WIZARD_MODELS.has(resModel) ||
+        (resModel === "res.config.settings" && context?.module === "crm")
     );
 }
 
@@ -330,11 +388,6 @@ function byTimeStamp(a, b) {
     return (a.value.extras?.timeStamp || 0) - (b.value.extras?.timeStamp || 0);
 }
 
-function targetsRecord(value, resId) {
-    const ids = value.args?.[0];
-    return Boolean(resId) && Array.isArray(ids) && ids.includes(resId);
-}
-
 function isParked(entry) {
     return Boolean(entry.value.extras?.error);
 }
@@ -368,27 +421,340 @@ function isCreateSave(value) {
     );
 }
 
+// -----------------------------------------------------------------------------
+// Entry index (one pass over the queue, shared by every projection)
+// -----------------------------------------------------------------------------
+
 /**
- * Tells whether a queued entry is a lead write that concerns `record`: its own
- * offline save (`record.offlineId`) or a lead method targeting `record.resId`,
- * possibly queued through another `Record` instance of the same lead.
+ * @typedef {Object} CrmEntryIndex
+ * @property {Map<string|undefined, Object[]>} byModel entries per `value.model`, in
+ *  the order of the indexed list (the queue order)
+ * @property {Map<string, Object>} byKey entry per `entry.key`
+ * @property {Map<Object, number>} positions position of each entry in the indexed list
+ * @property {Map<number, Object[]>} leadWritesById `crm.lead` calls of
+ *  `LEAD_WRITE_METHODS` per id their `args[0]` array targets
+ * @property {Map<any, Object[]>} leadCreatesByStage `crm.lead` creations
+ *  (`isCreateSave`) per `args[1].stage_id`
+ * @property {Map<any, Object[]>} activityCreatesByLead `mail.activity` creations on
+ *  `crm.lead` per `res_id` of their values
+ * @property {Set<number>} doneActivityIds activity ids a `mail.activity`
+ *  `action_done` targets
  *
- * @param {{key: string, value: Object}} entry
- * @param {Object} record
+ * Every per-id bucket is in replay order (`extras.timeStamp`, ties in list order).
  */
-function isLeadWriteOf(entry, record) {
-    const { value } = entry;
-    if (value.model !== record.resModel) {
-        return false;
+
+function addToBucket(buckets, id, entry) {
+    const bucket = buckets.get(id);
+    if (bucket) {
+        bucket.push(entry);
+    } else {
+        buckets.set(id, [entry]);
     }
-    if (record.offlineId && entry.key === record.offlineId) {
-        return true;
+}
+
+/**
+ * Indexes queue entries (the framework queue, or the entries a replay hold keeps)
+ * in one pass, so that each projection reads its lead's or stage's entries
+ * directly instead of filtering every entry. Bucket membership follows the
+ * projections' own matching rules: a call targets the ids its `args[0]` array
+ * holds, a falsy id targets nothing, and a `NaN` stage or lead, which no strict
+ * comparison matches, is left out.
+ *
+ * @param {Array<{key: string, value: Object}>} entries
+ * @returns {CrmEntryIndex}
+ */
+function buildEntryIndex(entries) {
+    const index = {
+        byModel: new Map(),
+        byKey: new Map(),
+        positions: new Map(),
+        leadWritesById: new Map(),
+        leadCreatesByStage: new Map(),
+        activityCreatesByLead: new Map(),
+        doneActivityIds: new Set(),
+    };
+    entries.forEach((entry, position) => {
+        const { value } = entry;
+        index.positions.set(entry, position);
+        index.byKey.set(entry.key, entry);
+        addToBucket(index.byModel, value?.model, entry);
+        if (value?.model === "crm.lead") {
+            const ids = value.args?.[0];
+            if (LEAD_WRITE_METHODS.has(value.method) && Array.isArray(ids)) {
+                for (const id of new Set(ids)) {
+                    if (id) {
+                        addToBucket(index.leadWritesById, id, entry);
+                    }
+                }
+            }
+            if (isCreateSave(value) && !Number.isNaN(value.args[1].stage_id)) {
+                addToBucket(index.leadCreatesByStage, value.args[1].stage_id, entry);
+            }
+        } else if (value?.model === "mail.activity") {
+            const vals = value.method === "create" && value.args?.[0]?.[0];
+            if (vals && vals.res_model === "crm.lead" && !Number.isNaN(vals.res_id)) {
+                addToBucket(index.activityCreatesByLead, vals.res_id, entry);
+            }
+            const ids = value.args?.[0];
+            if (value.method === "action_done" && Array.isArray(ids)) {
+                for (const id of ids) {
+                    index.doneActivityIds.add(id);
+                }
+            }
+        }
+    });
+    // Stable sorts: entries of one time stamp keep the list order.
+    for (const buckets of [
+        index.leadWritesById,
+        index.leadCreatesByStage,
+        index.activityCreatesByLead,
+    ]) {
+        for (const bucket of buckets.values()) {
+            bucket.sort(byTimeStamp);
+        }
     }
-    return (
-        record.resModel === "crm.lead" &&
-        LEAD_WRITE_METHODS.has(value.method) &&
-        targetsRecord(value, record.resId)
-    );
+    return index;
+}
+
+/**
+ * The indexed lead writes that concern `record`: its own offline save
+ * (`record.offlineId`, any method of its model) and the lead methods targeting
+ * `record.resId`, possibly queued through another `Record` instance of the same
+ * lead. Each entry is listed once, in replay order (ties in list order).
+ *
+ * @param {CrmEntryIndex} index
+ * @param {Object} record
+ * @returns {Object[]} a new array
+ */
+function leadWritesIn(index, record) {
+    const writes = [];
+    const own = record.offlineId ? index.byKey.get(record.offlineId) : undefined;
+    if (own && own.value?.model === record.resModel) {
+        writes.push(own);
+    }
+    if (record.resModel === "crm.lead" && record.resId) {
+        for (const entry of index.leadWritesById.get(record.resId) || []) {
+            if (entry !== own) {
+                writes.push(entry);
+            }
+        }
+    }
+    if (writes.length > 1) {
+        writes.sort((a, b) => byTimeStamp(a, b) || index.positions.get(a) - index.positions.get(b));
+    }
+    return writes;
+}
+
+/**
+ * Derived index of each offline plugin's queue (`buildEntryIndex` of
+ * `_ormToSync()`), rebuilt once per queue change and shared by every hook of that
+ * plugin. It stores nothing beyond the queue it is derived from.
+ *
+ * A computed joins the scope it is created in and stops following its sources
+ * when that scope ends, while other components still read it: readers therefore
+ * read the queue signal themselves first (`readQueueIndex`), which keeps them
+ * subscribed, and the computed recomputes at its next read.
+ *
+ * @type {WeakMap<OfflinePlugin, () => CrmEntryIndex>}
+ */
+const queueIndexes = new WeakMap();
+
+/**
+ * @param {OfflinePlugin} plugin
+ * @returns {CrmEntryIndex} the index of the plugin's current queue
+ */
+function readQueueIndex(plugin) {
+    plugin._ormToSync();
+    let index = queueIndexes.get(plugin);
+    if (!index) {
+        index = untrack(() => computed(() => buildEntryIndex(Object.values(plugin._ormToSync()))));
+        queueIndexes.set(plugin, index);
+    }
+    return index();
+}
+
+// -----------------------------------------------------------------------------
+// Replay hold (entries the replay just sent, until the views reload)
+// -----------------------------------------------------------------------------
+
+/** Models whose replayed entries the mobile views keep showing until they reload. */
+const HELD_MODELS = freezeSet(["crm.lead", "mail.activity"]);
+
+/**
+ * Key, on a root configuration, of the replay token `markRootLoad` gives its load.
+ * A symbol: spread and `Object.assign` copy it with the configuration, while no
+ * request, cache key or serialized state includes it.
+ */
+const REPLAY_TOKEN = Symbol("crmReplayToken");
+
+/**
+ * @typedef {Object} CrmReplayHolder
+ * @property {(entry: {key: string, value: Object}) => boolean} accept
+ * @property {Map<string, {entry: Object, seq: number}>} entries the entries it holds
+ *
+ * @typedef {Object} CrmReplayHold
+ * @property {number} seq number of the last capture
+ * @property {Set<CrmReplayHolder>} holders the mounted holders
+ * @property {import("@odoo/owl").Signal<Object[]>} held the entries some holder holds
+ * @property {() => CrmEntryIndex} index `buildEntryIndex` of `held`
+ */
+
+/**
+ * Replay hold of each offline plugin.
+ *
+ * The framework's replay removes each entry from the queue as soon as its call
+ * succeeds, and the views showing it reload only afterwards: the projections, read
+ * from the queue alone, would meanwhile drop a lead created offline (and its share
+ * of the stage count and revenue), a logged activity or a completion, until the
+ * reload shows the server record. The hold keeps in memory, for the mounted
+ * components that ask for it (`holdReplayed`), the `crm.lead` and `mail.activity`
+ * entries the replay has just removed, and the projections keep showing them as
+ * pending until that component displays a root loaded from the server after their
+ * replay. It creates no queue, cache, store or persistence and serves no RPC read:
+ * like `crmServerValues`, it only bridges the time until the reconciliation reload
+ * replaces what it holds. The queue itself, and everything that reads it to decide
+ * what to replay or discard (`queuedEntries`, `isQueued`, `onReplayed`,
+ * `onEntriesDiscarded`, the pending-sync badge, the systray), never sees it.
+ *
+ * @type {WeakMap<OfflinePlugin, CrmReplayHold>}
+ */
+const replayHolds = new WeakMap();
+
+/**
+ * Publishes the entries the mounted holders hold (each key once, in capture order).
+ *
+ * @param {CrmReplayHold} hold
+ */
+function publishHeld(hold) {
+    const byKey = new Map();
+    for (const holder of hold.holders) {
+        for (const item of holder.entries.values()) {
+            if (!byKey.has(item.entry.key)) {
+                byKey.set(item.entry.key, item);
+            }
+        }
+    }
+    const items = [...byKey.values()].sort((a, b) => a.seq - b.seq);
+    hold.held.set(Object.freeze(items.map(({ entry }) => entry)));
+}
+
+/**
+ * Gives the entries a replay has just removed from the queue to the mounted
+ * holders accepting them; an entry no holder accepts is not kept. A holder whose
+ * `accept` throws keeps nothing of the entry, and the error is reported.
+ *
+ * @param {CrmReplayHold} hold
+ * @param {Object[]} entries
+ */
+function keepReplayed(hold, entries) {
+    hold.seq++;
+    let kept = false;
+    for (const holder of hold.holders) {
+        for (const entry of entries) {
+            let accepted = false;
+            try {
+                accepted = holder.accept(entry);
+            } catch (error) {
+                crmReportError(error);
+            }
+            if (accepted) {
+                holder.entries.set(entry.key, { entry, seq: hold.seq });
+                kept = true;
+            }
+        }
+    }
+    if (kept) {
+        publishHeld(hold);
+    }
+}
+
+/**
+ * The replay hold of `plugin`, created at the first call. Its capture is a single
+ * immediate effect per plugin: it runs inside every write of the queue, before
+ * any render can show the queue without an entry the replay has just sent. An
+ * entry that leaves the queue while `syncingORM()` is true has been replayed
+ * (parked entries are re-scheduled under their key and never leave); one that
+ * leaves outside a replay was discarded, and is not kept. The queue is compared by
+ * key, as the replay replaces the whole queue object when it starts.
+ *
+ * The capture runs inside the framework's replay loop, where an exception would
+ * park the call it has just replayed: nothing it runs may throw, and an error is
+ * reported through `crmReportError` instead.
+ *
+ * @param {OfflinePlugin} plugin
+ * @returns {CrmReplayHold}
+ */
+function getReplayHold(plugin) {
+    let hold = replayHolds.get(plugin);
+    if (hold) {
+        return hold;
+    }
+    const held = signal(Object.freeze([]));
+    hold = { seq: 0, holders: new Set(), held, index: null };
+    replayHolds.set(plugin, hold);
+    untrack(() => {
+        // Readers read `held` themselves first (see `queueIndexes`).
+        hold.index = computed(() => buildEntryIndex(held()));
+        let previous = new Map();
+        immediateEffect(() => {
+            const current = new Map(Object.entries(plugin._ormToSync()));
+            untrack(() => {
+                const removed = previous;
+                previous = current;
+                try {
+                    if (!plugin.syncingORM()) {
+                        return;
+                    }
+                    const replayed = [];
+                    for (const [key, entry] of removed) {
+                        if (
+                            !current.has(key) &&
+                            HELD_MODELS.has(entry?.value?.model) &&
+                            !isParked(entry)
+                        ) {
+                            replayed.push(entry);
+                        }
+                    }
+                    if (replayed.length) {
+                        keepReplayed(hold, replayed);
+                    }
+                } catch (error) {
+                    crmReportError(error);
+                }
+            });
+        });
+    });
+    return hold;
+}
+
+/**
+ * @param {OfflinePlugin} plugin
+ * @returns {CrmEntryIndex} the index of the entries the plugin's replay hold keeps
+ */
+function readHeldIndex(plugin) {
+    const hold = getReplayHold(plugin);
+    hold.held();
+    return hold.index();
+}
+
+/**
+ * Entries of one projection bucket in replay order: the held ones (already
+ * replayed) and the queued ones. A key queued again counts once, as queued; on a
+ * time-stamp tie the held entry comes first, as it was queued before.
+ *
+ * @param {Object[]|undefined} queued bucket of the queue index
+ * @param {Object[]|undefined} held bucket of the held index
+ * @returns {Object[]} not to be mutated (it may be one of the buckets)
+ */
+function withHeld(queued, held) {
+    if (!held?.length) {
+        return queued || [];
+    }
+    if (!queued?.length) {
+        return held;
+    }
+    const queuedKeys = new Set(queued.map(({ key }) => key));
+    return [...held.filter(({ key }) => !queuedKeys.has(key)), ...queued].sort(byTimeStamp);
 }
 
 /**
@@ -416,6 +782,35 @@ function getActivityTypesRevision(plugin) {
         activityTypesRevisions.set(plugin, revision);
     }
     return revision;
+}
+
+/**
+ * Per offline plugin instance (the session, as above), the ids of the activity
+ * types the last successful warm-up read, in the server's order (`sequence, id`).
+ * Ids only: the labels stay in the framework relational-field cache. They select
+ * and order the cached types the activity sheet offers, so a type archived or set
+ * up for another model, which the cache keeps once a lead or another app has
+ * cached it, is not offered.
+ *
+ * @type {WeakMap<OfflinePlugin, number[]>}
+ */
+const warmedActivityTypeIds = new WeakMap();
+
+/**
+ * Reads the activity types usable on leads (active, generic or `crm.lead`) from
+ * the server, in the model's order (`sequence, id`). The warm-up and the online
+ * read without relational-field cache share it, so both offer the same types.
+ *
+ * @param {Object} orm the ORM service
+ * @returns {Promise<{id: number, display_name: string}[]>}
+ */
+async function readLeadActivityTypes(orm) {
+    const { records } = await orm.webSearchRead(
+        "mail.activity.type",
+        [["res_model", "in", [false, "crm.lead"]]],
+        { specification: { display_name: {} } }
+    );
+    return records;
 }
 
 // -----------------------------------------------------------------------------
@@ -459,6 +854,359 @@ export function crmOwnEffectPromise(result) {
 }
 
 // -----------------------------------------------------------------------------
+// Replay: one delivery per queued CRM call
+// -----------------------------------------------------------------------------
+
+/**
+ * Models whose queued calls the framework replay (`OfflinePlugin._syncORM`) sends
+ * through `crmReplayCall`. Calls of every other model are replayed unchanged.
+ */
+const CRM_REPLAY_MODELS = freezeSet(["crm.lead", "crm.stage", "crm.team", "mail.activity"]);
+
+/** Offline plugin instances whose replay goes through `crmReplayCall`. */
+const crmReplayPlugins = new WeakSet();
+
+/**
+ * Context key of the delivery key a quick create sends with its lead create, online
+ * and in its queued replay alike. The framework replay is at-least-once (a create
+ * whose answer is lost stays queued and is sent again), so the server's `crm.lead`
+ * `web_save` registers the key with the lead it creates and answers any later
+ * delivery of that key with this lead instead of creating another one.
+ */
+export const CRM_OFFLINE_CREATE_KEY = "crm_offline_create_key";
+
+/**
+ * A new delivery key (`CRM_OFFLINE_CREATE_KEY`): 128 random bits as 32 lowercase
+ * hexadecimal digits, the format the server accepts. `crypto.getRandomValues` is
+ * available on every origin, unlike `crypto.randomUUID` (secure contexts only),
+ * and a non-secure origin still sends the key with its online save.
+ *
+ * @returns {string}
+ */
+function newCrmOfflineCreateKey() {
+    let key = "";
+    for (const byte of crypto.getRandomValues(new Uint8Array(16))) {
+        key += byte.toString(16).padStart(2, "0");
+    }
+    return key;
+}
+
+/**
+ * Removes a replayed call from the offline store and waits until it is removed.
+ * The call was delivered, so a failure is reported and does not reject: a rejected
+ * call would be parked as refused.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {string} key
+ */
+async function removeReplayedFromStore(plugin, key) {
+    try {
+        await plugin._idb.delete(OfflinePlugin.ORM_SYNC_TABLE_NAME, key);
+    } catch (error) {
+        crmReportError(error);
+    }
+}
+
+/**
+ * Sends a call of the framework replay, which takes the cross-tab replay lock,
+ * sends each queued call through its plugin's silent ORM and only starts the
+ * removal of a delivered one from the offline store. When the last call is
+ * delivered it releases the lock at once, so another tab taking it could still
+ * read that call and send it again. So a delivered call of `CRM_REPLAY_MODELS`
+ * (found by its `args`, the very array the replay sends) resolves only once it
+ * has left the offline store, before the replay can release the lock.
+ *
+ * Every other outcome is the framework's: the call is sent unchanged, a lost
+ * connection stops the replay and keeps the entry, and any other error parks it.
+ * A lead create whose answer is lost is therefore sent again, verbatim: it carries
+ * the delivery key of its quick create (`CRM_OFFLINE_CREATE_KEY`), by which the
+ * server answers a create it already made instead of making it twice.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {Object} silentOrm the plugin's silent ORM, with the settings of the ORM
+ *  the call is made on
+ * @param {string} model
+ * @param {string} method
+ * @param {any[]} args
+ * @param {Object} kwargs
+ */
+async function crmReplayCall(plugin, silentOrm, model, method, args, kwargs) {
+    const entry =
+        CRM_REPLAY_MODELS.has(model) &&
+        Object.values(plugin._ormToSync()).find(
+            ({ value }) => value.args === args && value.model === model && value.method === method
+        );
+    if (!entry) {
+        return silentOrm.call(model, method, args, kwargs);
+    }
+    const result = await silentOrm.call(model, method, args, kwargs);
+    await removeReplayedFromStore(plugin, entry.key);
+    return result;
+}
+
+/**
+ * Makes the framework replay of `plugin` send its calls through `crmReplayCall`,
+ * once per plugin instance. The replay reads `plugin.orm.silent` for each call; the
+ * replacement ORM inherits everything else from the plugin's own. A call is sent
+ * through the ORM it is made on, so an ORM derived from the replacement keeps its
+ * settings: the cache options of `plugin.orm.silent.cache(...)`, through which the
+ * CRM lead form refreshes its cached reads after a replay, still write the cache.
+ *
+ * @param {OfflinePlugin} plugin
+ */
+function installCrmReplay(plugin) {
+    if (crmReplayPlugins.has(plugin)) {
+        return;
+    }
+    crmReplayPlugins.add(plugin);
+    const orm = plugin.orm;
+    plugin.orm = Object.create(orm, {
+        silent: {
+            get() {
+                const silentOrm = orm.silent;
+                const send = silentOrm.call;
+                return Object.assign(Object.create(silentOrm), {
+                    call(model, method, args, kwargs) {
+                        // `this`: this ORM, or one derived from it (`cache()`).
+                        const callOrm = Object.create(this, { call: { value: send } });
+                        return crmReplayCall(plugin, callOrm, model, method, args, kwargs);
+                    },
+                });
+            },
+        },
+    });
+}
+
+patch(OfflinePlugin.prototype, {
+    /** Replays the queue with the CRM delivery guarantees of `crmReplayCall`. */
+    async _syncORM() {
+        installCrmReplay(this);
+        return super._syncORM(...arguments);
+    },
+});
+
+// -----------------------------------------------------------------------------
+// Keyboard focus of the mobile pipeline and its bottom sheets
+// -----------------------------------------------------------------------------
+
+/**
+ * Focuses the first candidate that takes the focus: one in the document, not
+ * disabled, not inert, and displayed (a hidden element refuses the focus).
+ *
+ * @param {Iterable<HTMLElement|null|undefined>} candidates
+ * @returns {boolean} whether one of them was focused
+ */
+export function crmFocusFirst(candidates) {
+    for (const el of candidates) {
+        if (!el?.isConnected || el.matches(":disabled") || el.closest("[inert]")) {
+            continue;
+        }
+        el.focus();
+        if (document.activeElement === el) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Gives the focus back from a closing bottom sheet (the `onClose` of its opener)
+ * to the first usable candidate, typically the control that opened it. The focus
+ * is taken only from a bottom sheet or from the body it falls back to: focus the
+ * user moved elsewhere is left alone.
+ *
+ * @param {Iterable<HTMLElement|null|undefined>} candidates
+ * @returns {boolean} whether one of them was focused
+ */
+export function crmReturnFocusFromSheet(candidates) {
+    const active = document.activeElement;
+    if (active && active !== document.body && !active.closest(".o_bottom_sheet")) {
+        return false;
+    }
+    return crmFocusFirst(candidates);
+}
+
+/**
+ * Keyboard focus of a mobile bottom sheet's content (`rootRef`, given
+ * `tabindex="-1"` so a pointer inside it keeps the focus in the sheet):
+ * - once mounted, the sheet's heading (`headingRef`, `tabindex="-1"`) takes the
+ *   focus. It is focused before the sheet becomes the UI active element, whose
+ *   activation would otherwise focus the first control, which can be an input
+ *   raising the phone keyboard over the sheet's slide-in;
+ * - the sheet is the UI active element while it is open: Tab and Shift+Tab cycle
+ *   through its controls, and hotkeys of the page behind it are not dispatched;
+ * - from the sheet itself or its heading, which precede every control, Tab
+ *   reaches the first control and Shift+Tab wraps to the last one (the active
+ *   element only wraps from the first and the last controls).
+ *
+ * Returning the focus on close is the opener's (`crmReturnFocusFromSheet`).
+ *
+ * @param {() => HTMLElement|null} rootRef
+ * @param {() => HTMLElement|null} headingRef
+ */
+export function useCrmSheetFocus(rootRef, headingRef) {
+    const focusHeading = () => headingRef()?.focus({ preventScroll: true });
+    const onKeydown = (ev) => {
+        const hotkey = getActiveHotkey(ev);
+        if (hotkey !== "tab" && hotkey !== "shift+tab") {
+            return;
+        }
+        const tabables = getTabableElements(ev.currentTarget);
+        if (!tabables.length || tabables.includes(document.activeElement)) {
+            return;
+        }
+        ev.preventDefault();
+        (hotkey === "tab" ? tabables[0] : tabables.at(-1)).focus();
+    };
+    let listenedEl = null;
+    onMounted(() => {
+        focusHeading();
+        listenedEl = rootRef();
+        listenedEl?.addEventListener("keydown", onKeydown);
+    });
+    onWillUnmount(() => listenedEl?.removeEventListener("keydown", onKeydown));
+    useActiveElement(rootRef);
+    // A sheet without any enabled control: its activation focused the sheet itself.
+    onMounted(() => {
+        if (document.activeElement === rootRef()) {
+            focusHeading();
+        }
+    });
+}
+
+/**
+ * Focus kept as `useCrmFocusKeeper` found it before a patch.
+ *
+ * @typedef {{el: HTMLElement, info: Object}} CrmLostFocus
+ */
+
+/**
+ * Keeps the keyboard focus on a usable control of a mobile component when one of
+ * its own patches disables or removes the focused control (which leaves the focus
+ * on the body). Only focus that was inside `rootRef` before the patch is kept, so
+ * the focus is never taken from elsewhere.
+ *
+ * - `describe(el, root)` runs before the patch for the focused element, and returns
+ *   what `candidates` needs to know about it, or `null` to keep nothing;
+ * - `candidates({el, info}, root)` runs after a patch that lost the focus, and
+ *   returns the elements to focus, in order of preference. The lost element comes
+ *   first anyway: re-enabled, it takes the focus back.
+ *
+ * A focused control left disabled and `aria-busy="true"` (a running request) is
+ * waited for. Meanwhile the focus is parked on `park(lost, root)`, an element of
+ * the root taking the focus (such as a heading with `tabindex="-1"`), so that it
+ * never sits on the body, from which Tab would leave the component (a bottom
+ * sheet's Tab trap only sees keys pressed inside it). The first patch where the
+ * control is no longer busy resolves the wait, as above, but only while the focus
+ * is still on the park element (or on the body, without one): focus the user
+ * moved elsewhere meanwhile is never taken back.
+ *
+ * @param {() => HTMLElement|null} rootRef
+ * @param {{
+ *  describe?: (el: HTMLElement, root: HTMLElement) => Object|null,
+ *  candidates: (lost: CrmLostFocus, root: HTMLElement) => Array<HTMLElement|null|undefined>,
+ *  park?: (lost: CrmLostFocus, root: HTMLElement) => HTMLElement|null|undefined,
+ * }} params
+ */
+export function useCrmFocusKeeper(rootRef, { describe = () => ({}), candidates, park }) {
+    /** @type {CrmLostFocus|null} focus inside the root before the running patch */
+    let focused = null;
+    /**
+     * Busy control that lost the focus at a previous patch, and the element the
+     * focus was parked on meanwhile (`null` when none could take it).
+     *
+     * @type {(CrmLostFocus & {park: HTMLElement|null})|null}
+     */
+    let waiting = null;
+    function stopWaiting() {
+        waiting?.park?.removeEventListener("blur", onParkBlur);
+        waiting = null;
+    }
+    // The focus moved from the park element to another one: the user moved it, so
+    // the wait is dropped. A blur without a new target (the window losing the
+    // focus, the element leaving the page) keeps it.
+    function onParkBlur(ev) {
+        if (ev.relatedTarget) {
+            stopWaiting();
+        }
+    }
+    /**
+     * Waits for a busy control, with the focus parked on `parkedOn` when it is
+     * there already, else on the park element, which takes it without scrolling
+     * (the sheet's heading of a long list stays out of sight).
+     *
+     * @param {CrmLostFocus} lost
+     * @param {HTMLElement|null} root
+     * @param {HTMLElement|null} parkedOn
+     */
+    const wait = (lost, root, parkedOn) => {
+        let parkEl = parkedOn;
+        if (!parkEl && park && root) {
+            const el = park(lost, root);
+            if (el?.isConnected && root.contains(el) && !el.closest("[inert]")) {
+                el.focus({ preventScroll: true });
+                parkEl = document.activeElement === el ? el : null;
+            }
+        }
+        waiting = { el: lost.el, info: lost.info, park: parkEl };
+        parkEl?.addEventListener("blur", onParkBlur);
+    };
+    const isOnBody = (active) => !active || active === document.body;
+    onWillPatch(() => {
+        focused = null;
+        const root = rootRef();
+        const active = document.activeElement;
+        if (waiting) {
+            if (isOnBody(active) || active === waiting.park || active === waiting.el) {
+                // The focus has not moved since the control lost it: the wait
+                // carries over this patch, and the park element holding the focus
+                // is never taken for a control that lost it.
+                return;
+            }
+            stopWaiting();
+        }
+        if (root && !isOnBody(active) && root.contains(active)) {
+            const info = describe(active, root);
+            if (info) {
+                focused = { el: active, info };
+            }
+        }
+    });
+    onPatched(() => {
+        const active = document.activeElement;
+        let lost = focused;
+        focused = null;
+        /** @type {HTMLElement|null} park element that still has the focus */
+        let parkedOn = null;
+        if (waiting) {
+            const pending = waiting;
+            stopWaiting();
+            if (!lost && (isOnBody(active) || active === pending.park || active === pending.el)) {
+                lost = pending;
+                parkedOn = pending.park && active === pending.park ? pending.park : null;
+            }
+        }
+        const isLost =
+            lost &&
+            (isOnBody(active) ||
+                Boolean(parkedOn) ||
+                (active === lost.el && (!active.isConnected || active.matches(":disabled"))));
+        if (!isLost) {
+            return;
+        }
+        const root = rootRef();
+        if (lost.el.isConnected && lost.el.getAttribute("aria-busy") === "true") {
+            wait(lost, root, parkedOn);
+            return;
+        }
+        if (root) {
+            crmFocusFirst([lost.el, ...candidates(lost, root)]);
+        }
+    });
+    onWillUnmount(stopWaiting);
+}
+
+// -----------------------------------------------------------------------------
 // useCrmOffline
 // -----------------------------------------------------------------------------
 
@@ -471,12 +1219,17 @@ export function useCrmOffline() {
     const ui = useService("ui");
     const orm = useService("orm");
     const env = useEnv();
+    // Capturing starts with the first CRM component of the session (`getReplayHold`).
+    const hold = getReplayHold(plugin);
 
     const isOffline = () => plugin.isOffline();
 
-    /** @param {string} model */
-    const queuedEntries = (model) =>
-        Object.values(plugin._ormToSync()).filter(({ value }) => value?.model === model);
+    /**
+     * Queued entries of a model, in queue order: a new array on each call.
+     *
+     * @param {string} model
+     */
+    const queuedEntries = (model) => [...(readQueueIndex(plugin).byModel.get(model) || [])];
 
     /**
      * A `Record.offlineId` survives the replay of its entry, so a key is pending
@@ -486,10 +1239,8 @@ export function useCrmOffline() {
      */
     const isQueued = (key) => key !== undefined && key !== null && key in plugin._ormToSync();
 
-    const leadWrites = (record) =>
-        record
-            ? queuedEntries(record.resModel).filter((entry) => isLeadWriteOf(entry, record))
-            : [];
+    /** Queued lead writes of `record` (`leadWritesIn`), in replay order. */
+    const leadWrites = (record) => (record ? leadWritesIn(readQueueIndex(plugin), record) : []);
 
     /**
      * Adds a call to the framework queue (replayed in `extras.timeStamp` order)
@@ -537,8 +1288,38 @@ export function useCrmOffline() {
         }
     };
 
+    /**
+     * Every lead stage of the framework relational-field cache, read without a
+     * request (online and offline), in the cache's (id) order; `[]` when none is
+     * cached, as outside a secure context, where the framework caches nothing.
+     * An entry without a name (removed while it was read) is left out.
+     *
+     * @returns {Promise<{id: number, display_name: string}[]>}
+     */
+    const getCachedStages = async () => {
+        // Not `searchMany2XRecords`: that autocomplete search returns its first page only.
+        const keys =
+            (await plugin._idb.getAllKeys(OfflinePlugin.MANY2X_TABLE_PREFIX + "crm.stage")) || [];
+        if (!keys.length) {
+            return [];
+        }
+        const stages = (await plugin.readMany2XRecords("crm.stage", keys)) || [];
+        return stages.filter((stage) => stage.display_name);
+    };
+
     return {
         isOffline,
+
+        /**
+         * Offline where the framework queue cannot hold a call (a non-secure
+         * origin, `isCrmOfflineQueueUsable`): a control whose offline action queues
+         * one then drops `data-available-offline`, so the framework disables it with
+         * its `o_disabled_offline` state and re-enables it online. Always `false`
+         * online and in a secure context, where those controls are unchanged.
+         */
+        isOfflineQueueBlocked() {
+            return isOffline() && !isCrmOfflineQueueUsable();
+        },
 
         /** Small-screen (mobile) layout, read live on every access. */
         get isSmall() {
@@ -586,7 +1367,8 @@ export function useCrmOffline() {
          * are `{id, display_name}`; a field the record did not load is `undefined`.
          * Returns `null` while a pending (not parked) delete or archive hides it.
          * A queued save whose `extras.changes` is not a field-value mapping is
-         * ignored: the values it would display are left as they were.
+         * ignored: the values it would display are left as they were. The writes the
+         * replay has just sent stay applied until the view reloads (`holdReplayed`).
          *
          * @param {Object} record
          * @returns {Object|null}
@@ -601,7 +1383,13 @@ export function useCrmOffline() {
                     values[fieldName] = record.data[fieldName];
                 }
             }
-            for (const entry of leadWrites(record).sort(byTimeStamp)) {
+            let writes = leadWrites(record);
+            const heldWrites = leadWritesIn(readHeldIndex(plugin), record);
+            if (heldWrites.length) {
+                // Stable: on a time-stamp tie the replayed write applies first.
+                writes = [...heldWrites, ...writes].sort(byTimeStamp);
+            }
+            for (const entry of writes) {
                 const { method, extras } = entry.value;
                 if (method === "web_save") {
                     const changes = isFieldMapping(extras?.changes) ? extras.changes : {};
@@ -627,63 +1415,68 @@ export function useCrmOffline() {
          * Leads created offline (queued `web_save` without id) in a stage, in
          * replay order, as provisional card data. Entries that are not creations
          * (target ids other than an empty array, values not a mapping) are ignored.
+         * A creation the replay has just sent stays listed, never parked, until the
+         * view reloads and shows the created lead (`holdReplayed`).
          *
          * @param {number|false} stageId
          */
         pendingCreates(stageId) {
-            return queuedEntries("crm.lead")
-                .filter(({ value }) => isCreateSave(value) && value.args[1].stage_id === stageId)
-                .sort(byTimeStamp)
-                .map((entry) => {
-                    const { args, extras } = entry.value;
-                    const source = isFieldMapping(extras?.changes) ? extras.changes : args[1];
-                    return {
-                        key: entry.key,
-                        name: source.name,
-                        contact_name: source.contact_name,
-                        partner_id: source.partner_id,
-                        expected_revenue: source.expected_revenue,
-                        stage_id: source.stage_id,
-                        parked: isParked(entry),
-                    };
-                });
+            const entries = withHeld(
+                readQueueIndex(plugin).leadCreatesByStage.get(stageId),
+                readHeldIndex(plugin).leadCreatesByStage.get(stageId)
+            );
+            return entries.map((entry) => {
+                const { args, extras } = entry.value;
+                const source = isFieldMapping(extras?.changes) ? extras.changes : args[1];
+                return {
+                    key: entry.key,
+                    name: source.name,
+                    contact_name: source.contact_name,
+                    partner_id: source.partner_id,
+                    expected_revenue: source.expected_revenue,
+                    stage_id: source.stage_id,
+                    parked: isParked(entry),
+                };
+            });
         },
 
         /**
          * Activities scheduled offline on a lead, in replay order. `activity_type_id`
-         * and `user_id` are ids, `date_deadline` a "YYYY-MM-DD" string.
+         * and `user_id` are ids, `date_deadline` a "YYYY-MM-DD" string. An activity
+         * the replay has just created stays listed, never parked, until the opener
+         * reloads the lead with it (`holdReplayed`).
          *
          * @param {number} leadId
          */
         pendingActivities(leadId) {
-            return queuedEntries("mail.activity")
-                .filter(({ value }) => {
-                    const vals = value.method === "create" && value.args?.[0]?.[0];
-                    return Boolean(vals) && vals.res_model === "crm.lead" && vals.res_id === leadId;
-                })
-                .sort(byTimeStamp)
-                .map((entry) => {
-                    const vals = entry.value.args[0][0];
-                    return {
-                        key: entry.key,
-                        summary: vals.summary,
-                        date_deadline: vals.date_deadline,
-                        activity_type_id: vals.activity_type_id,
-                        user_id: vals.user_id,
-                        parked: isParked(entry),
-                    };
-                });
+            const entries = withHeld(
+                readQueueIndex(plugin).activityCreatesByLead.get(leadId),
+                readHeldIndex(plugin).activityCreatesByLead.get(leadId)
+            );
+            return entries.map((entry) => {
+                const vals = entry.value.args[0][0];
+                return {
+                    key: entry.key,
+                    summary: vals.summary,
+                    date_deadline: vals.date_deadline,
+                    activity_type_id: vals.activity_type_id,
+                    user_id: vals.user_id,
+                    parked: isParked(entry),
+                };
+            });
         },
 
         /**
-         * Whether "mark done" of this activity waits in the queue.
+         * Whether "mark done" of this activity waits in the queue, or was just
+         * replayed and the opener has not reloaded the lead without it yet
+         * (`holdReplayed`).
          *
          * @param {number} activityId
          */
         isActivityDonePending(activityId) {
-            return queuedEntries("mail.activity").some(
-                ({ value }) => value.method === "action_done" && targetsRecord(value, activityId)
-            );
+            const queued = readQueueIndex(plugin).doneActivityIds;
+            const held = readHeldIndex(plugin).doneActivityIds;
+            return Boolean(activityId) && (queued.has(activityId) || held.has(activityId));
         },
 
         /**
@@ -780,7 +1573,8 @@ export function useCrmOffline() {
 
         /**
          * Online only: caches the lead activity types in the framework
-         * relational-field cache so the activity sheet works offline, then bumps
+         * relational-field cache so the activity sheet works offline, remembers
+         * their ids in the server's order for this session, then bumps
          * `activityTypesRevision()` so an open sheet reads them. After a success it
          * does nothing more in this session. A failure is ignored and clears the
          * session flag, so the next eligible call in the same session (a later
@@ -792,12 +1586,12 @@ export function useCrmOffline() {
             }
             warmedActivityTypes.add(plugin);
             try {
-                const result = await orm.webSearchRead(
-                    "mail.activity.type",
-                    [["res_model", "in", [false, "crm.lead"]]],
-                    { specification: { display_name: {} } }
+                const records = await readLeadActivityTypes(orm);
+                await plugin.cacheMany2XSearch("mail.activity.type", records);
+                warmedActivityTypeIds.set(
+                    plugin,
+                    records.map(({ id }) => id)
                 );
-                await plugin.cacheMany2XSearch("mail.activity.type", result.records);
                 const revision = getActivityTypesRevision(plugin);
                 revision.set(untrack(revision) + 1);
             } catch {
@@ -816,9 +1610,88 @@ export function useCrmOffline() {
             return getActivityTypesRevision(plugin)();
         },
 
-        /** @returns {Promise<{id: number, display_name: string}[]>} cached activity types */
+        /**
+         * Activity types the sheet offers, first one first:
+         * - once this session's warm-up succeeded: the cached types it read, in
+         *   its order (`sequence, id`), so a cached type it left out (archived, or
+         *   set up for another model) is not offered;
+         * - before that: every cached type, in the cache's (id) order;
+         * - without relational-field cache (a non-secure context, or no cache
+         *   secret in the session): online, the types read from the server as the
+         *   warm-up reads them, `[]` when that read fails; offline, `[]`.
+         * Online with the cache, and offline, no RPC is issued.
+         *
+         * @returns {Promise<{id: number, display_name: string}[]>}
+         */
         async getActivityTypes() {
-            return (await plugin.searchMany2XRecords("mail.activity.type", "")) || [];
+            const cached = await plugin.searchMany2XRecords("mail.activity.type", "");
+            if (cached === undefined) {
+                if (isOffline()) {
+                    return [];
+                }
+                try {
+                    const records = await readLeadActivityTypes(orm);
+                    return records.map(({ id, display_name }) => ({ id, display_name }));
+                } catch {
+                    return [];
+                }
+            }
+            const warmedIds = warmedActivityTypeIds.get(plugin);
+            if (!warmedIds) {
+                return cached;
+            }
+            const typesById = new Map(cached.map((type) => [type.id, type]));
+            // The cache search returns a bounded number of rows: the warmed types it
+            // did not return are read by id; an id absent from the cache has no label.
+            const missingIds = warmedIds.filter((id) => !typesById.has(id));
+            if (missingIds.length) {
+                const read = await plugin.readMany2XRecords("mail.activity.type", missingIds);
+                for (const type of read || []) {
+                    if (type.display_name !== undefined) {
+                        typesById.set(type.id, type);
+                    }
+                }
+            }
+            return warmedIds.filter((id) => typesById.has(id)).map((id) => typesById.get(id));
+        },
+
+        getCachedStages,
+
+        /**
+         * Stage choices of an ungrouped lead list: the stages the same list shows
+         * when grouped by stage. Online they are the server's stage groups of the
+         * list's domain and context with group expansion (the sales team's stages
+         * and those of the list's leads, in stage order), stored in the framework
+         * relational-field cache. Offline no request is made: every cached stage
+         * (`getCachedStages()`, in id order, read without a request) is returned
+         * with `cached` set, as when the connection drops during the read. Other
+         * errors propagate.
+         *
+         * @param {Object} list the ungrouped root list
+         * @returns {Promise<{stages: {id: number, display_name: string}[], cached: boolean}>}
+         */
+        async loadStageChoices(list) {
+            if (!isOffline()) {
+                try {
+                    const groups = await orm.formattedReadGroup(
+                        "crm.lead",
+                        list.domain,
+                        ["stage_id"],
+                        [],
+                        { context: { ...list.context, read_group_expand: true } }
+                    );
+                    const stages = groups
+                        .filter((group) => group.stage_id)
+                        .map(({ stage_id: [id, display_name] }) => ({ id, display_name }));
+                    await plugin.cacheMany2XSearch("crm.stage", stages);
+                    return { stages, cached: false };
+                } catch (error) {
+                    if (!(error instanceof ConnectionLostError)) {
+                        throw error;
+                    }
+                }
+            }
+            return { stages: await getCachedStages(), cached: true };
         },
 
         /** @returns {Promise<{id: number, display_name: string}[]>} session user first */
@@ -868,7 +1741,7 @@ export function useCrmOffline() {
          * the lead reload does not (`reloadRecord`).
          *
          * @param {Object} record the lead
-         * @param {{activity_type_id: number, summary: string, date_deadline: string, user_id: number}} vals
+         * @param {{activity_type_id: number, summary: string|false, date_deadline: string, user_id: number}} vals
          */
         async scheduleActivity(record, { activity_type_id, summary, date_deadline, user_id }) {
             const { queued, result } = await run(
@@ -918,17 +1791,24 @@ export function useCrmOffline() {
         },
 
         /**
-         * Create with `list.context`. Offline or connection-loss saves return a queue
-         * key and use `extras.changes` for provisional display. Online save errors
-         * propagate; committed writes resolve even when refresh fails, with errors
-         * reported through `crmReportError`.
+         * Create with `list.context` plus a new delivery key (`CRM_OFFLINE_CREATE_KEY`).
+         * Offline or connection-loss saves return a queue key and use `extras.changes`
+         * for provisional display. The queued create is the call the online save sent,
+         * key included: a save whose answer was lost may have created the lead, and
+         * its replay (any tab, after a reload) is then answered with that lead rather
+         * than creating it twice. Online save errors propagate; committed writes
+         * resolve even when refresh fails, with errors reported through
+         * `crmReportError`.
          *
          * @param {Object} list the pipeline root list
          * @param {Object} vals server values (`stage_id` is an id)
          * @param {Object} extras
          */
         async createLead(list, vals, extras) {
-            const kwargs = { context: list.context, specification: {} };
+            const kwargs = {
+                context: { ...list.context, [CRM_OFFLINE_CREATE_KEY]: newCrmOfflineCreateKey() },
+                specification: {},
+            };
             if (isOffline()) {
                 return queue("crm.lead", "web_save", [[], vals], kwargs, extras);
             }
@@ -1004,6 +1884,101 @@ export function useCrmOffline() {
             });
         },
 
+        /**
+         * Setup only. While this component is mounted, keeps the `crm.lead` and
+         * `mail.activity` entries the replay removes from the queue and `accept`
+         * takes, so that `projectLead`, `pendingCreates`, `pendingActivities` and
+         * `isActivityDonePending` keep showing them (as pending, never parked) until
+         * the component shows what the server now holds. They are released by
+         * `releaseLoaded` once a root loaded from the server, by a load started
+         * after their replay (`markRootLoad`), is shown; when given,
+         * `displayedRoot` is followed, and every root it returns releases at once,
+         * before any render shows it. Unmounting releases everything.
+         *
+         * @param {(entry: {key: string, value: Object}) => boolean} accept called
+         *  untracked, at the replay, for each replayed entry
+         * @param {() => Object} [displayedRoot] the root the component displays,
+         *  read reactively
+         * @returns {{
+         *  holding: () => boolean,
+         *  releaseLoaded: (config: Object|undefined) => void,
+         *  releaseAll: () => void,
+         * }} `holding()` tells whether it holds entries; `releaseLoaded(config)`
+         *  releases those replayed before the load of the root `config` started
+         *  (nothing for a load `markRootLoad` did not give a token)
+         */
+        holdReplayed(accept, displayedRoot) {
+            /** @type {CrmReplayHolder} */
+            const holder = { accept, entries: new Map() };
+            const release = (isReleased) => {
+                let released = false;
+                for (const [key, item] of holder.entries) {
+                    if (isReleased(item)) {
+                        holder.entries.delete(key);
+                        released = true;
+                    }
+                }
+                if (released) {
+                    publishHeld(hold);
+                }
+            };
+            const releaseLoaded = (config) => {
+                const token = config ? toRaw(config)[REPLAY_TOKEN] : null;
+                if (Number.isInteger(token)) {
+                    release(({ seq }) => seq <= token);
+                }
+            };
+            onMounted(() => hold.holders.add(holder));
+            onWillUnmount(() => {
+                hold.holders.delete(holder);
+                if (holder.entries.size) {
+                    holder.entries.clear();
+                    publishHeld(hold);
+                }
+            });
+            if (displayedRoot) {
+                // Immediate: the root prop is set before the render that shows it.
+                const stop = untrack(() =>
+                    immediateEffect(() => {
+                        const root = displayedRoot();
+                        untrack(() => releaseLoaded(root?.config));
+                    })
+                );
+                onWillDestroy(stop);
+            }
+            return {
+                holding: () => holder.entries.size > 0,
+                releaseLoaded,
+                releaseAll: () => release(() => true),
+            };
+        },
+
+        /**
+         * Gives a root load about to start (`onWillLoadRoot`) its replay token: the
+         * number of the last replay capture when the load reads the server only,
+         * i.e. online, after the model's first load, and for a record the one the
+         * model already shows (the relational model's own no-cache rule); none
+         * otherwise (served from, or first answered by, the cache). The token is
+         * stored on `config` (`REPLAY_TOKEN`), which the root keeps.
+         *
+         * @param {Object} model the relational model loading the root
+         * @param {Object} [config] root configuration about to be loaded
+         */
+        markRootLoad(model, config) {
+            if (!config) {
+                return;
+            }
+            untrack(() => {
+                const rawModel = model && toRaw(model);
+                const fromServer =
+                    !plugin.isOffline() &&
+                    Boolean(rawModel?.isReady()) &&
+                    (!config.isMonoRecord ||
+                        (Boolean(config.resId) && rawModel.root?.config.resId === config.resId));
+                toRaw(config)[REPLAY_TOKEN] = fromServer ? hold.seq : null;
+            });
+        },
+
         consumeQuickCreateDeepLink,
     };
 }
@@ -1020,7 +1995,9 @@ patch(ViewButton.prototype, {
 
     /**
      * True for a CRM DISABLE button while offline. Read by the `web.views.ViewButton`
-     * extension (`aria-disabled`, `tabindex`), so `<a>` buttons leave the tab order.
+     * extension (`aria-disabled`, `tabindex`), so `<a>` buttons leave the tab order,
+     * and `data-available-offline` is dropped: the framework would otherwise
+     * re-enable a guarded "Won" on a non-secure origin.
      */
     get crmOfflineGuarded() {
         return (
@@ -1086,7 +2063,7 @@ const ACTION_ID_TEXT = /^\p{White_Space}*[+-]?\p{Nd}+(?:_\p{Nd}+)*\p{White_Space
  *
  * @param {unknown} actionRequest
  * @returns {boolean} whether the request is an action id, as a number or as a
- *  string the server reads as one (the disk-cache key stays the request itself)
+ *  string the server reads as one (identified by the request itself, as given)
  */
 function isActionIdRequest(actionRequest) {
     return (
@@ -1096,74 +2073,42 @@ function isActionIdRequest(actionRequest) {
 }
 
 /**
- * The action service's own `active_ids` URL parsing ("1,2" → [1, 2]).
+ * Identifies an action from what the client already holds, with no request:
+ * offline, a lookup through the action service's disk-cached `loadAction` would
+ * still attempt the network (the RPC cache always does on a RAM miss), so the
+ * guards never call it. Reads the CRM actions the web client itself loaded in this
+ * session (`knownActions`), then the action stored in the session.
  *
- * @param {string|number} ids
- * @returns {number[]}
+ * @param {Map<number|string, Readonly<{xml_id?: string, res_model?: string}>>} knownActions
+ * @param {number|string} actionRef an id, `xml_id` or path, as requested
+ * @returns {Object|null} `null` when unknown
  */
-function parseActiveIds(ids) {
-    if (typeof ids === "string") {
-        return ids.split(",").map(Number);
-    }
-    return typeof ids === "number" ? [ids] : [];
-}
-
-/**
- * The context the action service passes when it loads a URL state's action, so
- * the lookup below reads the same disk-cache entry.
- *
- * @param {Object} state
- */
-function getStateActionContext(state) {
-    const context = {};
-    if (state.active_id) {
-        context.active_id = state.active_id;
-    }
-    if (state.active_ids) {
-        context.active_ids = parseActiveIds(state.active_ids);
-    } else if (state.active_id) {
-        context.active_ids = [state.active_id];
-    }
-    return context;
-}
-
-/**
- * Resolves the action a URL state opens without issuing anything the action
- * service would not issue itself: client actions are skipped, the action stored
- * in the session is reused, otherwise the disk-cached `loadAction` is read.
- *
- * @param {Object} api the action manager
- * @param {Object} state
- * @param {number|string} actionRef
- * @returns {Promise<Object|null>} `null` when unknown (not cached offline)
- */
-async function resolveStateAction(api, state, actionRef) {
-    const actionRegistry = registry.category("actions");
-    if (
-        actionRegistry.contains(actionRef) ||
-        actionRegistry.getEntries().some(([, clientAction]) => clientAction.path === actionRef)
-    ) {
-        return null;
+function resolveKnownAction(knownActions, actionRef) {
+    const known = knownActions.get(actionRef);
+    if (known) {
+        return known;
     }
     try {
         const stored = JSON.parse(browser.sessionStorage.getItem("current_action") || "{}");
         if ([stored.id, stored.path, stored.xml_id].filter(Boolean).includes(actionRef)) {
             return stored;
         }
-        return await api.loadAction(actionRef, getStateActionContext(state));
+        return null;
     } catch {
+        // An unreadable stored action identifies nothing.
         return null;
     }
 }
 
 /**
- * Whether a URL state opens a disabled action or a blocked CRM view type.
+ * Whether a URL state opens a disabled action or a blocked CRM view type, from
+ * the actions the client already holds (`resolveKnownAction`).
  *
- * @param {Object} api the action manager
+ * @param {Map<number|string, Readonly<{xml_id?: string, res_model?: string}>>} knownActions
  * @param {Object} [state]
- * @returns {Promise<boolean>}
+ * @returns {boolean}
  */
-async function isBlockedRouterState(api, state) {
+function isBlockedRouterState(knownActions, state) {
     if (!state) {
         return false;
     }
@@ -1174,7 +2119,7 @@ async function isBlockedRouterState(api, state) {
         if (CRM_OFFLINE_DISABLED_ACTIONS.has(actionRef)) {
             return true;
         }
-        const action = await resolveStateAction(api, state, actionRef);
+        const action = resolveKnownAction(knownActions, actionRef);
         if (CRM_OFFLINE_DISABLED_ACTIONS.has(action?.xml_id)) {
             return true;
         }
@@ -1189,11 +2134,51 @@ async function isBlockedRouterState(api, state) {
  * and its internal calls go through closures, which the view-mount guard below
  * covers. Online each wrapper returns the original's own promise.
  *
+ * Offline, actions requested by id or by URL state are identified only from data
+ * the client already holds, so the guards issue no request: the descriptors of
+ * the CRM actions found in the web client's own `/web/action/load` responses, and
+ * the action stored in the session. This index answers the guards' predicates,
+ * never a load. A request it cannot identify goes to the original, whose load
+ * fails like that of any uncached action, and the view-mount guard still stops
+ * any CRM target.
+ *
  * @param {Object} api the action manager returned by `actionService.start`
  * @param {OfflinePlugin} offlinePlugin
  */
 function guardActionManager(api, offlinePlugin) {
     const { doAction, doActionButton, switchView, loadState } = api;
+
+    /** Keyed by every reference a loaded CRM action answers to; other actions are never kept. */
+    const knownActions = new Map();
+    /** Payloads of the pending `/web/action/load` requests (their responses carry no URL). */
+    const actionLoads = new WeakSet();
+    useListener(rpcBus, "RPC:REQUEST", ({ detail }) => {
+        if (detail.url === "/web/action/load") {
+            actionLoads.add(detail.data);
+        }
+    });
+    useListener(rpcBus, "RPC:RESPONSE", ({ detail }) => {
+        const { data, result } = detail;
+        if (!actionLoads.delete(data) || !result || typeof result !== "object") {
+            return;
+        }
+        const isCrmAction =
+            CRM_OFFLINE_DISABLED_ACTIONS.has(result.xml_id) ||
+            CRM_OFFLINE_BLOCKED_VIEW_MODELS.has(result.res_model);
+        const descriptor = isCrmAction
+            ? Object.freeze({ xml_id: result.xml_id, res_model: result.res_model })
+            : null;
+        for (const key of [data.params?.action_id, result.id, result.path, result.xml_id]) {
+            if (!key) {
+                continue;
+            }
+            if (descriptor) {
+                knownActions.set(key, descriptor);
+            } else {
+                knownActions.delete(key);
+            }
+        }
+    });
 
     api.doActionButton = function crmOfflineDoActionButton(...args) {
         const [params] = args;
@@ -1210,28 +2195,22 @@ function guardActionManager(api, offlinePlugin) {
     };
 
     api.doAction = function crmOfflineDoAction(...args) {
-        const [actionRequest, options] = args;
+        const [actionRequest] = args;
         if (isDisabledActionRequest(actionRequest)) {
             if (offlinePlugin.isOffline()) {
                 return Promise.resolve();
             }
-        } else if (isActionIdRequest(actionRequest) && offlinePlugin.isOffline()) {
-            // An id (a number or a numeric string) is identified through the
-            // disk-cached action, looked up with the request as given so the cache
-            // key is the original's; an uncached one cannot be, and goes to the
-            // original (whose load fails like any other).
-            return api
-                .loadAction(actionRequest, options?.additionalContext)
-                .catch(() => null)
-                .then((action) => {
-                    if (
-                        CRM_OFFLINE_DISABLED_ACTIONS.has(action?.xml_id) &&
-                        offlinePlugin.isOffline()
-                    ) {
-                        return;
-                    }
-                    return doAction.apply(this, args);
-                });
+        } else if (
+            isActionIdRequest(actionRequest) &&
+            offlinePlugin.isOffline() &&
+            // An id (a number or a numeric string) is identified, as requested, from
+            // the actions the client already holds, with no request; an unknown one
+            // goes to the original (whose load fails like any other).
+            CRM_OFFLINE_DISABLED_ACTIONS.has(
+                resolveKnownAction(knownActions, actionRequest)?.xml_id
+            )
+        ) {
+            return Promise.resolve();
         }
         return doAction.apply(this, args);
     };
@@ -1248,14 +2227,14 @@ function guardActionManager(api, offlinePlugin) {
     };
 
     api.loadState = function crmOfflineLoadState(...args) {
-        if (!offlinePlugin.isOffline()) {
-            return loadState.apply(this, args);
-        }
-        const state = args[0] === undefined ? router.current : args[0];
-        return isBlockedRouterState(api, state).then((blocked) =>
+        if (
+            offlinePlugin.isOffline() &&
+            isBlockedRouterState(knownActions, args[0] === undefined ? router.current : args[0])
+        ) {
             // `false`: the web client opens the menu's or the default app instead.
-            blocked && offlinePlugin.isOffline() ? false : loadState.apply(this, args)
-        );
+            return Promise.resolve(false);
+        }
+        return loadState.apply(this, args);
     };
 }
 
@@ -1270,7 +2249,7 @@ patch(actionService, {
 });
 
 // -----------------------------------------------------------------------------
-// Guard: navbar menus (menu service)
+// Guard: navbar menus (menu service and navbar entries)
 // -----------------------------------------------------------------------------
 
 patch(menuService, {
@@ -1288,6 +2267,109 @@ patch(menuService, {
             return selectMenu.apply(api, args);
         };
         return api;
+    },
+});
+
+/**
+ * DOM state of the same entries. The framework dims a navbar entry offline from the
+ * visited registry, which holds an action once any of its views was visited (a lead
+ * form opened from the forecast, a report's list), so it would render the entries
+ * the guard above stops as available. Online, and for every other entry, the
+ * framework's value is kept.
+ */
+patch(NavBar.prototype, {
+    _isAvailable(menu) {
+        if (this.offlinePlugin.isOffline() && CRM_OFFLINE_DISABLED_MENUS.has(menu?.xmlid)) {
+            return false;
+        }
+        return super._isAvailable(...arguments);
+    },
+
+    /**
+     * Read by the `web.SectionMenu` extension: a leaf entry of the CRM app's phone
+     * sidebar renders unavailable offline exactly when its desktop dropdown item is
+     * dimmed. Other apps' entries are left as the framework renders them.
+     *
+     * @param {Object} section a menu of the menu service
+     * @returns {boolean}
+     */
+    crmOfflineSectionDisabled(section) {
+        return (
+            this.offlinePlugin.isOffline() &&
+            this.menuService.getMenu(section.appID)?.xmlid === "crm.crm_menu_root" &&
+            !this._isAvailable(section)
+        );
+    },
+});
+
+// -----------------------------------------------------------------------------
+// Fallback: lead view descriptions cached by a wide-layout visit
+// -----------------------------------------------------------------------------
+
+/**
+ * Whether an ORM call loads `crm.lead` view descriptions for the small-screen
+ * layout: the view service adds `options.mobile` to `get_views` on a small screen.
+ *
+ * @param {string} model
+ * @param {string} method
+ * @param {Object} [kwargs]
+ * @returns {boolean}
+ */
+function isLeadSmallScreenGetViews(model, method, kwargs) {
+    return model === "crm.lead" && method === "get_views" && kwargs?.options?.mobile === true;
+}
+
+/**
+ * The ORM the view service loads view descriptions with, where `cache()` returns
+ * a cached ORM whose small-screen lead `get_views`, started offline and failed
+ * with a lost connection, is issued once more through that same cached ORM
+ * without `options.mobile`. Every other call and outcome is the original one.
+ *
+ * @param {Object} orm the view service's `orm` dependency
+ * @param {OfflinePlugin} offlinePlugin
+ * @returns {Object}
+ */
+function withLeadViewsFallback(orm, offlinePlugin) {
+    return Object.assign(Object.create(orm), {
+        cache(...cacheArgs) {
+            const cachedOrm = orm.cache(...cacheArgs);
+            return Object.assign(Object.create(cachedOrm), {
+                call(model, method, args, kwargs) {
+                    const startedOffline = offlinePlugin.isOffline();
+                    const result = cachedOrm.call(...arguments);
+                    if (!startedOffline || !isLeadSmallScreenGetViews(model, method, kwargs)) {
+                        return result;
+                    }
+                    const options = omit(kwargs.options, "mobile");
+                    return result.catch((error) => {
+                        if (!(error instanceof ConnectionLostError)) {
+                            throw error;
+                        }
+                        return cachedOrm.call(model, method, args, { ...kwargs, options });
+                    });
+                },
+            });
+        },
+    });
+}
+
+patch(viewService, {
+    /**
+     * The view service caches `get_views` per layout: `options.mobile`, which it
+     * sets on a small screen, is part of the RPC cache key. Offline on a phone, the
+     * lead views a wide-layout visit cached on this device would never be read, so
+     * a lead form visited at that width could not open, nor the pipeline it was
+     * opened from be restored. The view service's ORM therefore issues a failed
+     * offline small-screen lead `get_views` once more without `mobile` (the other
+     * options keep their order, so the request is the one that visit cached).
+     * `mobile` only changes the default mode of x2many sub-views, and the lead form
+     * and pipeline already fall back to the desktop load variant offline. A load
+     * started online keeps the framework's handling of a lost connection.
+     */
+    start(env, deps) {
+        // Resolved synchronously: the service scope only exists during `start`.
+        const offlinePlugin = usePlugin(OfflinePlugin);
+        return super.start(env, { ...deps, orm: withLeadViewsFallback(deps.orm, offlinePlugin) });
     },
 });
 
@@ -1667,6 +2749,28 @@ function guardAutocompleteSource(autocomplete, source) {
     };
 }
 
+/**
+ * Keys of the sources a lead view's autocomplete passes to its AutoComplete: the
+ * first holds that `Many2XAutocomplete` (whose `crmOfflineInlineSearch` the
+ * AutoComplete patch below reads), the second marks a source added through
+ * `otherSources` (e.g. the partner enrichment), as opposed to the record source.
+ */
+const CRM_LEAD_AUTOCOMPLETE = Symbol("crmLeadAutocomplete");
+const CRM_LEAD_EXTRA_SOURCE = Symbol("crmLeadExtraSource");
+
+/**
+ * @param {Many2XAutocomplete} autocomplete
+ * @param {Object} source
+ * @param {boolean} [isExtra]
+ */
+function tagLeadSource(autocomplete, source, isExtra = false) {
+    return {
+        ...source,
+        [CRM_LEAD_AUTOCOMPLETE]: autocomplete,
+        [CRM_LEAD_EXTRA_SOURCE]: isExtra,
+    };
+}
+
 patch(Many2XAutocomplete.prototype, {
     /**
      * True for a lead view's autocomplete while offline. Read by the
@@ -1683,9 +2787,16 @@ patch(Many2XAutocomplete.prototype, {
         }
         if (this.offlinePlugin.isOffline()) {
             // Cached records only: no enrichment source (e.g. partner autocomplete).
-            return [this.optionsSource];
+            return [tagLeadSource(this, this.optionsSource)];
         }
-        return super.sources.map((source) => guardAutocompleteSource(this, source));
+        const { otherSources } = this.props;
+        return super.sources.map((source) =>
+            tagLeadSource(
+                this,
+                guardAutocompleteSource(this, source),
+                otherSources.includes(source)
+            )
+        );
     },
 
     /**
@@ -1727,7 +2838,100 @@ function isInertGuardedOption(option) {
     return Boolean(option?.[CRM_OFFLINE_GUARDED_OPTION] && option.unselectable);
 }
 
+/**
+ * True while the lead autocomplete whose sources `autoComplete` renders is offline
+ * (`crmOfflineInlineSearch`, which reads the connection signal), false for every
+ * other AutoComplete.
+ *
+ * @param {AutoComplete} autoComplete
+ */
+function isLeadAutoCompleteOffline(autoComplete) {
+    return (autoComplete.props.sources || []).some((source) =>
+        Boolean(source?.[CRM_LEAD_AUTOCOMPLETE]?.crmOfflineInlineSearch)
+    );
+}
+
+/** Stores the value assigned to `shouldSearchWorldwide` (see the AutoComplete patch). */
+const CRM_SEARCH_WORLDWIDE = Symbol("crmSearchWorldwide");
+
 patch(AutoComplete.prototype, {
+    /**
+     * The "Search Worldwide" row calls `searchWorldwide(ev)`, which sets the flag
+     * below and closes then reopens the dropdown, reloading its sources. That
+     * handler is defined by the partner autocomplete, an AutoComplete subclass
+     * outside CRM's dependencies that CRM may not import, so its prototype cannot
+     * be patched from here: the handler is wrapped on the instance instead. The
+     * subclass's `setup` calls this one through `super`, so its method already
+     * resolves on the instance. While a lead autocomplete is offline the wrapper
+     * only prevents the event's default action: a direct call opens no dropdown,
+     * reloads no option and changes no state. Otherwise it returns the original's
+     * own result. AutoCompletes without the handler are left unchanged.
+     */
+    setup() {
+        super.setup(...arguments);
+        const { searchWorldwide } = this;
+        if (typeof searchWorldwide !== "function") {
+            return;
+        }
+        this.searchWorldwide = function crmOfflineSearchWorldwide(...args) {
+            if (isLeadAutoCompleteOffline(this)) {
+                args[0]?.preventDefault?.();
+                return Promise.resolve();
+            }
+            return searchWorldwide.apply(this, args);
+        };
+    },
+
+    /**
+     * The partner autocomplete (an AutoComplete subclass outside CRM's
+     * dependencies) renders a "Search Worldwide" row below the options unless this
+     * flag is set, passes the flag to every enrichment lookup, and sets it when that
+     * row is used. The row is part of its template, not a source option, so the
+     * option guards never see it. While a lead autocomplete is offline the flag
+     * reads true, so the row is not rendered, in a dropdown opened online too, and
+     * assigning true is ignored, so a call made offline cannot widen the next online
+     * lookup. Otherwise the assigned value is stored and returned unchanged. Read
+     * during render, so the row follows the connection.
+     */
+    get shouldSearchWorldwide() {
+        return isLeadAutoCompleteOffline(this) || this[CRM_SEARCH_WORLDWIDE];
+    },
+
+    set shouldSearchWorldwide(value) {
+        if (value && isLeadAutoCompleteOffline(this)) {
+            return;
+        }
+        this[CRM_SEARCH_WORLDWIDE] = value;
+    },
+
+    /**
+     * A lookup of a lead autocomplete's added source (enrichment) still pending
+     * when the connection drops can stay pending offline, which would keep its
+     * loading row ("Searching Autocomplete...") shown and selected. Its
+     * `isLoading` reads false while the guard holds and the real state otherwise,
+     * so the row comes back online while the lookup is still pending. The source
+     * proxy's set trap writes through the accessor and re-reads it, so loading
+     * changes still re-render. The record source keeps its own loading row, and
+     * other AutoCompletes' sources are returned unchanged.
+     */
+    makeSource(source) {
+        const made = super.makeSource(...arguments);
+        const autocomplete = source?.[CRM_LEAD_EXTRA_SOURCE] && source[CRM_LEAD_AUTOCOMPLETE];
+        if (!autocomplete) {
+            return made;
+        }
+        let isLoading = made.isLoading;
+        Object.defineProperty(made, "isLoading", {
+            configurable: true,
+            enumerable: true,
+            get: () => !autocomplete.crmOfflineInlineSearch && isLoading,
+            set: (value) => {
+                isLoading = value;
+            },
+        });
+        return made;
+    },
+
     /**
      * `makeOption` replaces `unselectable` with a plain boolean (`!option.onSelect`)
      * computed once, which would leave a guarded lead option selectable after the
@@ -1783,6 +2987,94 @@ patch(AutoComplete.prototype, {
             return undefined;
         }
         return id;
+    },
+});
+
+// -----------------------------------------------------------------------------
+// Guard: CRM wizard and CRM settings forms
+// -----------------------------------------------------------------------------
+
+patch(Record.prototype, {
+    /**
+     * Never queues the save of a CRM transient record (a CRM wizard, the CRM
+     * settings): a save that reaches it offline by any path, such as the settings'
+     * "Unsaved changes" confirmation when leaving the page, fails instead and the
+     * record keeps its changes. The buttons below stop before saving at all.
+     *
+     * @returns {boolean}
+     */
+    _offlineSave() {
+        if (isCrmOfflineTransientForm(this.resModel, this.context)) {
+            return false;
+        }
+        return super._offlineSave(...arguments);
+    },
+});
+
+patch(FormController.prototype, {
+    /**
+     * Offline, stops a button of a CRM wizard or of the CRM settings before the form
+     * saves its record, which would queue a transient `web_save` (such records are
+     * never queued). `special="cancel"` buttons go on, so a wizard's Cancel still
+     * closes it.
+     *
+     * @param {Object} clickParams
+     * @returns {Promise<boolean|undefined>}
+     */
+    beforeExecuteActionButton(clickParams) {
+        if (
+            isCrmOfflineTransientForm(this.props.resModel, this.props.context) &&
+            clickParams?.special !== "cancel" &&
+            this.offlinePlugin.isOffline()
+        ) {
+            return Promise.resolve(false);
+        }
+        return super.beforeExecuteActionButton(...arguments);
+    },
+});
+
+patch(SettingsFormController.prototype, {
+    /**
+     * The settings controller saves its record itself, without the form controller's
+     * method: the same guard on the CRM settings page, every button and the control
+     * panel Save (`execute`) included. Its "cancel" (the control panel Discard) saves
+     * nothing and goes on.
+     *
+     * @param {Object} clickParams
+     * @returns {Promise<boolean|undefined>}
+     */
+    beforeExecuteActionButton(clickParams) {
+        if (
+            isCrmOfflineTransientForm(this.props.resModel, this.props.context) &&
+            clickParams?.name !== "cancel" &&
+            this.offlinePlugin.isOffline()
+        ) {
+            return Promise.resolve(false);
+        }
+        return super.beforeExecuteActionButton(...arguments);
+    },
+});
+
+patch(settingsFormView.Model.prototype, {
+    /**
+     * Offline, skips a reload of the loaded CRM settings page, with no request: the
+     * settings model reads no cache, so its `onchange` would fail, and the dialog whose
+     * closing reloads the page (a wizard opened from a settings button) would stay
+     * open. The page keeps its values. The first load is left to the original: the
+     * view-mount guard already keeps the CRM settings from loading offline.
+     *
+     * @param {Object} [params]
+     * @returns {Promise<void>}
+     */
+    load(params) {
+        if (
+            isCrmOfflineTransientForm(this.config.resModel, this.config.context) &&
+            this.isReady() &&
+            this.offlinePlugin.isOffline()
+        ) {
+            return Promise.resolve();
+        }
+        return super.load(...arguments);
     },
 });
 

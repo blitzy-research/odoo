@@ -11,7 +11,8 @@
         <div t-else=""
             class="o_kanban_renderer o_renderer o_crm_mobile_pipeline"
             t-att-class="{ o_crm_mobile_pipeline_ungrouped: !this.props.list.isGrouped }"
-            t-ref="this.rootRef">
+            t-ref="this.rootRef"
+            t-on-keydown="this.onMobileKeydown">
             <t t-set="stageChoices" t-value="this.stages"/>
             <t t-if="this.isStagePipeline">
                 <t t-set="group" t-value="this.activeGroup"/>
@@ -20,7 +21,7 @@
                     <div class="o_crm_mobile_pipeline_header">
                         <!-- Navigation reads the clamped index: a stale `mobile.activeIndex` past the last stage never blocks it. -->
                         <button type="button"
-                            class="btn btn-light o_crm_mobile_pipeline_prev"
+                            class="btn btn-secondary o_crm_mobile_pipeline_prev"
                             data-available-offline="1"
                             t-att-disabled="!this.hasPreviousStage"
                             aria-label="Previous stage"
@@ -29,9 +30,10 @@
                             <i class="oi oi-chevron-left" aria-hidden="true"/>
                         </button>
                         <div class="o_crm_mobile_pipeline_stage">
-                            <!-- A heading by role, so heading navigation reaches the displayed stage; a <h2> would bring Bootstrap's heading size and margin. -->
-                            <div class="o_crm_mobile_pipeline_stage_name fw-bold" role="heading" aria-level="2" aria-live="polite" t-out="group.displayName"/>
-                            <div class="o_crm_mobile_pipeline_summary">
+                            <!-- A heading by role, so heading navigation reaches the displayed stage; a <h2> would bring Bootstrap's heading size and margin. It takes the focus when no header button can. -->
+                            <div class="o_crm_mobile_pipeline_stage_name fs-4 fw-bold" role="heading" aria-level="2" aria-live="polite" tabindex="-1" t-out="group.displayName"/>
+                            <!-- Bare numbers: assistive technology reads them, labelled, from the status region below, which stays silent for the sample data of an empty pipeline (dimmed by the stylesheet). -->
+                            <div class="o_crm_mobile_pipeline_summary" aria-hidden="true">
                                 <span class="o_crm_mobile_pipeline_count" t-out="stageView.count"/>
                                 <!-- Omit revenue for a filtered count or a root without the revenue aggregate; empty stages use zero. -->
                                 <t t-set="revenue" t-value="stageView.revenue"/>
@@ -43,7 +45,7 @@
                             <span class="visually-hidden o_crm_mobile_pipeline_status" role="status" aria-atomic="true" t-out="this.crmStageStatus(stageView)"/>
                         </div>
                         <button type="button"
-                            class="btn btn-light o_crm_mobile_pipeline_next"
+                            class="btn btn-secondary o_crm_mobile_pipeline_next"
                             data-available-offline="1"
                             t-att-disabled="!this.hasNextStage"
                             aria-label="Next stage"
@@ -51,10 +53,11 @@
                             t-on-click="() => this.goToStage(this.activeIndex + 1)">
                             <i class="oi oi-chevron-right" aria-hidden="true"/>
                         </button>
-                        <!-- The quick create needs no cached onchange: usable offline in every loaded stage. -->
+                        <!-- The quick create needs no cached onchange: usable offline in every loaded stage, unless the offline queue cannot hold its create (non-secure origin). -->
                         <button type="button"
                             class="btn btn-primary o_crm_mobile_pipeline_new"
-                            data-available-offline="1"
+                            t-att-data-available-offline="this.crmOffline.isOfflineQueueBlocked() ? false : '1'"
+                            t-att-aria-label="this.crmNewLeadAriaLabel(group)"
                             t-att-disabled="!this.canQuickCreate()"
                             t-on-click="(ev) => this.openQuickCreate(ev.currentTarget)">New</button>
                     </div>
@@ -74,8 +77,14 @@
                                 <OfflineActionHelper/>
                             </div>
                         </t>
-                        <OfflineActionHelper t-elif="this.isStageUnavailableOffline(group)"/>
                         <t t-else="">
+                            <!-- Each card holds three tab stops: the visually hidden skip link takes the focus to the end marker after the last card, so the next Tab reaches "Load more" and Shift+Tab the last card. The inert sample records of an empty pipeline have no tab stop, so neither frames them; a provisional card is a real lead. -->
+                            <t t-set="hasCards" t-value="(stageView.records.length and !this.props.list.model.useSampleModel) or stageView.pending.length"/>
+                            <button t-if="hasCards"
+                                type="button"
+                                class="btn btn-link visually-hidden-focusable o_crm_mobile_pipeline_skip"
+                                data-available-offline="1"
+                                t-on-click="() => this.crmSkipToEnd()">Skip to the end of the leads</button>
                             <!-- The card calls onOpen(record) and onMoveStage(record, stageId). -->
                             <t t-foreach="stageView.records" t-as="record" t-key="record.resId">
                                 <CrmMobileLeadCard
@@ -96,9 +105,17 @@
                                     onOpen.bind="this.openLead"
                                     onMoveStage.bind="this.moveLead"/>
                             </t>
+                            <div t-if="hasCards"
+                                class="visually-hidden-focusable o_crm_mobile_pipeline_end"
+                                tabindex="-1"
+                                t-ref="this.crmEndRef">End of the leads</div>
+                            <!-- Offline, the stage's uncached leads are explained below any card the pipeline can show: a lead created offline, or one projected into the stage. "Load more" shows online only, so never beside it. -->
+                            <OfflineActionHelper t-if="this.isStageUnavailableOffline(group)"/>
                             <!-- A filtered count of 0 leaves nothing to load, as the header shows. -->
                             <t t-set="unloadedCount" t-value="this.crmGetUnloadedCount(group)"/>
-                            <div t-if="this.showLoadMore(unloadedCount)" class="o_crm_mobile_pipeline_load_more">
+                            <!-- Inert on sample data, as the sample cards are. -->
+                            <div t-if="this.showLoadMore(unloadedCount)" class="o_crm_mobile_pipeline_load_more"
+                                t-att-inert="this.props.list.model.useSampleModel ? '' : false">
                                 <!-- Disabled and busy while its load runs: a repeat click starts no other load. -->
                                 <t t-set="loadingMore" t-value="this.crmLoadingMore.has(group.id)"/>
                                 <button type="button"
@@ -107,6 +124,8 @@
                                     t-att-aria-busy="loadingMore ? 'true' : false"
                                     t-on-click="() => this.crmLoadMore(group)"><i t-if="loadingMore" class="fa fa-circle-o-notch fa-spin me-1" aria-hidden="true"/>Load more... (<t t-out="unloadedCount"/> remaining)</button>
                             </div>
+                            <!-- No live region: the header status already reads out the count of 0. -->
+                            <p t-if="this.crmIsStageEmpty(stageView)" class="o_crm_mobile_pipeline_empty">No leads in this stage</p>
                         </t>
                     </div>
                 </t>
@@ -125,7 +144,15 @@
                         </div>
                     </t>
                     <t t-else="">
-                        <t t-foreach="this.getUngroupedRecords()" t-as="record" t-key="record.resId">
+                        <!-- Skip link and end marker as on the stage pipeline, never around sample records. -->
+                        <t t-set="ungroupedRecords" t-value="this.getUngroupedRecords()"/>
+                        <t t-set="hasCards" t-value="ungroupedRecords.length and !this.props.list.model.useSampleModel"/>
+                        <button t-if="hasCards"
+                            type="button"
+                            class="btn btn-link visually-hidden-focusable o_crm_mobile_pipeline_skip"
+                            data-available-offline="1"
+                            t-on-click="() => this.crmSkipToEnd()">Skip to the end of the leads</button>
+                        <t t-foreach="ungroupedRecords" t-as="record" t-key="record.resId">
                             <CrmMobileLeadCard
                                 record="record"
                                 stages="stageChoices"
@@ -134,10 +161,16 @@
                                 onOpen.bind="this.openLead"
                                 onMoveStage.bind="this.moveLead"/>
                         </t>
+                        <div t-if="hasCards"
+                            class="visually-hidden-focusable o_crm_mobile_pipeline_end"
+                            tabindex="-1"
+                            t-ref="this.crmEndRef">End of the leads</div>
                     </t>
                 </div>
             </t>
             <ActionHelper t-if="this.showNoContentHelper" noContentHelp="this.props.noContentHelp"/>
+            <!-- Reads out the outcome of a replay of offline changes: present and empty until one ends, so its text change is announced. -->
+            <span class="visually-hidden o_crm_mobile_pipeline_sync_status" role="status" t-out="this.crmSyncStatus()"/>
         </div>
     </t>
 
@@ -240,13 +273,16 @@
 
     <!--
         Anchors ignore disabled; guarded CRM buttons (crmOfflineGuarded,
-        crm_offline_hooks.js) leave the tab order. Otherwise preserve aria-disabled from
-        the attributes spread and the original tabindex.
+        crm_offline_hooks.js) leave the tab order and lose data-available-offline, which
+        would make the framework re-enable a guarded "Won" (non-secure origin).
+        Otherwise preserve aria-disabled and data-available-offline from the attributes
+        spread and the original tabindex.
     -->
     <t t-inherit="web.views.ViewButton" t-inherit-mode="extension">
         <xpath expr="//t[@t-tag='this.props.tag']" position="attributes">
             <attribute name="t-att-aria-disabled">this.crmOfflineGuarded ? 'true' : (this.props.attrs['aria-disabled'] ?? false)</attribute>
             <attribute name="t-att-tabindex">this.crmOfflineGuarded ? -1 : this.props.tabindex</attribute>
+            <attribute name="t-att-data-available-offline">this.crmOfflineGuarded ? false : (this.props.attrs['data-available-offline'] ?? false)</attribute>
         </xpath>
     </t>
 
@@ -270,10 +306,38 @@
         </xpath>
     </t>
 
+    <!--
+        Phone sidebar leaf entries of the CRM app (crmOfflineSectionDisabled,
+        crm_offline_hooks.js) render unavailable offline, as the desktop dropdown items
+        do. The added class attribute merges with the original one; online it adds
+        nothing and aria-disabled is absent.
+    -->
+    <t t-inherit="web.SectionMenu" t-inherit-mode="extension">
+        <xpath expr="//li[@t-else='']" position="attributes">
+            <attribute name="t-attf-class">{{ this.crmOfflineSectionDisabled(section) ? 'o_disabled_offline' : '' }}</attribute>
+            <attribute name="t-att-aria-disabled">this.crmOfflineSectionDisabled(section) ? 'true' : false</attribute>
+        </xpath>
+    </t>
+
     <!-- Offline lead fields use cached inline autocomplete; the phone dialog requires the server. -->
     <t t-inherit="web.Many2XAutocomplete" t-inherit-mode="extension">
         <xpath expr="//input[@t-on-click='this.onSearchMore']" position="attributes">
             <attribute name="t-if">this.uiService.isSmall and this.props.dropdown and !this.crmOfflineInlineSearch</attribute>
+        </xpath>
+    </t>
+
+    <!--
+        Offline, a lead whose follower count was never loaded (crmFollowersCountUnknown,
+        crm_form.js) shows neither an endless spinner nor a made-up count; the count
+        loads on reconnection. Online the condition is false and the markup is mail's.
+    -->
+    <t t-inherit="mail.Chatter" t-inherit-mode="extension">
+        <xpath expr="//div[hasclass('o-mail-Followers')]//i[hasclass('fa-spin')]" position="attributes">
+            <attribute name="t-if" add="!this.crmFollowersCountUnknown" separator=" and "/>
+        </xpath>
+        <xpath expr="//sup[hasclass('o-mail-Followers-counter')]" position="attributes">
+            <attribute name="t-else"/>
+            <attribute name="t-elif">!this.crmFollowersCountUnknown</attribute>
         </xpath>
     </t>
 

@@ -2,12 +2,14 @@
 
 import ast
 import copy
+import secrets
 from datetime import timedelta
 from unittest.mock import patch
 
 from lxml import etree
 
 from odoo import fields
+from odoo.exceptions import AccessError
 from odoo.tests import HttpCase
 from odoo.tests.common import tagged
 from odoo.tools import file_open
@@ -259,6 +261,79 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
             self.assertEqual(lead_a[fname], lead_b[fname], f'Replayed and online saves differ on lead {fname}')
         for fname in ('email', 'phone'):
             self.assertEqual(partner_a[fname], partner_b[fname], f'Replayed and online saves differ on partner {fname}')
+
+    def test_offline_partner_change_replay_matches_online(self):
+        """ A partner chosen offline in the lead form gets no onchange, so the
+        CRM form queues ``web_save [[resId], {partner_id}]`` with
+        ``{specification: {}}``: neither the lead's email and phone nor the flags
+        loaded for the previous partner are forced. Replaying it must give the
+        same lead and partners as the online save, whose onchange takes the
+        email and phone of the new partner into the changes. """
+        salesman = self.user_sales_salesman
+        partner_a, partner_b = self.env['res.partner'].create([
+            {'name': 'Twin Partner A'},
+            {'name': 'Twin Partner B'},
+        ])
+        new_partner = self.env['res.partner'].create({
+            'name': 'New Partner',
+            'email': 'new.partner@example.com',
+            'phone': '+32 470 99 99 99',
+        })
+        lead_a, lead_b = (
+            self._create_salesman_opportunity(
+                name, partner_id=partner.id, email_from='lead.own@example.com', phone='+32 494 12 12 12',
+            )
+            for name, partner in (('Twin Lead A', partner_a), ('Twin Lead B', partner_b))
+        )
+        (partner_a + partner_b).write({'email': False, 'phone': False})
+
+        # initial state: the leads' own email and phone differ from their partner's,
+        # so a save of either lead without a partner change would propagate them
+        for lead in lead_a + lead_b:
+            with self.subTest(lead=lead.name):
+                self.assertEqual(lead.email_from, 'lead.own@example.com')
+                self.assertEqual(lead.phone, '+32 494 12 12 12')
+                self.assertTrue(lead.partner_email_update)
+                self.assertTrue(lead.partner_phone_update)
+
+        # lead A: the replayed queue entry, exactly as queued
+        result_a = lead_a.with_user(salesman).web_save({'partner_id': new_partner.id}, specification={})
+        self.assertEqual(result_a, [{'id': lead_a.id}])
+
+        # lead B: the online save, with the values the partner onchange gives
+        result_b = lead_b.with_user(salesman).web_save({
+            'partner_id': new_partner.id,
+            'email_from': 'new.partner@example.com',
+            'phone': '+32 470 99 99 99',
+        }, specification={
+            'email_from': {},
+            'phone': {},
+            'partner_id': {'fields': {'display_name': {}}},
+        })
+        self.assertEqual(result_b, [{
+            'id': lead_b.id,
+            'email_from': 'new.partner@example.com',
+            'phone': '+32 470 99 99 99',
+            'partner_id': {'id': new_partner.id, 'display_name': 'New Partner'},
+        }])
+
+        self.env.invalidate_all()
+        for lead in lead_a + lead_b:
+            with self.subTest(lead=lead.name):
+                self.assertEqual(lead.partner_id, new_partner)
+                self.assertEqual(lead.email_from, 'new.partner@example.com')
+                self.assertEqual(lead.phone, '+32 470 99 99 99')
+                self.assertFalse(lead.partner_email_update)
+                self.assertFalse(lead.partner_phone_update)
+        self.assertEqual(new_partner.email, 'new.partner@example.com', 'Should have kept the new partner email')
+        self.assertEqual(new_partner.phone, '+32 470 99 99 99', 'Should have kept the new partner phone')
+        for partner in partner_a + partner_b:
+            with self.subTest(partner=partner.name):
+                self.assertFalse(partner.email)
+                self.assertFalse(partner.phone)
+
+        for fname in ('partner_id', 'email_from', 'phone', 'partner_email_update', 'partner_phone_update'):
+            self.assertEqual(lead_a[fname], lead_b[fname], f'Replayed and online saves differ on lead {fname}')
 
     def test_offline_mark_won_replay(self):
         """ Won clicked offline queues ``action_set_won [[resId]]`` with the form
@@ -581,6 +656,202 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
             lead + online_lead,
             'The pipeline action lists the replayed and the online lead alike',
         )
+
+    def _quick_create(self, user, vals, key, specification=None, next_id=None):
+        """ Deliver the call the mobile quick create sends, online or replayed from
+        the offline queue: ``web_save([], vals)`` with the pipeline context and the
+        create's delivery key, as ``user``.
+
+        :return: the ``web_save`` answer
+        """
+        context = dict(self.pipeline_context, crm_offline_create_key=key)
+        return self.env['crm.lead'].with_user(user).with_context(context).browse().web_save(
+            vals, specification={} if specification is None else specification, next_id=next_id,
+        )
+
+    def _quick_create_xmlids(self, key):
+        """ The external identifiers a delivery key is registered under. """
+        return self.env['ir.model.data'].search([('module', '=', '__crm_offline__'), ('name', '=', key)])
+
+    def test_offline_quick_create_replay_same_key_creates_once(self):
+        """ A quick create whose answer was lost is sent again verbatim, with the
+        same delivery key: the server answers with the lead the first delivery
+        created, and neither creates nor writes anything. """
+        salesman = self.user_sales_salesman
+        key = secrets.token_hex(16)
+        vals = {
+            'name': 'Lost Answer Lead',
+            'contact_name': 'Lost Contact',
+            'phone': '+32 494 66 66 66',
+            'email_from': 'lost@example.com',
+            'expected_revenue': 300.0,
+            'stage_id': self.stage_gen_1.id,
+        }
+        first = self._quick_create(salesman, vals, key)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(set(first[0]), {'id'})
+        lead = self.env['crm.lead'].browse(first[0]['id'])
+        self.assertEqual(lead.type, 'opportunity')
+        self.assertEqual(lead.create_uid, salesman)
+        messages = lead.message_ids
+
+        # the same call again (the replay), then with other values: the first
+        # delivery's lead answers both, unchanged
+        self.assertEqual(self._quick_create(salesman, dict(vals), key), first)
+        self.assertEqual(self._quick_create(salesman, dict(vals, expected_revenue=999.0, name='Other'), key), first)
+        self.assertEqual(
+            self._quick_create(salesman, vals, key, specification={'name': {}, 'expected_revenue': {}}),
+            [{'id': lead.id, 'name': 'Lost Answer Lead', 'expected_revenue': 300.0}],
+            'A delivery reading fields back reads them from the delivered lead',
+        )
+        leads = self.env['crm.lead'].with_context(active_test=False).search([('name', 'in', ('Lost Answer Lead', 'Other'))])
+        self.assertEqual(leads, lead, 'Every delivery of one key makes one lead')
+        for fname, value in vals.items():
+            with self.subTest(field=fname):
+                self.assertEqual(lead[fname].id if fname == 'stage_id' else lead[fname], value)
+        self.assertEqual(lead.message_ids, messages, 'A repeated delivery writes nothing')
+
+        # an archived lead is still the delivered one
+        lead.action_archive()
+        self.assertEqual(self._quick_create(salesman, vals, key), first)
+        self.assertEqual(self.env['crm.lead'].with_context(active_test=False).search_count([('name', '=', 'Lost Answer Lead')]), 1)
+
+        # `next_id` answers that record, as base web_save does, for a first
+        # delivery and a repeated one alike
+        other = self._create_salesman_opportunity('Next Lead')
+        self.assertEqual(self._quick_create(salesman, vals, key, next_id=other.id), [{'id': other.id}])
+        next_key = secrets.token_hex(16)
+        self.assertEqual(
+            self._quick_create(salesman, dict(vals, name='Next Key Lead'), next_key, specification={'name': {}}, next_id=other.id),
+            [{'id': other.id, 'name': 'Next Lead'}],
+        )
+        next_key_lead = self.env['crm.lead'].search([('name', '=', 'Next Key Lead')])
+        self.assertEqual(len(next_key_lead), 1)
+        self.assertEqual(self._quick_create_xmlids(next_key).res_id, next_key_lead.id)
+
+    def test_offline_quick_create_replay_distinct_keys(self):
+        """ Two quick creates carry two delivery keys: identical values still make
+        two leads, so a create is never answered with another create's lead. """
+        salesman = self.user_sales_salesman
+        vals = {
+            'name': 'Twin Lead',
+            'contact_name': '',
+            'phone': '',
+            'email_from': '',
+            'expected_revenue': 30.0,
+            'stage_id': self.stage_gen_1.id,
+        }
+        first_key, second_key = secrets.token_hex(16), secrets.token_hex(16)
+        self.assertNotEqual(first_key, second_key)
+        first = self._quick_create(salesman, vals, first_key)
+        second = self._quick_create(salesman, dict(vals), second_key)
+        self.assertNotEqual(first, second)
+        twins = self.env['crm.lead'].search([('name', '=', 'Twin Lead')])
+        self.assertEqual(set(twins.ids), {first[0]['id'], second[0]['id']})
+        self.assertEqual(len(twins), 2)
+        self.assertEqual(self._quick_create_xmlids(first_key).res_id, first[0]['id'])
+        self.assertEqual(self._quick_create_xmlids(second_key).res_id, second[0]['id'])
+
+        # each key answers with its own lead
+        self.assertEqual(self._quick_create(salesman, vals, second_key), second)
+        self.assertEqual(self._quick_create(salesman, vals, first_key), first)
+        self.assertEqual(self.env['crm.lead'].search_count([('name', '=', 'Twin Lead')]), 2)
+
+    def test_offline_quick_create_replay_key_of_another_user(self):
+        """ A delivery key registered by another user's create is refused: the
+        lead is neither returned nor created again. """
+        key = secrets.token_hex(16)
+        vals = {
+            'name': 'Foreign Key Lead',
+            'contact_name': '',
+            'phone': '',
+            'email_from': '',
+            'expected_revenue': 0.0,
+            'stage_id': self.stage_gen_1.id,
+        }
+        [foreign] = self._quick_create(self.user_sales_leads, vals, key)
+        with self.assertRaises(AccessError):
+            self._quick_create(self.user_sales_salesman, vals, key)
+        leads = self.env['crm.lead'].with_context(active_test=False).search([('name', '=', 'Foreign Key Lead')])
+        self.assertEqual(leads.ids, [foreign['id']])
+        self.assertEqual(leads.create_uid, self.user_sales_leads)
+        self.assertEqual(self._quick_create_xmlids(key).res_id, foreign['id'])
+
+    def test_offline_quick_create_replay_invalid_key(self):
+        """ Without a well-formed delivery key, a create is a plain create: every
+        delivery makes a lead, and no external identifier is registered. """
+        salesman = self.user_sales_salesman
+        vals = {
+            'name': 'Unkeyed Lead',
+            'contact_name': '',
+            'phone': '',
+            'email_from': '',
+            'expected_revenue': 10.0,
+            'stage_id': self.stage_gen_1.id,
+        }
+        # fixed, with letters, so that its upper-case variant is not a valid key
+        hex_key = '0123456789abcdef' * 2
+        invalid_keys = [
+            hex_key.upper(), hex_key[:-1], hex_key + '0', f'{hex_key[:-1]}g', f' {hex_key}',
+            f'{hex_key}\n', int(hex_key, 16), False, None,
+        ]
+        for key in invalid_keys:
+            with self.subTest(key=key):
+                for _delivery in range(2):
+                    self._quick_create(salesman, vals, key)
+        leads = self.env['crm.lead'].search([('name', '=', 'Unkeyed Lead')])
+        self.assertEqual(len(leads), 2 * len(invalid_keys))
+        self.assertEqual(set(leads.mapped('type')), {'opportunity'})
+        self.assertFalse(self.env['ir.model.data'].search([('model', '=', 'crm.lead'), ('res_id', 'in', leads.ids)]))
+        self.assertFalse(self.env['ir.model.data'].search([('module', '=', '__crm_offline__'), ('name', 'ilike', hex_key[:-1])]))
+
+        # a write with a valid key is a plain write too
+        lead = leads[0]
+        context = dict(self.pipeline_context, crm_offline_create_key=hex_key)
+        lead.with_user(salesman).with_context(context).web_save({'expected_revenue': 11.0}, specification={})
+        self.assertEqual(lead.expected_revenue, 11.0)
+        self.assertFalse(self._quick_create_xmlids(hex_key))
+
+    def test_offline_quick_create_replay_key_external_id(self):
+        """ The delivery key is registered as the external identifier
+        ``__crm_offline__.<key>`` of its lead, which deleting the lead removes:
+        the same key then creates the lead again. """
+        salesman = self.user_sales_salesman
+        key = secrets.token_hex(16)
+        vals = {
+            'name': 'Registered Lead',
+            'contact_name': '',
+            'phone': '',
+            'email_from': '',
+            'expected_revenue': 50.0,
+            'stage_id': self.stage_gen_1.id,
+        }
+        [delivered] = self._quick_create(salesman, vals, key)
+        lead = self.env['crm.lead'].browse(delivered['id'])
+        xmlid = self._quick_create_xmlids(key)
+        self.assertEqual(len(xmlid), 1)
+        self.assertEqual(
+            (xmlid.model, xmlid.res_id, xmlid.noupdate, xmlid.complete_name),
+            ('crm.lead', lead.id, True, f'__crm_offline__.{key}'),
+        )
+        self.assertEqual(self.env.ref(f'__crm_offline__.{key}'), lead)
+
+        # deleted (the salesman has no delete right): its external identifier goes
+        lead.unlink()
+        self.assertFalse(self._quick_create_xmlids(key))
+        [recreated] = self._quick_create(salesman, vals, key)
+        self.assertNotEqual(recreated['id'], delivered['id'])
+        self.assertEqual(self.env['crm.lead'].search([('name', '=', 'Registered Lead')]).ids, [recreated['id']])
+        self.assertEqual(self._quick_create_xmlids(key).res_id, recreated['id'])
+
+        # an external identifier left behind by a lead deleted without the ORM is
+        # taken over by the next delivery of its key
+        self.env.cr.execute('DELETE FROM crm_lead WHERE id = %s', [recreated['id']])
+        self.env['crm.lead'].invalidate_model()
+        [taken_over] = self._quick_create(salesman, vals, key)
+        self.assertNotIn(taken_over['id'], (delivered['id'], recreated['id']))
+        self.assertEqual(self._quick_create_xmlids(key).res_id, taken_over['id'])
+        self.assertEqual(self._quick_create(salesman, vals, key), [taken_over])
 
     # ------------------------------------------------------------
     # Wiring
