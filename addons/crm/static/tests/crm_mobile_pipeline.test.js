@@ -53,10 +53,12 @@ import { isQuickCreateDeepLink, quickCreateDeepLink } from "@crm/mobile/crm_offl
 import { CrmFormController } from "@crm/views/crm_form/crm_form";
 import { AutoComplete } from "@web/core/autocomplete/autocomplete";
 import { browser } from "@web/core/browser/browser";
+import { getCurrency } from "@web/core/currency";
 import { rpc } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { registry } from "@web/core/registry";
 import { user } from "@web/core/user";
+import { formatMonetary } from "@web/views/fields/formatters";
 import { buildM2OFieldDescription, Many2OneField } from "@web/views/fields/many2one/many2one_field";
 import { Many2XAutocomplete } from "@web/views/fields/relational_utils";
 import { AnimatedNumber } from "@web/views/view_components/animated_number";
@@ -3005,6 +3007,91 @@ test("mobile lead card announces its sync state through a status region", async 
 });
 
 test.tags("mobile");
+test("mobile lead card and activity sheet controls are named after their lead and activity", async () => {
+    await makeMockServer();
+    // "Desk Upgrade" without a name; on "Conference Room", an activity shown under its
+    // type only and one with neither a summary nor a type.
+    MockServer.env["crm.lead"].write([3], { name: false });
+    MockServer.env["mail.activity"].write([3], { summary: false });
+    const [untitledId] = MockServer.env["mail.activity"].create([
+        {
+            res_model: "crm.lead",
+            res_id: 4,
+            activity_type_id: false,
+            summary: false,
+            date_deadline: "2026-10-12",
+            user_id: serverState.userId,
+            state: "planned",
+        },
+    ]);
+    const setOffline = mockOffline();
+    await mountPipeline();
+    const ariaLabels = (selector) => queryAll(selector).map((el) => el.getAttribute("aria-label"));
+
+    // Each card names its stage selector and icon-only activities button after its
+    // lead, the button keeping its "Activities" tooltip; a lead without a name gets
+    // the plain labels.
+    expect(cardNames()).toEqual(["Office Design", "Quote for Chairs", ""]);
+    expect(ariaLabels(".o_crm_mobile_lead_card .o_crm_mobile_lead_stage")).toEqual([
+        "Stage of Office Design",
+        "Stage of Quote for Chairs",
+        "Stage",
+    ]);
+    expect(ariaLabels(".o_crm_mobile_lead_card .o_crm_mobile_lead_activities_button")).toEqual([
+        "Activities: Office Design",
+        "Activities: Quote for Chairs",
+        "Activities",
+    ]);
+    expect(".o_crm_mobile_lead_activities_button[title=Activities]").toHaveCount(3);
+
+    // The sheet of a lead with two activities: each "Mark done" is named after the
+    // title of its row and keeps its visible text.
+    await openActivities("Office Design");
+    expect(activityTitles()).toEqual(["Follow-up call", "Send brochure"]);
+    expect(ariaLabels(".o_crm_mobile_activity_done")).toEqual([
+        "Mark done: Follow-up call",
+        "Mark done: Send brochure",
+    ]);
+    expect(queryAllTexts(".o_crm_mobile_activity_done")).toEqual(["Mark done", "Mark done"]);
+    await closeSheet();
+
+    // A row without a summary is named after the type it shows; a row with neither
+    // gets the plain label.
+    await contains(".o_crm_mobile_pipeline_next").click();
+    await openActivities("Conference Room");
+    expect(`${activityRow(3)} .o_crm_mobile_activity_title`).toHaveText("Email");
+    expect(`${activityRow(3)} .o_crm_mobile_activity_done`).toHaveAttribute(
+        "aria-label",
+        "Mark done: Email"
+    );
+    expect(`${activityRow(untitledId)} .o_crm_mobile_activity_title`).toHaveText("");
+    expect(`${activityRow(untitledId)} .o_crm_mobile_activity_done`).toHaveAttribute(
+        "aria-label",
+        "Mark done"
+    );
+    expect(queryAllTexts(".o_crm_mobile_activity_done")).toEqual(["Mark done", "Mark done"]);
+    await closeSheet();
+
+    // Marked done offline: the name follows the visible "Done · Pending sync" label.
+    await contains(".o_crm_mobile_pipeline_prev").click();
+    await setOffline(true);
+    await openActivities("Office Design");
+    await contains(`${activityRow(1)} .o_crm_mobile_activity_done`).click();
+    expect(`${activityRow(1)} .o_crm_mobile_activity_done`).toHaveText("Done · Pending sync");
+    expect(`${activityRow(1)} .o_crm_mobile_activity_done`).toHaveAttribute(
+        "aria-label",
+        "Done · Pending sync: Follow-up call"
+    );
+    expect(`${activityRow(2)} .o_crm_mobile_activity_done`).toHaveAttribute(
+        "aria-label",
+        "Mark done: Send brochure"
+    );
+    expect(queued("mail.activity").map(({ method, args }) => [method, args[0]])).toEqual([
+        ["action_done", [1]],
+    ]);
+});
+
+test.tags("mobile");
 test("mobile lead card stage move queues offline", async () => {
     const received = receivedCalls("crm.lead", "web_save");
     const setOffline = mockOffline();
@@ -3252,6 +3339,34 @@ test("mobile lead card: provisional card cannot be opened or given activities un
     expect.verifySteps(["open 8"]);
 });
 
+test.tags("mobile");
+test("mobile lead card: provisional card shows its revenue in the company currency, as synced cards do", async () => {
+    const setOffline = mockOffline();
+    await mountPipeline();
+    await setOffline(true);
+    // "Office Design" is a synced card of the same revenue.
+    await quickCreateLead({ name: "Offline Lead", revenue: 100 });
+
+    const provisional = ".o_crm_mobile_lead_card.o_crm_mobile_lead_card_provisional";
+    const revenue = (selector) => textOf(`${selector} .o_crm_mobile_lead_revenue`);
+    // The active company's currency, which the server gives the created lead.
+    const currencyId = user.activeCompany.currency_id;
+    const expected = formatMonetary(100, { currencyId }).replace(/\u00a0/g, " ");
+    expect(expected).toInclude(getCurrency(currencyId).symbol);
+    expect(provisional).toHaveCount(1);
+    expect(revenue(provisional)).toBe(expected);
+    expect(revenue(card("Office Design"))).toBe(expected);
+
+    // Synced: the server card, in the lead's company currency, keeps the same text.
+    await reconnect(setOffline);
+    expect(provisional).toHaveCount(0);
+    const [created] = MockServer.env["crm.lead"].search_read(OFFLINE_LEAD_DOMAIN, [
+        "company_currency",
+    ]);
+    expect(created.company_currency[0]).toBe(currencyId);
+    expect(revenue(card("Offline Lead"))).toBe(expected);
+});
+
 // -----------------------------------------------------------------------------
 // Quick create (CrmMobileQuickCreate)
 // -----------------------------------------------------------------------------
@@ -3334,6 +3449,64 @@ test("mobile quick create requires a name and closes on cancel", async () => {
     expect(queued("crm.lead")).toEqual([]);
     expect(".o_crm_mobile_lead_card_provisional").toHaveCount(0);
     expect(headerTexts()).toEqual(["New", "3", "$ 600"]);
+});
+
+test.tags("mobile");
+test("mobile quick create closes once on a repeated cancel or a cancel after save", async () => {
+    const setOffline = mockOffline();
+    await mountPipeline();
+    await setOffline(true);
+    const sheet = "form.o_crm_mobile_quick_create";
+    const cancel = ".o_crm_mobile_quick_create_cancel";
+    await contains(".o_crm_mobile_pipeline_new").click();
+    expect(document.body).toHaveClass("bottom-sheet-open");
+
+    // Cancel activated twice before the sheet leaves the page, which happens only at
+    // the next render.
+    const cancelButton = queryFirst(cancel);
+    cancelButton.click();
+    cancelButton.click();
+    await animationFrame();
+    expect(".o_bottom_sheet").toHaveCount(0);
+    expect(document.body).not.toHaveClass("bottom-sheet-open");
+
+    // Closed once: the bottom-sheet service still flags the next sheet it opens.
+    await contains(".o_crm_mobile_pipeline_new").click();
+    expect(`.o_bottom_sheet ${sheet}`).toHaveCount(1);
+    expect(document.body).toHaveClass("bottom-sheet-open");
+
+    // Cancel activated as soon as a successful Save has closed the sheet, while the
+    // sheet is still displayed: the lead is queued once and nothing more is closed.
+    await contains(`${sheet} input[name=name]`).edit("Saved Lead", { confirm: false });
+    let cancelOnClosingSheet = null;
+    const observer = new MutationObserver(() => {
+        if (!cancelOnClosingSheet && !document.body.classList.contains("bottom-sheet-open")) {
+            const button = queryFirst(cancel);
+            cancelOnClosingSheet = { displayed: Boolean(button) };
+            button?.click();
+        }
+    });
+    observer.observe(document.body, { attributeFilter: ["class"] });
+    after(() => observer.disconnect());
+    await contains(".o_crm_mobile_quick_create_save").click();
+    await animationFrame();
+    observer.disconnect();
+    expect(cancelOnClosingSheet).toEqual({ displayed: true });
+    expect(".o_bottom_sheet").toHaveCount(0);
+    expect(document.body).not.toHaveClass("bottom-sheet-open");
+    expect(queued("crm.lead").map(({ args }) => args[1].name)).toEqual(["Saved Lead"]);
+    expect(queryAllTexts(".o_crm_mobile_lead_card_provisional .o_crm_mobile_lead_name")).toEqual([
+        "Saved Lead",
+    ]);
+
+    // Closed once: the next sheet is flagged while open and unflagged once closed.
+    await contains(".o_crm_mobile_pipeline_new").click();
+    expect(`.o_bottom_sheet ${sheet}`).toHaveCount(1);
+    expect(document.body).toHaveClass("bottom-sheet-open");
+    await contains(cancel).click();
+    await animationFrame();
+    expect(".o_bottom_sheet").toHaveCount(0);
+    expect(document.body).not.toHaveClass("bottom-sheet-open");
 });
 
 test.tags("mobile");

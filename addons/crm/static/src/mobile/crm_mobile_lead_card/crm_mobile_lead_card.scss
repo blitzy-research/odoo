@@ -113,7 +113,12 @@
     }
 }
 
+// The lead form's phone "Activities" button is a flex item of the control panel's
+// breadcrumbs row. Its explicit touch-target `min-width` replaces the item's automatic
+// minimum (the width of its label), so it must not shrink: the label stays inside
+// the button.
 .o_crm_mobile_activities_button {
+    flex: 0 0 auto;
     min-width: var(--CrmMobileLeadCard-touchTarget);
     min-height: var(--CrmMobileLeadCard-touchTarget);
 }

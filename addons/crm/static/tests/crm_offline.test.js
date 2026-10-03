@@ -23,7 +23,15 @@
  */
 
 import { Component, xml } from "@odoo/owl";
-import { beforeEach, expect, test } from "@odoo/hoot";
+import {
+    advanceTime,
+    beforeEach,
+    expect,
+    mockDate,
+    mockUserAgent,
+    runAllTimers,
+    test,
+} from "@odoo/hoot";
 import {
     animationFrame,
     click,
@@ -35,7 +43,6 @@ import {
     waitFor,
     waitUntil,
 } from "@odoo/hoot-dom";
-import { advanceTime, mockDate, mockUserAgent, runAllTimers } from "@odoo/hoot-mock";
 import {
     contains,
     defineActions,
@@ -79,7 +86,7 @@ import { CrmPlsTooltipButton } from "@crm/views/crm_form/crm_pls_tooltip_button"
 import { CrmShareTargetItem } from "@crm/webclient/share_target/crm_share_target_item";
 import { browser } from "@web/core/browser/browser";
 import { router } from "@web/core/browser/router";
-import { ConnectionLostError } from "@web/core/network/rpc";
+import { ConnectionLostError, RPCError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { registry } from "@web/core/registry";
 import { user } from "@web/core/user";
@@ -5324,27 +5331,45 @@ test("[Offline] lead generation install confirmation opened online installs noth
         expect.step(`button_immediate_install ${JSON.stringify(args)}`);
         throw makeServerError({ message: serverMessage });
     });
+    /** Arguments of every `console.error` call. */
+    const logged = [];
     patchWithCleanup(console, {
-        error() {
+        error(...args) {
             expect.step("console.error");
+            logged.push(args);
         },
     });
     const setOffline = mockOffline();
+    const INSTALL = "/web/dataset/call_kw/ir.module.module/button_immediate_install";
+    /** The route whose next request loses the connection (502 answer), if any. */
+    const lost = { route: null };
+    onRpc("/*", (request) => {
+        if (lost.route && new URL(request.url).pathname === lost.route) {
+            lost.route = null;
+            return new Response("", { status: 502 });
+        }
+    });
     stepRoutes((route) => route.includes("/ir.module.module/"));
     await mountWithCleanup(WebClient);
     await getService("action").doAction(PIPELINE_ACTION.id);
     await flushStartupSync();
     // On small screens the control panel buttons live in its adaptive "More" bottom sheet.
     const toggle = `${isSmall() ? ".o-control-panel-adaptive-dropdown.dropdown-menu " : ""}.o-dropdown-caret:contains(Generate)`;
-    if (isSmall() && !queryAll(toggle).length) {
-        await contains(".o_control_panel_main_buttons button[title=More]").click();
-        await animationFrame();
-    }
-    await contains(toggle).click();
-    await expect.waitForSteps(["/web/dataset/call_kw/ir.module.module/search_read"]);
-    await contains(
-        ".o_lead_mining_menu_choices .o_lead_mining_element[data-module-xml-id='base.module_website']"
-    ).click();
+    const websiteItem =
+        ".o_lead_mining_menu_choices .o_lead_mining_element[data-module-xml-id='base.module_website']";
+    /** Opens the dropdown when it is closed, then asks to install Website. */
+    const openWebsiteConfirmation = async () => {
+        if (!queryAll(websiteItem).length) {
+            if (isSmall() && !queryAll(toggle).length) {
+                await contains(".o_control_panel_main_buttons button[title=More]").click();
+                await animationFrame();
+            }
+            await contains(toggle).click();
+        }
+        await contains(websiteItem).click();
+    };
+    await openWebsiteConfirmation();
+    expect.verifySteps(["/web/dataset/call_kw/ir.module.module/search_read"]);
     const body = ".modal .modal-body";
     const confirm = ".modal-footer .btn-primary:contains(Install)";
     const cancel = ".modal-footer .btn-secondary";
@@ -5379,25 +5404,57 @@ test("[Offline] lead generation install confirmation opened online installs noth
     expect(Object.values(getService(OfflinePlugin)._ormToSync())).toEqual([]);
     expect.verifySteps([]);
 
-    // Online, Confirm is enabled again and installs; the failure shows a fixed message.
+    // Online, Confirm is enabled again and installs. The server's refusal is shown in the
+    // error dialog and logged, as for any failed installation.
     await setOffline(false);
     await animationFrame();
     expect(confirm).toBeEnabled();
     expect(confirm).not.toHaveClass("o_disabled_offline");
     await contains(confirm).click();
-    await expect.waitForSteps([
-        "/web/dataset/call_kw/ir.module.module/button_immediate_install",
-        "button_immediate_install [2]",
-    ]);
+    await expect.waitForSteps([INSTALL, "button_immediate_install [2]", "console.error"]);
     await animationFrame();
     expect(confirm).toHaveCount(0);
     expect(".o_error_dialog").toHaveCount(1);
-    const errorText = queryFirst(".o_error_dialog").textContent;
-    expect(errorText).toInclude('Failed to install "Website"');
-    expect(errorText).not.toInclude(serverMessage);
-    expect(errorText).not.toInclude("odoo.exceptions");
+    expect(logged).toHaveLength(1);
+    const [[refusal]] = logged;
+    expect(refusal).toBeInstanceOf(RPCError);
+    expect(refusal.message).toBe(serverMessage);
+    expect(refusal.exceptionName).toBe("odoo.exceptions.UserError");
+    const errorDetail = ".o_error_dialog .o_error_detail code.d-block";
+    expect(queryFirst(errorDetail).textContent).toBe(String(refusal));
+    expect(queryFirst(".o_error_dialog").textContent).not.toInclude('Failed to install "Website"');
     expect(website().status).toBe("FAILED_TO_INSTALL");
     expect(website().title).toBe('Failed to install "Website"');
+    expect(getService(OfflinePlugin).isOffline()).toBe(false);
+    expect.verifySteps([]);
+
+    // Online, an installation whose request loses the connection never reaches the server:
+    // the failure shows only a fixed text and logs nothing.
+    await contains(".o_error_dialog .modal-footer .btn-primary").click();
+    expect(".o_error_dialog").toHaveCount(0);
+    await openWebsiteConfirmation();
+    expect(body).toHaveText('Do you want to install the "Website" App?');
+    expect(confirm).toBeEnabled();
+    lost.route = INSTALL;
+    await contains(confirm).click();
+    await expect.waitForSteps([INSTALL]);
+    await animationFrame();
+    expect(getService(OfflinePlugin).isOffline()).toBe(true);
+    // The network is kept down, so that no timer reconnects while the test settles.
+    await setOffline(true);
+    await settle();
+    expect(confirm).toHaveCount(0);
+    expect(".o_error_dialog").toHaveCount(1);
+    expect(errorDetail).toHaveCount(1);
+    expect(queryFirst(errorDetail).textContent).toBe('Failed to install "Website"');
+    const lostText = queryFirst(".o_error_dialog").textContent;
+    expect(lostText).not.toInclude(INSTALL);
+    expect(lostText).not.toInclude("Connection");
+    expect(lostText).not.toInclude(serverMessage);
+    expect(website().status).toBe("FAILED_TO_INSTALL");
+    expect(website().title).toBe('Failed to install "Website"');
+    expect(Object.values(getService(OfflinePlugin)._ormToSync())).toEqual([]);
+    expect(logged).toHaveLength(1);
     expect.verifySteps([]);
 });
 

@@ -7,6 +7,7 @@ import { useHotkey } from "@web/core/hotkeys/hotkey_hook";
 import { sprintf } from "@web/core/utils/strings";
 import { _t } from "@web/core/l10n/translation";
 import { user } from "@web/core/user";
+import { ConnectionLostError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { ConfirmationDialog } from "@web/core/confirmation_dialog/confirmation_dialog";
 import { ErrorDialog } from "@web/core/errors/error_dialogs";
@@ -243,14 +244,20 @@ export class LeadGenerationDropdown extends Component {
                         id,
                     ]);
                     location.reload();
-                } catch {
-                    // Online too: a fixed text, not the raw error, which can hold server details.
+                } catch (error) {
                     this.setElementStatus(element, name, MODULE_STATUS.FAILED_TO_INSTALL);
-                    this.dialogs.add(ErrorDialog, {
-                        message: sprintf(this.newContentText.FAILED_TO_INSTALL, {
-                            module_name: name,
-                        }),
-                    });
+                    // A lost connection or an offline client: a fixed text, nothing logged.
+                    // Any other failure, such as a server refusal: the error, shown and logged.
+                    if (error instanceof ConnectionLostError || this.offlinePlugin.isOffline()) {
+                        this.dialogs.add(ErrorDialog, {
+                            message: sprintf(this.newContentText.FAILED_TO_INSTALL, {
+                                module_name: name,
+                            }),
+                        });
+                        return;
+                    }
+                    this.dialogs.add(ErrorDialog, { message: error });
+                    console.error(error);
                 }
             },
             cancel: () => {},

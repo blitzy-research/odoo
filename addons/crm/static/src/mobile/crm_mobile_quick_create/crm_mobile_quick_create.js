@@ -61,6 +61,8 @@ export class CrmMobileQuickCreate extends Component {
             invalidStage: false,
             isSaving: false,
         });
+        // Set once the sheet has asked to close (`closeSheet`).
+        this.closed = false;
     }
 
     /**
@@ -137,7 +139,7 @@ export class CrmMobileQuickCreate extends Component {
             this.flagInvalidStage();
             return;
         }
-        this.props.close?.();
+        this.closeSheet();
     }
 
     /**
@@ -152,6 +154,20 @@ export class CrmMobileQuickCreate extends Component {
     }
 
     onCancel() {
+        this.closeSheet();
+    }
+
+    /**
+     * Closes the sheet once. Each bottom-sheet close also decrements the service's
+     * count of open sheets, and the sheet stays on the page until the next render:
+     * a repeated Cancel, or a Cancel right after a successful Save, would otherwise
+     * close it again and leave later sheets unflagged as open on the page.
+     */
+    closeSheet() {
+        if (this.closed) {
+            return;
+        }
+        this.closed = true;
         this.props.close?.();
     }
 }

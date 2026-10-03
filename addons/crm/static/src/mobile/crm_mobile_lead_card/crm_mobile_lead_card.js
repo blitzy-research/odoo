@@ -68,6 +68,16 @@ function serverDate(value) {
 }
 
 /**
+ * Name a lead card shows, for the accessible names of its controls.
+ *
+ * @param {{name?: unknown}} values display values of the card
+ * @returns {string} the trimmed name, or `""` for a lead without one
+ */
+function leadName(values) {
+    return typeof values.name === "string" ? values.name.trim() : "";
+}
+
+/**
  * Lists loaded and queued lead activities and delegates writes to the shared hooks.
  * Resolve displayed data through `getLeadRecord` on every render because the sheet
  * retains props while reloads replace records. Close when the lead disappears; read
@@ -256,14 +266,17 @@ export class CrmMobileLeadActivities extends Component {
                 }
             }
         }
-        return rows.map((row) => ({
-            ...row,
-            donePending: Boolean(row.id) && donePendingIds.has(row.id),
-            doneBusy: Boolean(this.state.doneBusy[row.id]),
-            typeLabel: this.typeLabel(row.activity_type_id),
-            deadlineLabel: this.deadlineLabel(row.date_deadline),
-            assigneeLabel: this.assigneeLabel(row.user_id),
-        }));
+        return rows.map((row) => {
+            const syncedRow = {
+                ...row,
+                donePending: Boolean(row.id) && donePendingIds.has(row.id),
+                doneBusy: Boolean(this.state.doneBusy[row.id]),
+                typeLabel: this.typeLabel(row.activity_type_id),
+                deadlineLabel: this.deadlineLabel(row.date_deadline),
+                assigneeLabel: this.assigneeLabel(row.user_id),
+            };
+            return { ...syncedRow, doneAriaLabel: this.doneAriaLabel(syncedRow) };
+        });
     }
 
     get syncedRows() {
@@ -341,6 +354,24 @@ export class CrmMobileLeadActivities extends Component {
     /** @param {{display_name?: string}|number|false} value */
     assigneeLabel(value) {
         return relationLabel(value, this.state.assignees);
+    }
+
+    /**
+     * Accessible name of a synced row's done button: its visible label followed
+     * by the activity title the row shows, so that the done buttons of the sheet
+     * are told apart; the visible label alone for a row without a title.
+     *
+     * @param {{summary?: string|false, typeLabel: string, donePending: boolean}} row
+     * @returns {string}
+     */
+    doneAriaLabel(row) {
+        const activity = String(row.summary || row.typeLabel || "").trim();
+        if (row.donePending) {
+            return activity
+                ? _t("Done · Pending sync: %(activity)s", { activity })
+                : _t("Done · Pending sync");
+        }
+        return activity ? _t("Mark done: %(activity)s", { activity }) : _t("Mark done");
     }
 
     /**
@@ -612,7 +643,8 @@ export class CrmMobileLeadCard extends Component {
      *
      * @returns {{values: Object, partnerLabel: string, revenueLabel: string,
      *  stage: {id: number|false, missing: boolean, label: string}|null,
-     *  syncState: "failed"|"pending"|false}|null}
+     *  syncState: "failed"|"pending"|false, stageAriaLabel: string,
+     *  activitiesAriaLabel: string}|null}
      */
     get cardData() {
         const values = this.values;
@@ -625,6 +657,8 @@ export class CrmMobileLeadCard extends Component {
             revenueLabel: this.revenueLabel(values),
             stage: this.stageChoice(values),
             syncState: this.syncState,
+            stageAriaLabel: this.stageAriaLabel(values),
+            activitiesAriaLabel: this.activitiesAriaLabel(values),
         };
     }
 
@@ -635,6 +669,10 @@ export class CrmMobileLeadCard extends Component {
 
     /**
      * Empty when the revenue was not loaded (desktop-variant offline fallback).
+     * A synced card shows it in its record's `company_currency`. A provisional
+     * card has no record yet, so it uses the active company's currency: the
+     * active company is the default company of created records, and the server
+     * computes `company_currency` from the lead's company (or the current one).
      *
      * @param {Object} values display values (see `values`)
      */
@@ -644,7 +682,9 @@ export class CrmMobileLeadCard extends Component {
             return "";
         }
         return formatMonetary(revenue, {
-            currencyId: this.props.record?.data.company_currency?.id,
+            currencyId: this.isProvisional
+                ? user.activeCompany?.currency_id
+                : this.props.record?.data.company_currency?.id,
         });
     }
 
@@ -681,6 +721,32 @@ export class CrmMobileLeadCard extends Component {
             label = id ? values.stage_id.display_name || "" : _t("None");
         }
         return { id, missing, label };
+    }
+
+    /**
+     * Accessible name of the stage selector: "Stage" followed by the lead name, so
+     * that the selectors of the cards are told apart; "Stage" alone for a lead
+     * without a name.
+     *
+     * @param {Object} values display values (see `values`)
+     * @returns {string}
+     */
+    stageAriaLabel(values) {
+        const lead = leadName(values);
+        return lead ? _t("Stage of %(lead)s", { lead }) : _t("Stage");
+    }
+
+    /**
+     * Accessible name of the icon-only activities button: its "Activities" title
+     * followed by the lead name, so that the buttons of the cards are told apart;
+     * "Activities" alone for a lead without a name.
+     *
+     * @param {Object} values display values (see `values`)
+     * @returns {string}
+     */
+    activitiesAriaLabel(values) {
+        const lead = leadName(values);
+        return lead ? _t("Activities: %(lead)s", { lead }) : _t("Activities");
     }
 
     /**

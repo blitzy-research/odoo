@@ -34,7 +34,7 @@
                 <select t-if="card.stage"
                     class="o_crm_mobile_lead_stage form-select"
                     data-available-offline="1"
-                    aria-label="Stage"
+                    t-att-aria-label="card.stageAriaLabel"
                     t-att-disabled="this.isProvisional"
                     t-on-change="this.onStageChange">
                     <option t-if="card.stage.missing" value="" selected="selected" disabled="disabled" t-out="card.stage.label"/>
@@ -49,7 +49,7 @@
                     class="o_crm_mobile_lead_activities_button btn btn-secondary"
                     data-available-offline="1"
                     title="Activities"
-                    aria-label="Activities"
+                    t-att-aria-label="card.activitiesAriaLabel"
                     t-att-disabled="this.isProvisional"
                     t-on-click="this.openActivities">
                     <i class="fa fa-clock-o" aria-hidden="true"/>
@@ -84,6 +84,7 @@
                         data-available-offline="1"
                         t-att-disabled="row.donePending or row.doneBusy"
                         t-att-aria-busy="row.doneBusy ? 'true' : false"
+                        t-att-aria-label="row.doneAriaLabel"
                         t-on-click="() => this.markDone(row)">
                         <t t-if="row.donePending">Done · Pending sync</t><t t-else="">Mark done</t>
                     </button>
