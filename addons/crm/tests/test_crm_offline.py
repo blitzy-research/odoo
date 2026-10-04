@@ -3,6 +3,7 @@
 import ast
 import copy
 import secrets
+from contextlib import contextmanager
 from datetime import timedelta
 from unittest.mock import patch
 
@@ -11,9 +12,10 @@ from lxml import etree
 from odoo import fields
 from odoo.exceptions import AccessError
 from odoo.tests import HttpCase
-from odoo.tests.common import tagged
+from odoo.tests.common import JsonRpcException, tagged
 from odoo.tools import file_open
 
+from odoo.addons.crm.models.crm_lead import CrmOfflineOriginError
 from odoo.addons.crm.tests.common import TestCrmCommon
 from odoo.addons.mail.tests.common import mail_new_test_user
 from odoo.addons.web.controllers.webmanifest import WebManifest as WebManifestBase
@@ -770,12 +772,85 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
             'stage_id': self.stage_gen_1.id,
         }
         [foreign] = self._quick_create(self.user_sales_leads, vals, key)
-        with self.assertRaises(AccessError):
+        with self.assertRaises(AccessError) as refused:
             self._quick_create(self.user_sales_salesman, vals, key)
+        # sent by its own user: the web client keeps it parked, it is not replayed again
+        self.assertNotIsInstance(refused.exception, CrmOfflineOriginError)
         leads = self.env['crm.lead'].with_context(active_test=False).search([('name', '=', 'Foreign Key Lead')])
         self.assertEqual(leads.ids, [foreign['id']])
         self.assertEqual(leads.create_uid, self.user_sales_leads)
         self.assertEqual(self._quick_create_xmlids(key).res_id, foreign['id'])
+
+    def test_offline_quick_create_replay_queued_by_another_user(self):
+        """ A browser shared by two users keeps one offline queue: a create one
+        user queued must not be delivered in the session of the next one. Its
+        context names the user who queued it (``uid``, sent by the web client
+        with every call), so a first delivery by another user is refused, and
+        creates and registers nothing. Delivered by the user it names, the same
+        create makes its lead once. """
+        salesman, other = self.user_sales_salesman, self.user_sales_leads
+        key = secrets.token_hex(16)
+        vals = {
+            'name': 'Queued Elsewhere Lead',
+            'contact_name': 'Queued Contact',
+            'phone': '',
+            'email_from': '',
+            'expected_revenue': 40.0,
+            'stage_id': self.stage_gen_1.id,
+        }
+
+        def deliver(user, origin_uid):
+            context = dict(self.pipeline_context, crm_offline_create_key=key, uid=origin_uid)
+            return self.env['crm.lead'].with_user(user).with_context(context).browse().web_save(
+                vals, specification={},
+            )
+
+        def created_leads():
+            return self.env['crm.lead'].with_context(active_test=False).search([('name', '=', vals['name'])])
+
+        with self.assertRaises(CrmOfflineOriginError):
+            deliver(salesman, other.id)
+        self.assertFalse(created_leads())
+        self.assertFalse(self._quick_create_xmlids(key))
+
+        # the same call through the web client's JSON-RPC route, whose context
+        # reaches the save as sent: refused as well, under the error name the
+        # web client parks the call with
+        self.authenticate(salesman.login, salesman.login)
+        call = {
+            'model': 'crm.lead',
+            'method': 'web_save',
+            'args': [[], vals],
+            'kwargs': {
+                'context': dict(self.pipeline_context, crm_offline_create_key=key, uid=other.id),
+                'specification': {},
+            },
+        }
+        with self.assertRaises(JsonRpcException) as refused:
+            self.make_jsonrpc_request('/web/dataset/call_kw/crm.lead/web_save', call)
+        # the JSON-RPC error's data.name
+        self.assertEqual(refused.exception.args[0], 'odoo.addons.crm.models.crm_lead.CrmOfflineOriginError')
+        self.assertFalse(created_leads())
+        self.assertFalse(self._quick_create_xmlids(key))
+
+        # delivered by the user who queued it, through the route and again directly
+        call['kwargs']['context']['uid'] = salesman.id
+        first = self.make_jsonrpc_request('/web/dataset/call_kw/crm.lead/web_save', call)
+        lead = created_leads()
+        self.assertEqual(first, [{'id': lead.id}])
+        self.assertEqual((lead.create_uid, lead.user_id), (salesman, salesman))
+        self.assertEqual(self._quick_create_xmlids(key).res_id, lead.id)
+        self.assertEqual(deliver(salesman, salesman.id), first)
+        self.assertEqual(created_leads(), lead, 'Every delivery of one key makes one lead')
+
+        # a later delivery naming another user is refused before the key is looked up
+        with self.assertRaises(CrmOfflineOriginError):
+            deliver(salesman, other.id)
+        with self.assertRaises(CrmOfflineOriginError):
+            deliver(other, salesman.id)
+        # a boolean is no user id: the delivery is checked as without one
+        self.assertEqual(deliver(salesman, False), first)
+        self.assertEqual(created_leads(), lead)
 
     def test_offline_quick_create_replay_invalid_key(self):
         """ Without a well-formed delivery key, a create is a plain create: every
@@ -852,6 +927,218 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self.assertNotIn(taken_over['id'], (delivered['id'], recreated['id']))
         self.assertEqual(self._quick_create_xmlids(key).res_id, taken_over['id'])
         self.assertEqual(self._quick_create(salesman, vals, key), [taken_over])
+
+    # ------------------------------------------------------------
+    # Queue identity
+    # ------------------------------------------------------------
+
+    def _queued_by(self, records, caller, origin, context=None):
+        """ ``records`` as a queued call reaches them when it is replayed in
+        ``caller``'s session: with the call's ``context`` plus the id of the user
+        who queued it (``origin``), which the CRM web client adds to every call it
+        queues under the ``crm_offline_uid`` key. """
+        return records.with_user(caller).with_context(dict(context or {}, crm_offline_uid=origin.id))
+
+    @contextmanager
+    def _assert_queued_by_another_user(self):
+        """ Assert the block raises the ``CrmOfflineOriginError``, an
+        ``AccessError``, refusing a call queued offline by another user. Unlike
+        ``assertRaises``, no savepoint is rolled back on the error, so whatever
+        the call changed before being refused stays visible to the assertions
+        that it changed nothing. """
+        try:
+            yield
+        except AccessError as error:
+            self.assertIsInstance(error, CrmOfflineOriginError)
+            self.assertEqual(
+                error.args[0], "This offline change was sent in another user's session and was not applied.",
+            )
+        else:
+            self.fail("A call queued offline by another user was applied")
+
+    def test_offline_replay_queued_by_another_user_lead_calls(self):
+        """ A browser keeps one offline queue for every session it holds, and
+        pages that do not load the CRM client code (website, portal) replay it
+        in whatever session they have. Each ``crm.lead`` call the CRM queue
+        replays (edit, create, archive, unarchive, won, delete) is refused when
+        the user who queued it is not the caller, and changes nothing; the same
+        call queued by the caller is applied as before. """
+        salesman, other, manager = self.user_sales_salesman, self.user_sales_leads, self.user_sales_manager
+        lead = self._create_salesman_opportunity('Queued Identity Lead', expected_revenue=100)
+        context = self.pipeline_context
+
+        def lead_audit():
+            # with the tracking messages of the writes made so far
+            self.env.cr.flush()
+            lead.invalidate_recordset()
+            return (lead.name, lead.expected_revenue, lead.active, lead.stage_id, lead.probability,
+                    lead.won_status, lead.write_uid, lead.message_ids)
+
+        # edit (form save, card stage move or colour)
+        before = lead_audit()
+        with self._assert_queued_by_another_user():
+            self._queued_by(lead, salesman, other, context).web_save(
+                {'name': 'Foreign Pending', 'expected_revenue': 1777}, specification={},
+            )
+        self.assertEqual(lead_audit(), before)
+        self._queued_by(lead, salesman, salesman, context).web_save(
+            {'name': 'Own Pending', 'expected_revenue': 1777}, specification={},
+        )
+        lead.invalidate_recordset()
+        self.assertEqual((lead.name, lead.expected_revenue, lead.write_uid), ('Own Pending', 1777, salesman))
+        # a boolean is no user id: the call is checked as without one
+        lead.with_user(salesman).with_context(context, crm_offline_uid=True).web_save(
+            {'expected_revenue': 1888}, specification={},
+        )
+        self.assertEqual(lead_audit()[1], 1888)
+
+        # archive, then unarchive (form action menu)
+        before = lead_audit()
+        with self._assert_queued_by_another_user():
+            self._queued_by(lead, salesman, other, context).action_archive()
+        self.assertEqual(lead_audit(), before)
+        self._queued_by(lead, salesman, salesman, context).action_archive()
+        self.assertFalse(lead_audit()[2])
+        before = lead_audit()
+        with self._assert_queued_by_another_user():
+            self._queued_by(lead, salesman, other, context).action_unarchive()
+        self.assertEqual(lead_audit(), before)
+        self._queued_by(lead, salesman, salesman, context).action_unarchive()
+        self.assertTrue(lead_audit()[2])
+
+        # won (form Won button)
+        before = lead_audit()
+        self.assertEqual(before[5], 'pending')
+        with self._assert_queued_by_another_user():
+            self._queued_by(lead, salesman, other, context).action_set_won()
+        self.assertEqual(lead_audit(), before)
+        self.assertTrue(self._queued_by(lead, salesman, salesman, context).action_set_won())
+        self.assertEqual(lead_audit()[3:6], (self.stage_gen_won, 100, 'won'))
+
+        # create (mobile quick create, with its delivery key, and form create)
+        vals = {
+            'name': 'Queued Create Lead',
+            'contact_name': 'Queued Contact',
+            'phone': '+32 494 77 77 77',
+            'email_from': 'queued@example.com',
+            'expected_revenue': 2777.0,
+            'stage_id': self.stage_gen_1.id,
+        }
+        key = secrets.token_hex(16)
+        for create_key in (key, None):
+            with self.subTest(create_key=create_key), self._assert_queued_by_another_user():
+                create_context = dict(context, crm_offline_create_key=create_key)
+                self._queued_by(self.env['crm.lead'], salesman, other, create_context).web_save(vals, specification={})
+        created = self.env['crm.lead'].with_context(active_test=False).search([('name', '=', vals['name'])])
+        self.assertFalse(created)
+        self.assertFalse(self._quick_create_xmlids(key))
+        [delivered] = self._queued_by(
+            self.env['crm.lead'], salesman, salesman, dict(context, crm_offline_create_key=key),
+        ).web_save(vals, specification={})
+        created = self.env['crm.lead'].with_context(active_test=False).search([('name', '=', vals['name'])])
+        self.assertEqual(created.ids, [delivered['id']])
+        self.assertEqual((created.create_uid, created.user_id, created.type), (salesman, salesman, 'opportunity'))
+        self.assertEqual(self._quick_create_xmlids(key).res_id, created.id)
+
+        # delete (card menu or form action menu), by a user allowed to delete
+        doomed = self._create_salesman_opportunity('Queued Delete Lead')
+        with self._assert_queued_by_another_user():
+            self._queued_by(doomed, manager, salesman, context).unlink()
+        self.assertTrue(doomed.exists())
+        self._queued_by(doomed, manager, manager, context).unlink()
+        self.assertFalse(doomed.exists())
+
+    def test_offline_replay_queued_by_another_user_activity_calls(self):
+        """ The activity calls the CRM queue replays ("Log a call", "Schedule
+        follow-up", "Mark done") are refused when queued by another user than
+        the caller, and leave the lead's activities as they were. """
+        salesman, other = self.user_sales_salesman, self.user_sales_leads
+        lead = self._create_salesman_opportunity('Queued Activity Lead')
+        vals = {
+            'res_model': 'crm.lead',
+            'res_id': lead.id,
+            'activity_type_id': self.call_type.id,
+            'summary': 'Call',
+            'date_deadline': fields.Date.to_string(fields.Date.today()),
+            'user_id': salesman.id,
+        }
+
+        def lead_activities():
+            return self.env['mail.activity'].with_context(active_test=False).search([
+                ('res_model', '=', 'crm.lead'), ('res_id', '=', lead.id),
+            ])
+
+        with self._assert_queued_by_another_user():
+            self._queued_by(self.env['mail.activity'], salesman, other).create([dict(vals)])
+        self.assertFalse(lead_activities())
+        activity = self._queued_by(self.env['mail.activity'], salesman, salesman).create([dict(vals)])
+        self.assertEqual(lead_activities(), activity)
+        self.assertEqual((activity.create_uid, activity.user_id), (salesman, salesman))
+        self.assertEqual(activity.sudo().res_model_id.model, 'crm.lead')
+
+        with self._assert_queued_by_another_user():
+            self._queued_by(activity, salesman, other).action_done()
+        lead.invalidate_recordset(['activity_ids'])
+        self.assertEqual(lead.activity_ids, activity)
+        self.assertEqual(lead_activities(), activity)
+        self.assertTrue(activity.active)
+        self.assertFalse(self._get_activity_done_messages(lead, self.call_type))
+        self._queued_by(activity, salesman, salesman).action_done()
+        lead.invalidate_recordset(['activity_ids'])
+        self.assertFalse(lead.activity_ids)
+        self.assertEqual(len(self._get_activity_done_messages(lead, self.call_type)), 1)
+
+    def test_offline_replay_queued_by_another_user_stage_and_team_saves(self):
+        """ The stage form save and the Sales Teams card colour, queued offline,
+        are refused when queued by another user than the caller (a manager, who
+        may write both), and change nothing. """
+        manager, salesman = self.user_sales_manager, self.user_sales_salesman
+        team_color = 1 if self.sales_team_1.color != 1 else 2
+        for record, fname, value in (
+            (self.stage_gen_1, 'name', 'Queued Stage'),
+            (self.sales_team_1, 'color', team_color),
+        ):
+            with self.subTest(model=record._name):
+                record.invalidate_recordset()
+                before = (record[fname], record.write_uid)
+                self.assertNotEqual(before[0], value)
+                with self._assert_queued_by_another_user():
+                    self._queued_by(record, manager, salesman).web_save({fname: value}, specification={})
+                record.invalidate_recordset()
+                self.assertEqual((record[fname], record.write_uid), before)
+                self._queued_by(record, manager, manager).web_save({fname: value}, specification={})
+                record.invalidate_recordset()
+                self.assertEqual((record[fname], record.write_uid), (value, manager))
+
+    def test_offline_replay_queued_by_another_user_through_json_rpc(self):
+        """ The replay a page without the CRM client code sends, through the web
+        client's JSON-RPC route in the session of the user signed in on the
+        browser, of a lead edit another user queued: refused, the lead is left
+        as it was. The same call queued by the signed-in user is applied. """
+        salesman, other = self.user_sales_salesman, self.user_sales_leads
+        lead = self._create_salesman_opportunity('Queued Route Lead', expected_revenue=100)
+        before = (lead.name, lead.expected_revenue, lead.write_uid)
+        self.authenticate(salesman.login, salesman.login)
+        call = {
+            'model': 'crm.lead',
+            'method': 'web_save',
+            'args': [[lead.id], {'name': 'Route Pending', 'expected_revenue': 1777}],
+            'kwargs': {
+                'context': dict(self.pipeline_context, uid=other.id, crm_offline_uid=other.id),
+                'specification': {},
+            },
+        }
+        with self.assertRaises(JsonRpcException) as refused:
+            self.make_jsonrpc_request('/web/dataset/call_kw/crm.lead/web_save', call)
+        # the JSON-RPC error's data.name
+        self.assertEqual(refused.exception.args[0], 'odoo.addons.crm.models.crm_lead.CrmOfflineOriginError')
+        lead.invalidate_recordset()
+        self.assertEqual((lead.name, lead.expected_revenue, lead.write_uid), before)
+
+        call['kwargs']['context'].update(uid=salesman.id, crm_offline_uid=salesman.id)
+        self.assertEqual(self.make_jsonrpc_request('/web/dataset/call_kw/crm.lead/web_save', call), [{'id': lead.id}])
+        lead.invalidate_recordset()
+        self.assertEqual((lead.name, lead.expected_revenue, lead.write_uid), ('Route Pending', 1777, salesman))
 
     # ------------------------------------------------------------
     # Wiring

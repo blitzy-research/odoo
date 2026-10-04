@@ -128,6 +128,12 @@ class CrmTeam(models.Model):
                 })
         return result
 
+    def web_save(self, vals, specification, next_id=None):
+        """ Refuse a save queued offline by another user (``crm.lead``
+        ``_check_offline_queue_origin``); saving itself is unchanged. """
+        self.env['crm.lead']._check_offline_queue_origin()
+        return super().web_save(vals, specification, next_id=next_id)
+
     def unlink(self):
         """ When unlinking, concatenate ``crm.lead.scoring.frequency`` linked to
         the team into "no team" statistics. """

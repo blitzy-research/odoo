@@ -341,4 +341,15 @@
         </xpath>
     </t>
 
+    <!--
+        Offline, a lead chatter's attachment dropzones (crmOfflineInert, crm_form.js)
+        render nothing, so a dropped file is neither saved with a new lead nor
+        uploaded. Online, and for every other dropzone, the markup is mail's.
+    -->
+    <t t-inherit="mail.MailAttachmentDropzone" t-inherit-mode="extension">
+        <xpath expr="//Dropzone" position="attributes">
+            <attribute name="t-if">!this.crmOfflineInert</attribute>
+        </xpath>
+    </t>
+
 </templates>

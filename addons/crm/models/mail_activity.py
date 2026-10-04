@@ -16,7 +16,9 @@ class MailActivity(models.Model):
         """ Resolve ``res_model_id`` for ``crm.lead`` values without a truthy identifier, removing
         the readonly ``res_model`` for recomputation. Offline name-based replay lacks ``ir.model``
         ids. The cached ``ir.model._get`` lookup is sudoed; activity creation retains the caller's
-        rights. Explicit ids and other models pass through unchanged. """
+        rights. Explicit ids and other models pass through unchanged. A create queued offline by
+        another user is refused first (``crm.lead`` ``_check_offline_queue_origin``). """
+        self.env['crm.lead']._check_offline_queue_origin()
         crm_lead_model_id = False
         for vals in vals_list:
             if vals.get("res_model") == "crm.lead" and not vals.get("res_model_id"):
@@ -29,6 +31,12 @@ class MailActivity(models.Model):
     # ------------------------------------------------------------
     # ACTIONS
     # ------------------------------------------------------------
+
+    def action_done(self):
+        """ Refuse a mark done queued offline by another user (``crm.lead``
+        ``_check_offline_queue_origin``); marking done itself is unchanged. """
+        self.env['crm.lead']._check_offline_queue_origin()
+        return super().action_done()
 
     def action_create_calendar_event(self):
         """ Small override of the action that creates a calendar.

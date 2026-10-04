@@ -16,6 +16,7 @@ import {
     useListener,
     usePlugin,
 } from "@odoo/owl";
+import { MailComposerFormRenderer } from "@mail/chatter/web/mail_composer_form";
 import { ActivityButton } from "@mail/core/web/activity_button";
 import { AutoComplete } from "@web/core/autocomplete/autocomplete";
 import { browser } from "@web/core/browser/browser";
@@ -37,6 +38,7 @@ import { Record } from "@web/model/relational_model/record";
 import { getScheduleORMExtras } from "@web/model/relational_model/utils";
 import { useEnv } from "@web/owl2/utils";
 import { ActionMenus } from "@web/search/action_menus/action_menus";
+import { session } from "@web/session";
 import { CardRenderer } from "@web/views/card/card_renderer";
 import { Many2ManyTagsField } from "@web/views/fields/many2many_tags/many2many_tags_field";
 import { Many2XAutocomplete } from "@web/views/fields/relational_utils";
@@ -94,7 +96,9 @@ export const CRM_OFFLINE_BUTTON_MODELS = freezeSet([
 /**
  * Buttons of other models that open CRM data or CRM configuration. `name: null`
  * matches any button name; `contextModule` additionally requires the button's
- * (or the record's) context `module` key, as the CRM settings page sets it.
+ * (or the record's) context `module` key, as the CRM settings page sets it. CRM's
+ * own settings method matches whatever settings page shows it (the General
+ * Settings show the CRM app too).
  *
  * @type {ReadonlyArray<Readonly<{resModel: string, name: string|null, contextModule?: string}>>}
  */
@@ -102,6 +106,7 @@ export const CRM_OFFLINE_BUTTON_METHODS = Object.freeze([
     Object.freeze({ resModel: "res.partner", name: "action_view_opportunity" }),
     Object.freeze({ resModel: "utm.campaign", name: "action_redirect_to_leads_opportunities" }),
     Object.freeze({ resModel: "res.config.settings", name: null, contextModule: "crm" }),
+    Object.freeze({ resModel: "res.config.settings", name: "action_crm_assign_leads" }),
 ]);
 
 /** Action `xml_id`s that never open offline (forecast, reports, wizards, settings...). */
@@ -148,6 +153,31 @@ const CRM_WIZARD_MODELS = freezeSet([
     "crm.merge.opportunity",
     "crm.lead.pls.update",
 ]);
+
+/**
+ * Action `xml_id`s of the CRM bound mail composers (`mail.compose.message`): a
+ * composer they opened is a CRM transient wizard, while composers opened by any
+ * other action are CRM's only when they write to leads (`CRM_LEAD_MAIL_WIZARD_KEYS`).
+ */
+const CRM_COMPOSER_ACTIONS = freezeSet([
+    "crm.action_lead_mail_compose",
+    "crm.action_lead_mass_mail",
+]);
+
+/**
+ * Mail wizards of a lead's chatter, by the context key naming the model they write
+ * to: the full composer (`default_model`) and the followers wizard of the followers
+ * menu (`default_res_model`, also set by `crm.mail_followers_edit_action_from_lead`).
+ * Opened with `crm.lead` there, such a wizard is a CRM transient wizard of the
+ * read-only lead chatter; opened on any other model, it is mail's.
+ */
+const CRM_LEAD_MAIL_WIZARD_KEYS = Object.freeze({
+    "mail.compose.message": "default_model",
+    "mail.followers.edit": "default_res_model",
+});
+
+/** `xml_id` of the CRM lead meetings action (`calendar.event`), in `CRM_OFFLINE_DISABLED_ACTIONS`. */
+const CRM_MEETINGS_ACTION = "crm.act_crm_opportunity_calendar_event_new";
 
 /** Record models whose `object`/`action` view buttons are disabled offline. */
 const CRM_VIEW_BUTTON_MODELS = freezeSet(["crm.lead", "crm.team", "crm.stage"]);
@@ -320,20 +350,53 @@ export function isCrmOfflineGuarded(record, clickParams, attrs) {
 }
 
 /**
- * Tells whether a form, or its record, holds a CRM transient record that only its
- * buttons use: a CRM wizard, or the settings opened with `context.module` "crm" (the
- * CRM settings page). Offline, saving or reloading such a record cannot work: its
- * `web_save` is a transient write, never queued, and the settings model reads no
- * cache. Pure: it reads no signal.
+ * Tells whether a view, form or record holds a lead's meeting (`calendar.event`):
+ * opened by the CRM meetings action (`CRM_MEETINGS_ACTION`), or in a context naming
+ * a lead the way the server links a new meeting to it (`calendar.event.default_get`
+ * in `crm/models/calendar.py`): `default_opportunity_id`, set by the lead's
+ * Schedule Meeting and by the calendar opened for a lead's meeting activity, or
+ * `default_res_model` "crm.lead", set by the calendar opened from a lead's activity
+ * scheduling. Meetings have no offline support, so offline such a meeting is
+ * neither written nor queued. Pure: it reads no signal.
  *
  * @param {string} [resModel]
  * @param {Object} [context]
+ * @param {string|false} [actionXmlId] `xml_id` of the action that opened the view
  * @returns {boolean}
  */
-function isCrmOfflineTransientForm(resModel, context) {
+function isCrmOfflineMeeting(resModel, context, actionXmlId) {
+    return (
+        resModel === "calendar.event" &&
+        (actionXmlId === CRM_MEETINGS_ACTION ||
+            Boolean(context?.default_opportunity_id) ||
+            context?.default_res_model === "crm.lead")
+    );
+}
+
+/**
+ * Tells whether a form, or its record, holds a CRM record that is never saved
+ * offline. These are the CRM transient records that only their buttons use: a CRM
+ * wizard, the settings opened with `context.module` "crm" (the CRM settings page),
+ * a mail composer opened by a CRM bound action (`CRM_COMPOSER_ACTIONS`, read from
+ * the opening action's `xml_id`), or a mail wizard of the lead chatter, opened on
+ * leads (`CRM_LEAD_MAIL_WIZARD_KEYS`, read from the form's context). They also
+ * include a lead's meeting (`isCrmOfflineMeeting`). Offline, saving or reloading
+ * such a record cannot work: its `web_save` is a transient or meeting write, never
+ * queued, and the settings model reads no cache. Pure: it reads no signal.
+ *
+ * @param {string} [resModel]
+ * @param {Object} [context]
+ * @param {string|false} [actionXmlId] `xml_id` of the action that opened the form
+ * @returns {boolean}
+ */
+function isCrmOfflineTransientForm(resModel, context, actionXmlId) {
     return (
         CRM_WIZARD_MODELS.has(resModel) ||
-        (resModel === "res.config.settings" && context?.module === "crm")
+        (resModel === "res.config.settings" && context?.module === "crm") ||
+        (resModel === "mail.compose.message" && CRM_COMPOSER_ACTIONS.has(actionXmlId)) ||
+        (Object.hasOwn(CRM_LEAD_MAIL_WIZARD_KEYS, resModel) &&
+            context?.[CRM_LEAD_MAIL_WIZARD_KEYS[resModel]] === "crm.lead") ||
+        isCrmOfflineMeeting(resModel, context, actionXmlId)
     );
 }
 
@@ -758,6 +821,29 @@ function withHeld(queued, held) {
 }
 
 /**
+ * Provisional card data of a lead creation entry (`leadCreatesByStage`): its key,
+ * the display values its save recorded (`extras.changes`, else the saved values),
+ * and whether its replay was rejected (parked).
+ *
+ * @param {{key: string, value: Object}} entry
+ * @returns {{key: string, name: any, contact_name: any, partner_id: any,
+ *  expected_revenue: any, stage_id: any, parked: boolean}}
+ */
+function provisionalLead(entry) {
+    const { args, extras } = entry.value;
+    const source = isFieldMapping(extras?.changes) ? extras.changes : args[1];
+    return {
+        key: entry.key,
+        name: source.name,
+        contact_name: source.contact_name,
+        partner_id: source.partner_id,
+        expected_revenue: source.expected_revenue,
+        stage_id: source.stage_id,
+        parked: isParked(entry),
+    };
+}
+
+/**
  * Activity types are warmed once per web-client session: the flag is set when a
  * warm-up starts, kept after a success and cleared by a failure, so a later call in
  * the same session tries again. The session is the lifetime of the framework
@@ -811,6 +897,30 @@ async function readLeadActivityTypes(orm) {
         { specification: { display_name: {} } }
     );
     return records;
+}
+
+/**
+ * Resolves with the rows of `read`, a read of the framework relational-field cache
+ * (`searchMany2XRecords`, `readMany2XRecords`), or with `undefined`, the value those
+ * reads resolve with when there is no cache, when it reaches a row this session
+ * cannot decrypt. The cache is shared by every user of the browser, while each
+ * user's rows are encrypted with that user's key: the Web Crypto API rejects a row
+ * written by another user with an "OperationError", which fails the whole read.
+ * Such a read has nothing usable for this user. Every other error propagates.
+ *
+ * @template T
+ * @param {Promise<T>} read
+ * @returns {Promise<T|undefined>}
+ */
+async function readDecryptableCache(read) {
+    try {
+        return await read;
+    } catch (error) {
+        if (error instanceof DOMException && error.name === "OperationError") {
+            return undefined;
+        }
+        throw error;
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -874,6 +984,14 @@ const crmReplayPlugins = new WeakSet();
  * delivery of that key with this lead instead of creating another one.
  */
 export const CRM_OFFLINE_CREATE_KEY = "crm_offline_create_key";
+
+/**
+ * Context key of the id of the user who queued a call of `CRM_REPLAY_MODELS`. The
+ * offline store is shared by every session of the browser, and pages that do not
+ * load this module (website, portal) replay it in whatever session they have, so
+ * the server refuses a call carrying this key whose user is not the caller.
+ */
+export const CRM_OFFLINE_UID_KEY = "crm_offline_uid";
 
 /**
  * A new delivery key (`CRM_OFFLINE_CREATE_KEY`): 128 random bits as 32 lowercase
@@ -977,7 +1095,124 @@ function installCrmReplay(plugin) {
     });
 }
 
+/**
+ * The identity of this web client's session: its user and its database. A queued
+ * call of `CRM_REPLAY_MODELS` carries it as `extras.crmOrigin`, so that only a
+ * session of that user on that database loads, shows and replays it
+ * (`isForeignCrmEntry`).
+ *
+ * @returns {{uid: number|false, db: string}}
+ */
+function currentCrmOrigin() {
+    return { uid: user.userId, db: session.db };
+}
+
+/**
+ * Tells whether a queued call of `CRM_REPLAY_MODELS`, read from the offline store,
+ * belongs to another identity than this session's. The offline store is shared by
+ * every session of the browser, while a call must be shown and replayed only to
+ * and by the user who queued it. Its owner is the identity it was queued with
+ * (`extras.crmOrigin`: user and database); a call queued without one is owned by
+ * the user its call context names (`kwargs.context.uid`, which the web client
+ * sends with every call). A call naming neither cannot be attributed and is kept,
+ * as the framework keeps every call. A session without a user owns no attributed
+ * call. Calls of every other model are the framework's, and never foreign here.
+ *
+ * @param {{model?: string, kwargs?: Object, extras?: Object}} value a stored queue
+ *  entry's value
+ * @returns {boolean}
+ */
+function isForeignCrmEntry(value) {
+    if (!CRM_REPLAY_MODELS.has(value?.model)) {
+        return false;
+    }
+    const { uid, db } = currentCrmOrigin();
+    const origin = value.extras?.crmOrigin;
+    if (isFieldMapping(origin)) {
+        return !uid || origin.uid !== uid || (origin.db ?? null) !== (db ?? null);
+    }
+    const contextUid = value.kwargs?.context?.uid;
+    if (Number.isInteger(contextUid)) {
+        return !uid || contextUid !== uid;
+    }
+    return false;
+}
+
 patch(OfflinePlugin.prototype, {
+    /**
+     * Queues a call as the framework does. A call of `CRM_REPLAY_MODELS` also
+     * carries, in its `extras`, the identity of the session queuing it
+     * (`currentCrmOrigin`), unless its extras already name one: the framework
+     * parks a refused call by queuing it again under its key with
+     * `{...extras, error}`, and it stays its first owner's.
+     *
+     * Such a call is also sent with the id of the user queuing it in its context
+     * (`CRM_OFFLINE_UID_KEY`), unless its context already names one, as the parked
+     * call queued again with its stored kwargs does. Pages that do not load this
+     * module replay the shared offline store without the filter above, in their
+     * own session, and the server refuses a call whose context names another
+     * user than the caller. Only queued calls carry the key: online calls are
+     * sent unchanged. Its model, method and args are queued, and replayed,
+     * unchanged; the caller's kwargs and options are not modified.
+     *
+     * @param {string} model
+     * @param {string} method
+     * @param {any[]} args
+     * @param {Object} kwargs
+     * @param {{id?: string, extras?: Object}} options
+     * @returns {string} the queue key
+     */
+    scheduleORM(model, method, args, kwargs, options) {
+        if (CRM_REPLAY_MODELS.has(model)) {
+            if (options && !options.extras?.crmOrigin) {
+                options = {
+                    ...options,
+                    extras: { ...options.extras, crmOrigin: currentCrmOrigin() },
+                };
+            }
+            if (!(kwargs?.context && CRM_OFFLINE_UID_KEY in kwargs.context)) {
+                kwargs = {
+                    ...kwargs,
+                    context: { ...kwargs?.context, [CRM_OFFLINE_UID_KEY]: user.userId },
+                };
+            }
+        }
+        return super.scheduleORM(model, method, args, kwargs, options);
+    },
+
+    /**
+     * Loads the queue from the offline store as the framework does, without the
+     * calls of another identity (`isForeignCrmEntry`). The store is shared by every
+     * session of the browser, so a user's pending CRM calls would otherwise be
+     * shown to, and replayed as, the next user signing in on it. Left out of the
+     * queue, they are not projected (pipeline, cards, lead form, activity sheet),
+     * listed in the systray, replayed nor discarded: they stay in the store,
+     * unchanged, until a session of their own user loads them. This only keeps
+     * them out of another user's web client; it does not protect the store itself.
+     *
+     * The framework sets the queue from the whole store. Setting it so, then
+     * removing the foreign calls, would show them to the queue's immediate effects
+     * in between (the replay hold would take them for replayed calls and project
+     * them), so the store is read here and the queue set once, already filtered.
+     *
+     * Every other call is loaded exactly as stored, a parked one with its error.
+     * A call the server refused because it was sent in another user's session (a
+     * page without this module replayed it there) stays parked like any refused
+     * call: the replay skips it, and the systray shows the server's error, where
+     * its user discards it, or reopens an edit to save it again.
+     */
+    async _updateScheduledORMList() {
+        const table = await this._idb.getAllEntries(OfflinePlugin.ORM_SYNC_TABLE_NAME);
+        const entries = table.map((v) => ({ key: v.key, value: JSON.parse(v.value) }));
+        this._ormToSync.set(
+            Object.fromEntries(
+                entries
+                    .filter(({ value }) => !isForeignCrmEntry(value))
+                    .map((entry) => [entry.key, entry])
+            )
+        );
+    },
+
     /** Replays the queue with the CRM delivery guarantees of `crmReplayCall`. */
     async _syncORM() {
         installCrmReplay(this);
@@ -1291,8 +1526,10 @@ export function useCrmOffline() {
     /**
      * Every lead stage of the framework relational-field cache, read without a
      * request (online and offline), in the cache's (id) order; `[]` when none is
-     * cached, as outside a secure context, where the framework caches nothing.
-     * An entry without a name (removed while it was read) is left out.
+     * cached, as outside a secure context, where the framework caches nothing, and
+     * when the cache holds a stage this session cannot decrypt
+     * (`readDecryptableCache`). An entry without a name (removed while it was read)
+     * is left out.
      *
      * @returns {Promise<{id: number, display_name: string}[]>}
      */
@@ -1303,7 +1540,8 @@ export function useCrmOffline() {
         if (!keys.length) {
             return [];
         }
-        const stages = (await plugin.readMany2XRecords("crm.stage", keys)) || [];
+        const stages =
+            (await readDecryptableCache(plugin.readMany2XRecords("crm.stage", keys))) || [];
         return stages.filter((stage) => stage.display_name);
     };
 
@@ -1425,19 +1663,29 @@ export function useCrmOffline() {
                 readQueueIndex(plugin).leadCreatesByStage.get(stageId),
                 readHeldIndex(plugin).leadCreatesByStage.get(stageId)
             );
-            return entries.map((entry) => {
-                const { args, extras } = entry.value;
-                const source = isFieldMapping(extras?.changes) ? extras.changes : args[1];
-                return {
-                    key: entry.key,
-                    name: source.name,
-                    contact_name: source.contact_name,
-                    partner_id: source.partner_id,
-                    expected_revenue: source.expected_revenue,
-                    stage_id: source.stage_id,
-                    parked: isParked(entry),
-                };
-            });
+            return entries.map(provisionalLead);
+        },
+
+        /**
+         * Leads created offline (as `pendingCreates`) in a stage that none of
+         * `stageIds` is, in replay order, as provisional card data: e.g. a creation
+         * in a stage deleted on the server since it was queued, which its replay
+         * parks. The caller shows them where it shows its own stages' creations, so
+         * that every creation the queue holds keeps a card.
+         *
+         * @param {Set<number|false>} stageIds the stages the caller displays
+         */
+        pendingCreatesOutside(stageIds) {
+            const queued = readQueueIndex(plugin).leadCreatesByStage;
+            const held = readHeldIndex(plugin).leadCreatesByStage;
+            const entries = [];
+            for (const stageId of new Set([...queued.keys(), ...held.keys()])) {
+                if (!stageIds.has(stageId)) {
+                    entries.push(...withHeld(queued.get(stageId), held.get(stageId)));
+                }
+            }
+            // Stable: entries of one time stamp keep their stage's replay order.
+            return entries.sort(byTimeStamp).map(provisionalLead);
         },
 
         /**
@@ -1617,14 +1865,18 @@ export function useCrmOffline() {
          *   set up for another model) is not offered;
          * - before that: every cached type, in the cache's (id) order;
          * - without relational-field cache (a non-secure context, or no cache
-         *   secret in the session): online, the types read from the server as the
-         *   warm-up reads them, `[]` when that read fails; offline, `[]`.
-         * Online with the cache, and offline, no RPC is issued.
+         *   secret in the session), or when the cached types include one this
+         *   session cannot decrypt (`readDecryptableCache`): online, the types read
+         *   from the server as the warm-up reads them, `[]` when that read fails;
+         *   offline, `[]`.
+         * Online with a readable cache, and offline, no RPC is issued.
          *
          * @returns {Promise<{id: number, display_name: string}[]>}
          */
         async getActivityTypes() {
-            const cached = await plugin.searchMany2XRecords("mail.activity.type", "");
+            const cached = await readDecryptableCache(
+                plugin.searchMany2XRecords("mail.activity.type", "")
+            );
             if (cached === undefined) {
                 if (isOffline()) {
                     return [];
@@ -1642,10 +1894,13 @@ export function useCrmOffline() {
             }
             const typesById = new Map(cached.map((type) => [type.id, type]));
             // The cache search returns a bounded number of rows: the warmed types it
-            // did not return are read by id; an id absent from the cache has no label.
+            // did not return are read by id; an id absent from the cache, or read with
+            // a row this session cannot decrypt, has no label.
             const missingIds = warmedIds.filter((id) => !typesById.has(id));
             if (missingIds.length) {
-                const read = await plugin.readMany2XRecords("mail.activity.type", missingIds);
+                const read = await readDecryptableCache(
+                    plugin.readMany2XRecords("mail.activity.type", missingIds)
+                );
                 for (const type of read || []) {
                     if (type.display_name !== undefined) {
                         typesById.set(type.id, type);
@@ -1694,9 +1949,16 @@ export function useCrmOffline() {
             return { stages: await getCachedStages(), cached: true };
         },
 
-        /** @returns {Promise<{id: number, display_name: string}[]>} session user first */
+        /**
+         * The session user first, then the cached users, each once; the session user
+         * alone without cache, or when the cached users include one this session
+         * cannot decrypt (`readDecryptableCache`).
+         *
+         * @returns {Promise<{id: number, display_name: string}[]>}
+         */
         async getAssignees() {
-            const cached = (await plugin.searchMany2XRecords("res.users", "")) || [];
+            const cached =
+                (await readDecryptableCache(plugin.searchMany2XRecords("res.users", ""))) || [];
             const assignees = [{ id: user.userId, display_name: user.name }];
             const seen = new Set([user.userId]);
             for (const assignee of cached) {
@@ -1794,7 +2056,8 @@ export function useCrmOffline() {
          * Create with `list.context` plus a new delivery key (`CRM_OFFLINE_CREATE_KEY`).
          * Offline or connection-loss saves return a queue key and use `extras.changes`
          * for provisional display. The queued create is the call the online save sent,
-         * key included: a save whose answer was lost may have created the lead, and
+         * key included (queued with its user, `CRM_OFFLINE_UID_KEY`, as every CRM call
+         * is): a save whose answer was lost may have created the lead, and
          * its replay (any tab, after a reload) is then answered with that lead rather
          * than creating it twice. Online save errors propagate; committed writes
          * resolve even when refresh fails, with errors reported through
@@ -2072,25 +2335,80 @@ function isActionIdRequest(actionRequest) {
     );
 }
 
+/** One Unicode decimal digit (`Nd`): the characters `ACTION_ID_TEXT` reads as digits. */
+const DECIMAL_DIGIT = /^\p{Nd}$/u;
+
+/**
+ * The value of a Unicode decimal digit. Unicode encodes the `Nd` characters in
+ * contiguous runs of ten, ascending from 0 to 9, so a digit's value is its offset in
+ * its maximal contiguous `Nd` run, modulo ten.
+ *
+ * @param {number} codePoint the code point of an `Nd` character
+ * @returns {number} 0 to 9
+ */
+function decimalDigitValue(codePoint) {
+    let runStart = codePoint;
+    while (runStart > 0 && DECIMAL_DIGIT.test(String.fromCodePoint(runStart - 1))) {
+        runStart--;
+    }
+    return (codePoint - runStart) % 10;
+}
+
+/**
+ * The action id an id request (`isActionIdRequest`) stands for, as the server's
+ * `int()` reads it: a number truncated toward zero, or a string's sign applied to
+ * its digits (any Unicode decimal digit), whitespace and underscores dropped. Every
+ * form of one id therefore gives the same integer. Pure.
+ *
+ * @param {unknown} actionRequest
+ * @returns {number|null} `null` for a request that is not an id, or whose value is
+ *  not a safe integer
+ */
+function normalizeActionId(actionRequest) {
+    if (!isActionIdRequest(actionRequest)) {
+        return null;
+    }
+    let id;
+    if (typeof actionRequest === "number") {
+        id = Math.trunc(actionRequest);
+    } else {
+        let digits = "";
+        // By code point: some decimal digits lie outside the Basic Multilingual Plane.
+        for (const char of actionRequest) {
+            if (DECIMAL_DIGIT.test(char)) {
+                digits += decimalDigitValue(char.codePointAt(0));
+            }
+        }
+        id = actionRequest.includes("-") ? -Number(digits) : Number(digits);
+    }
+    return Number.isSafeInteger(id) ? id : null;
+}
+
 /**
  * Identifies an action from what the client already holds, with no request:
  * offline, a lookup through the action service's disk-cached `loadAction` would
  * still attempt the network (the RPC cache always does on a RAM miss), so the
  * guards never call it. Reads the CRM actions the web client itself loaded in this
- * session (`knownActions`), then the action stored in the session.
+ * session (`knownActions`), then the action stored in the session. An id request
+ * matches by its value (`normalizeActionId`), whichever id form loaded the action.
  *
  * @param {Map<number|string, Readonly<{xml_id?: string, res_model?: string}>>} knownActions
- * @param {number|string} actionRef an id, `xml_id` or path, as requested
+ * @param {number|string} actionRef an id (a number or a string the server reads as
+ *  one), `xml_id` or path, as requested
  * @returns {Object|null} `null` when unknown
  */
 function resolveKnownAction(knownActions, actionRef) {
-    const known = knownActions.get(actionRef);
+    const id = normalizeActionId(actionRef);
+    const known = knownActions.get(actionRef) ?? (id === null ? null : knownActions.get(id));
     if (known) {
         return known;
     }
     try {
         const stored = JSON.parse(browser.sessionStorage.getItem("current_action") || "{}");
-        if ([stored.id, stored.path, stored.xml_id].filter(Boolean).includes(actionRef)) {
+        if (
+            [stored.id, stored.path, stored.xml_id].filter(Boolean).includes(actionRef) ||
+            (id !== null && normalizeActionId(stored.id) === id)
+        ) {
             return stored;
         }
         return null;
@@ -2098,6 +2416,27 @@ function resolveKnownAction(knownActions, actionRef) {
         // An unreadable stored action identifies nothing.
         return null;
     }
+}
+
+/**
+ * Whether an action request names a disabled action, with no request: an `xml_id`
+ * of the set, or an action object carrying one (`isDisabledActionRequest`), or an id
+ * the client already holds for such an action (`resolveKnownAction`). Reads no
+ * signal. `doAction` requests and `type="action"` button names are both loaded by
+ * the action service's `_loadAction`, so both are identified here.
+ *
+ * @param {Map<number|string, Readonly<{xml_id?: string, res_model?: string}>>} knownActions
+ * @param {unknown} actionRequest
+ * @returns {boolean}
+ */
+function isKnownDisabledAction(knownActions, actionRequest) {
+    return (
+        isDisabledActionRequest(actionRequest) ||
+        (isActionIdRequest(actionRequest) &&
+            CRM_OFFLINE_DISABLED_ACTIONS.has(
+                resolveKnownAction(knownActions, actionRequest)?.xml_id
+            ))
+    );
 }
 
 /**
@@ -2129,6 +2468,65 @@ function isBlockedRouterState(knownActions, state) {
 }
 
 /**
+ * Whether a `doActionButton` request is a `type="action"` button opening a disabled
+ * action (`isKnownDisabledAction` of its `name`), whatever the button's model: the
+ * action service loads that `name` itself, past the `doAction` guard.
+ *
+ * @param {Map<number|string, Readonly<{xml_id?: string, res_model?: string}>>} knownActions
+ * @param {{type?: string, name?: unknown}} params
+ * @returns {boolean}
+ */
+function isDisabledActionButton(knownActions, params) {
+    return params.type === "action" && isKnownDisabledAction(knownActions, params.name);
+}
+
+/** Context keys a `mail.activity` button call names its activity's record model by. */
+const ACTIVITY_RECORD_MODEL_KEYS = Object.freeze([
+    "active_model",
+    "default_res_model",
+    "res_model",
+]);
+
+/**
+ * Whether a `doActionButton` request runs `mail.activity.action_create_calendar_event`
+ * (overridden by CRM) for a lead's activity, identified with no request: a
+ * `crm.lead` model in the call's own context, the mail store's copy of a targeted
+ * activity, or the lead view the action service displays (a dialog opened from a
+ * lead keeps that view current). Reads no signal; the mail store is optional.
+ *
+ * @param {Object} api the action manager returned by `actionService.start`
+ * @param {Object} env the action service's env
+ * @param {{type?: string, resModel?: string, name?: unknown, resId?: number, resIds?: number[], context?: Object, buttonContext?: Object}} params
+ * @returns {boolean}
+ */
+function isCrmLeadActivityCalendarCall(api, env, params) {
+    if (
+        params.type !== "object" ||
+        params.resModel !== "mail.activity" ||
+        params.name !== "action_create_calendar_event"
+    ) {
+        return false;
+    }
+    const contexts = [params.context, params.buttonContext];
+    if (
+        contexts.some((context) =>
+            ACTIVITY_RECORD_MODEL_KEYS.some((key) => context?.[key] === "crm.lead")
+        )
+    ) {
+        return true;
+    }
+    const activities = env.services["mail.store"]?.["mail.activity"];
+    const activityIds = [params.resId, ...(Array.isArray(params.resIds) ? params.resIds : [])];
+    if (activityIds.some((id) => id && activities?.get(id)?.res_model === "crm.lead")) {
+        return true;
+    }
+    const controller = api.currentController;
+    return (
+        controller?.props?.resModel === "crm.lead" || controller?.action?.res_model === "crm.lead"
+    );
+}
+
+/**
  * Wraps the action manager's public entry points in place. The object is
  * mutated, never copied: it exposes `currentController`/`currentAction` getters,
  * and its internal calls go through closures, which the view-mount guard below
@@ -2139,13 +2537,15 @@ function isBlockedRouterState(knownActions, state) {
  * the CRM actions found in the web client's own `/web/action/load` responses, and
  * the action stored in the session. This index answers the guards' predicates,
  * never a load. A request it cannot identify goes to the original, whose load
- * fails like that of any uncached action, and the view-mount guard still stops
- * any CRM target.
+ * fails like that of any uncached action, or is answered from the disk cache (an
+ * action loaded in an earlier page session); the view-mount guard still stops any
+ * CRM target and any view of a disabled action.
  *
  * @param {Object} api the action manager returned by `actionService.start`
  * @param {OfflinePlugin} offlinePlugin
+ * @param {Object} env the action service's env
  */
-function guardActionManager(api, offlinePlugin) {
+function guardActionManager(api, offlinePlugin, env) {
     const { doAction, doActionButton, switchView, loadState } = api;
 
     /** Keyed by every reference a loaded CRM action answers to; other actions are never kept. */
@@ -2186,7 +2586,9 @@ function guardActionManager(api, offlinePlugin) {
         if (
             params &&
             !params.special &&
-            isCrmOfflineButtonCall(params) &&
+            (isCrmOfflineButtonCall(params) ||
+                isDisabledActionButton(knownActions, params) ||
+                isCrmLeadActivityCalendarCall(api, env, params)) &&
             offlinePlugin.isOffline()
         ) {
             return Promise.resolve();
@@ -2196,20 +2598,9 @@ function guardActionManager(api, offlinePlugin) {
 
     api.doAction = function crmOfflineDoAction(...args) {
         const [actionRequest] = args;
-        if (isDisabledActionRequest(actionRequest)) {
-            if (offlinePlugin.isOffline()) {
-                return Promise.resolve();
-            }
-        } else if (
-            isActionIdRequest(actionRequest) &&
-            offlinePlugin.isOffline() &&
-            // An id (a number or a numeric string) is identified, as requested, from
-            // the actions the client already holds, with no request; an unknown one
-            // goes to the original (whose load fails like any other).
-            CRM_OFFLINE_DISABLED_ACTIONS.has(
-                resolveKnownAction(knownActions, actionRequest)?.xml_id
-            )
-        ) {
+        // An id the client does not hold goes to the original (whose load fails like
+        // any other, or opens the view-mount guard's offline helper).
+        if (isKnownDisabledAction(knownActions, actionRequest) && offlinePlugin.isOffline()) {
             return Promise.resolve();
         }
         return doAction.apply(this, args);
@@ -2243,7 +2634,7 @@ patch(actionService, {
         // Resolved synchronously: the service scope only exists during `start`.
         const offlinePlugin = usePlugin(OfflinePlugin);
         const api = super.start(...arguments);
-        guardActionManager(api, offlinePlugin);
+        guardActionManager(api, offlinePlugin, env);
         return api;
     },
 });
@@ -2378,17 +2769,30 @@ patch(viewService, {
 // -----------------------------------------------------------------------------
 
 /**
- * Classifies a CRM view target that never opens offline. Pure: reads props only.
+ * Classifies a CRM view target that never opens offline. Pure: reads its arguments
+ * only.
  * - "read": report and analysis views (the lead graph, pivot, calendar, activity
- *   and forecast views, every `crm.activity.report` view), swapped to the offline
- *   helper as soon as the connection drops;
- * - "dialog": wizards, the team form and the CRM settings, which stay mounted
- *   once loaded so entered values survive (their buttons are guarded instead).
+ *   and forecast views, every `crm.activity.report` view), and the other non-form
+ *   views of a disabled action (the Recurring Plans list, the meeting calendar) or
+ *   of a lead's meetings (`isCrmOfflineMeeting`: the calendar Schedule Meeting
+ *   opens, with its event moves and event popover), swapped to the offline helper
+ *   as soon as the connection drops, a meeting view once its quick create closes;
+ * - "dialog": wizards, the team form, the CRM settings and the forms of a disabled
+ *   action (a CRM bound mail composer) or of a lead's meeting, which stay mounted
+ *   once loaded so entered values survive (their saves and buttons are guarded
+ *   instead).
+ *
+ * A disabled action is recognised by the `xml_id` of the action that opened the
+ * view, so its target is stopped however it was requested: an id the action guards
+ * cannot identify offline (loaded in an earlier page session, then answered from the
+ * disk cache), a restored URL or a breadcrumb. Lead views keep their own rules, so a
+ * lead form opened from the forecast stays usable.
  *
  * @param {Object} props View props
+ * @param {string|false} [actionXmlId] `xml_id` of the action that opened the view
  * @returns {"read"|"dialog"|false}
  */
-function crmBlockedTarget(props) {
+function crmBlockedTarget(props, actionXmlId) {
     const { resModel, type } = props;
     const context = props.context || {};
     if (resModel === "crm.activity.report") {
@@ -2407,8 +2811,22 @@ function crmBlockedTarget(props) {
     if (resModel === "res.config.settings" && context.module === "crm") {
         return "dialog";
     }
+    if (
+        CRM_OFFLINE_DISABLED_ACTIONS.has(actionXmlId) ||
+        isCrmOfflineMeeting(resModel, context, actionXmlId)
+    ) {
+        return type === "form" ? "dialog" : "read";
+    }
     return false;
 }
+
+/**
+ * Count of lead-meeting forms mounted in a dialog: the quick create a meeting calendar
+ * opens. The calendar owns that dialog and closes it when it unmounts, so while one is
+ * open the lead-meeting views keep the controller, under the modal, rather than lose
+ * the entered values; the dialog's save is refused offline like any meeting save.
+ */
+const crmMeetingDialogs = proxy({ open: 0 });
 
 patch(View, {
     components: { ...View.components, OfflineActionHelper },
@@ -2422,6 +2840,32 @@ patch(View.prototype, {
         this.crmViewState = proxy({ loadPending: false });
         /** @type {Promise<void>|null} the running `crmLoadPendingView` load */
         this.crmPendingViewLoad = null;
+        // Whether a mounted lead-meeting view gives way to the helper. A computed
+        // notifies only when it flips, so the connection dropping under an open meeting
+        // dialog re-renders nothing (a re-render reloads the controller's data).
+        this.crmMeetingSwap = computed(
+            () => this.crmOfflinePlugin.isOffline() && !crmMeetingDialogs.open
+        );
+        const { resModel, context, type } = this.props;
+        if (
+            this.env.inDialog &&
+            type === "form" &&
+            isCrmOfflineMeeting(resModel, context, this.env.config?.actionXmlId)
+        ) {
+            let counted = false;
+            const release = () => {
+                if (counted) {
+                    counted = false;
+                    crmMeetingDialogs.open--;
+                }
+            };
+            onMounted(() => {
+                counted = true;
+                crmMeetingDialogs.open++;
+            });
+            onWillUnmount(release);
+            onWillDestroy(release);
+        }
         useEffect(() => {
             if (this.crmLoadPending && !this.crmOfflinePlugin.isOffline()) {
                 untrack(() => {
@@ -2451,18 +2895,29 @@ patch(View.prototype, {
     /**
      * True while the `web.View` extension renders `OfflineActionHelper` instead of
      * the controller: a CRM target whose load was skipped offline, or a mounted
-     * read target while offline.
+     * read target while offline. A lead-meeting view waits for its open meeting
+     * dialog (`crmMeetingDialogs`) to close first.
      */
     get crmOfflineBlocked() {
-        const target = crmBlockedTarget(this.props);
+        const actionXmlId = this.env.config?.actionXmlId;
+        const target = crmBlockedTarget(this.props, actionXmlId);
         if (!target) {
             return false;
         }
-        return this.crmLoadPending || (target === "read" && this.crmOfflinePlugin.isOffline());
+        if (this.crmLoadPending) {
+            return true;
+        }
+        if (target !== "read") {
+            return false;
+        }
+        if (isCrmOfflineMeeting(this.props.resModel, this.props.context, actionXmlId)) {
+            return this.crmMeetingSwap();
+        }
+        return this.crmOfflinePlugin.isOffline();
     },
 
     loadView(props) {
-        if (!crmBlockedTarget(props)) {
+        if (!crmBlockedTarget(props, this.env.config?.actionXmlId)) {
             return super.loadView(...arguments);
         }
         if (this.crmOfflinePlugin.isOffline()) {
@@ -2517,11 +2972,16 @@ patch(View.prototype, {
 
 patch(ActionMenus.prototype, {
     onItemSelected(item) {
-        if (
-            CRM_ACTION_MENU_MODELS.has(this.props.resModel) &&
-            !item?.availableOffline &&
-            this.offlinePlugin.isOffline()
-        ) {
+        // Every item of a lead's meeting (Archive, Unarchive, Delete, Duplicate)
+        // writes or copies it, and meetings are never written offline.
+        const isCrmItem =
+            (CRM_ACTION_MENU_MODELS.has(this.props.resModel) && !item?.availableOffline) ||
+            isCrmOfflineMeeting(
+                this.props.resModel,
+                this.props.context,
+                this.env.config?.actionXmlId
+            );
+        if (isCrmItem && this.offlinePlugin.isOffline()) {
             return Promise.resolve();
         }
         return super.onItemSelected(...arguments);
@@ -2805,16 +3265,17 @@ patch(Many2XAutocomplete.prototype, {
      * same cache once the lost connection refuses it, so every offline query would
      * still attempt a request. `searchMany2XRecords` resolves `undefined` without a
      * secure context or the session's cache secret, which is read as no cached
-     * record.
+     * record, as is a search reaching a record this session cannot decrypt
+     * (`readDecryptableCache`).
      *
      * @param {string} name
      * @returns {Promise<Object[]>}
      */
     search(name) {
         if (this.crmOfflineInlineSearch) {
-            return this.offlinePlugin
-                .searchMany2XRecords(this.props.resModel, name)
-                .then((records) => records || []);
+            return readDecryptableCache(
+                this.offlinePlugin.searchMany2XRecords(this.props.resModel, name)
+            ).then((records) => records || []);
         }
         return super.search(...arguments);
     },
@@ -2994,17 +3455,148 @@ patch(AutoComplete.prototype, {
 // Guard: CRM wizard and CRM settings forms
 // -----------------------------------------------------------------------------
 
+/**
+ * Settings records on which a CRM-owned settings control runs (its pre-save and the
+ * "Unsaved changes" confirmation it may open), with their number of running
+ * controls, keyed by raw record. Offline, such a record is neither saved nor queued,
+ * and no settings button runs on it.
+ *
+ * @type {WeakMap<Record, number>}
+ */
+const crmSettingsControlRuns = new WeakMap();
+
+/**
+ * Marks a settings record for the run of a CRM-owned settings control.
+ *
+ * @param {Record} record
+ * @returns {() => void} ends this run (called once)
+ */
+function startCrmSettingsControlRun(record) {
+    const raw = toRaw(record);
+    crmSettingsControlRuns.set(raw, (crmSettingsControlRuns.get(raw) || 0) + 1);
+    return () => {
+        const runs = crmSettingsControlRuns.get(raw) - 1;
+        if (runs > 0) {
+            crmSettingsControlRuns.set(raw, runs);
+        } else {
+            crmSettingsControlRuns.delete(raw);
+        }
+    };
+}
+
+/**
+ * Tells whether a CRM-owned settings control runs on a settings record.
+ *
+ * @param {Record} [record]
+ * @returns {boolean}
+ */
+function isCrmSettingsControlRun(record) {
+    return Boolean(record) && crmSettingsControlRuns.has(toRaw(record));
+}
+
+/**
+ * Tells whether a record's save is never queued: a CRM transient record or a lead's
+ * meeting (`isCrmOfflineTransientForm`, with the `xml_id` of the action that opened
+ * its view), any other record of a lead's meeting form (such as an event tag whose
+ * colour the form's tag editor saves), or a settings record a CRM-owned settings
+ * control runs on. Pure: it reads no signal.
+ *
+ * @param {Record} record
+ * @returns {boolean}
+ */
+function isCrmOfflineTransientRecord(record) {
+    const actionXmlId = record.model.env?.config?.actionXmlId;
+    const root = record.model.root;
+    return (
+        isCrmOfflineTransientForm(record.resModel, record.context, actionXmlId) ||
+        Boolean(root && isCrmOfflineMeeting(root.resModel, root.context, actionXmlId)) ||
+        isCrmSettingsControlRun(record)
+    );
+}
+
+/**
+ * Key of a settings button, from its `type` and `name` (click parameters and arch
+ * attributes carry the same strings).
+ *
+ * @param {string} [type]
+ * @param {string} [name]
+ * @returns {string}
+ */
+function settingsButtonKey(type, name) {
+    return `${type}:${name}`;
+}
+
+/**
+ * The CRM-owned controls of a settings arch: the `object` and `action` buttons and
+ * links of its CRM app (`<app name="crm">`), as `settingsButtonKey`s. The General
+ * Settings show that app as the CRM settings page does, under another
+ * `context.module`.
+ *
+ * @param {Element} [xmlDoc] settings form arch
+ * @returns {ReadonlySet<string>}
+ */
+function getCrmSettingsButtonKeys(xmlDoc) {
+    const keys = new Set();
+    const nodes =
+        xmlDoc?.querySelectorAll("app[name='crm'] button[name], app[name='crm'] a[type][name]") ||
+        [];
+    for (const node of nodes) {
+        const type = node.getAttribute("type");
+        if (type === "object" || type === "action") {
+            keys.add(settingsButtonKey(type, node.getAttribute("name")));
+        }
+    }
+    return keys;
+}
+
+/**
+ * Runs the pre-execution of a CRM-owned settings control (`beforeExecute`: the
+ * settings controller's pre-save, or the "Unsaved changes" confirmation it opens)
+ * with the settings record marked (`startCrmSettingsControlRun`), and stops the
+ * control when the connection is lost meanwhile.
+ *
+ * @param {Record} record the settings record
+ * @param {OfflinePlugin} offlinePlugin
+ * @param {() => Promise<boolean|undefined>} beforeExecute
+ * @returns {Promise<boolean|undefined>} `false` when offline once it ends, else its result
+ */
+async function runCrmSettingsControl(record, offlinePlugin, beforeExecute) {
+    const endRun = startCrmSettingsControlRun(record);
+    try {
+        const proceed = await beforeExecute();
+        return offlinePlugin.isOffline() ? false : proceed;
+    } finally {
+        endRun();
+    }
+}
+
 patch(Record.prototype, {
     /**
-     * Never queues the save of a CRM transient record (a CRM wizard, the CRM
-     * settings): a save that reaches it offline by any path, such as the settings'
-     * "Unsaved changes" confirmation when leaving the page, fails instead and the
-     * record keeps its changes. The buttons below stop before saving at all.
+     * Offline, refuses the save of a CRM transient record (a CRM wizard, the CRM
+     * settings, a CRM bound mail composer, a mail wizard of the lead chatter, a
+     * settings record a CRM-owned control runs on) or of a record of a lead's meeting
+     * form or dialog before its `web_save` request, whatever calls it (a button, the
+     * settings' "Unsaved changes" confirmation, a direct `save()`): nothing is
+     * requested or queued, and the record keeps its changes.
+     *
+     * @returns {Promise<boolean>}
+     */
+    _save() {
+        if (isCrmOfflineTransientRecord(this) && this.model.offlinePlugin.isOffline()) {
+            return Promise.resolve(false);
+        }
+        return super._save(...arguments);
+    },
+
+    /**
+     * Never queues the save of a CRM transient record or of a lead's meeting: a save
+     * whose request loses the connection fails instead, and the record keeps its
+     * changes.
      *
      * @returns {boolean}
      */
     _offlineSave() {
-        if (isCrmOfflineTransientForm(this.resModel, this.context)) {
+        if (isCrmOfflineTransientRecord(this)) {
             return false;
         }
         return super._offlineSave(...arguments);
@@ -3013,17 +3605,24 @@ patch(Record.prototype, {
 
 patch(FormController.prototype, {
     /**
-     * Offline, stops a button of a CRM wizard or of the CRM settings before the form
-     * saves its record, which would queue a transient `web_save` (such records are
-     * never queued). `special="cancel"` buttons go on, so a wizard's Cancel still
-     * closes it.
+     * Offline, stops a button of a CRM wizard, of the CRM settings, of a CRM bound
+     * mail composer (its Send included), of a mail wizard of the lead chatter (the
+     * full composer's Send, the followers wizard's Add) or of a lead's meeting form
+     * (its "Send email" and invitation buttons) before the form saves its record,
+     * which would queue a transient or meeting `web_save` (such records are never
+     * queued), and before the button's own call. `special="cancel"` buttons go on, so
+     * a wizard's Cancel still closes it.
      *
      * @param {Object} clickParams
      * @returns {Promise<boolean|undefined>}
      */
     beforeExecuteActionButton(clickParams) {
         if (
-            isCrmOfflineTransientForm(this.props.resModel, this.props.context) &&
+            isCrmOfflineTransientForm(
+                this.props.resModel,
+                this.props.context,
+                this.env.config?.actionXmlId
+            ) &&
             clickParams?.special !== "cancel" &&
             this.offlinePlugin.isOffline()
         ) {
@@ -3031,27 +3630,106 @@ patch(FormController.prototype, {
         }
         return super.beforeExecuteActionButton(...arguments);
     },
+
+    /**
+     * The Action-menu items of a lead's meeting form (Archive, Unarchive and Delete
+     * included) lose `availableOffline`, so the menu dims them offline: each writes
+     * the meeting, which is never queued, and the Action-menu guard refuses them.
+     * The menu reads `availableOffline` only offline, so online it is unchanged.
+     *
+     * @returns {Object}
+     */
+    getStaticActionMenuItems() {
+        const items = super.getStaticActionMenuItems(...arguments);
+        if (
+            !isCrmOfflineMeeting(
+                this.props.resModel,
+                this.props.context,
+                this.env.config?.actionXmlId
+            )
+        ) {
+            return items;
+        }
+        return Object.fromEntries(
+            Object.entries(items).map(([key, item]) => [key, omit(item, "availableOffline")])
+        );
+    },
+});
+
+patch(MailComposerFormRenderer.prototype, {
+    /**
+     * Offline, a CRM mail composer (`isCrmOfflineTransientRecord`: a CRM bound
+     * composer, the lead chatter's full composer) closes from its dialog's close
+     * control. Mail runs, before the dialog closes, a `res.partner` read that carries
+     * the composer's recipients back to the thread; offline it fails and the dialog
+     * would stay open, with its Discard disabled. That read is skipped offline, so the
+     * thread keeps the recipients it had when the composer opened. Online, and for
+     * every other composer, the dialog closes as mail does.
+     */
+    setup() {
+        super.setup(...arguments);
+        const dialogData = this.env.dialogData;
+        const dismiss = dialogData?.dismiss;
+        if (typeof dismiss !== "function") {
+            return;
+        }
+        const renderer = this;
+        dialogData.dismiss = function crmOfflineComposerDismiss() {
+            const { record } = renderer.props;
+            if (isCrmOfflineTransientRecord(record) && record.model.offlinePlugin.isOffline()) {
+                return Promise.resolve();
+            }
+            return dismiss.apply(this, arguments);
+        };
+    },
 });
 
 patch(SettingsFormController.prototype, {
+    /** Reads the CRM-owned controls of the page's arch once. */
+    setup() {
+        super.setup(...arguments);
+        this.crmSettingsButtonKeys = getCrmSettingsButtonKeys(this.archInfo.xmlDoc);
+    },
+
     /**
      * The settings controller saves its record itself, without the form controller's
-     * method: the same guard on the CRM settings page, every button and the control
-     * panel Save (`execute`) included. Its "cancel" (the control panel Discard) saves
-     * nothing and goes on.
+     * method, so the guard is repeated here. Offline, it stops before the record is
+     * saved and before any "Unsaved changes" confirmation opens: every button of the
+     * CRM settings page (the control panel Save, `execute`, included); a CRM-owned
+     * control (`getCrmSettingsButtonKeys`) on any settings page, such as the CRM app
+     * of the General Settings; and any button on a record a CRM-owned control runs
+     * on, such as the Save of the confirmation that control opened online. Online, a
+     * CRM-owned control runs marked (`runCrmSettingsControl`). The "cancel" button
+     * (the control panel Discard) saves nothing and goes on.
      *
      * @param {Object} clickParams
      * @returns {Promise<boolean|undefined>}
      */
     beforeExecuteActionButton(clickParams) {
+        if (clickParams?.name === "cancel") {
+            return super.beforeExecuteActionButton(...arguments);
+        }
+        const isCrmControl = this.crmSettingsButtonKeys.has(
+            settingsButtonKey(clickParams?.type, clickParams?.name)
+        );
         if (
-            isCrmOfflineTransientForm(this.props.resModel, this.props.context) &&
-            clickParams?.name !== "cancel" &&
+            (isCrmControl ||
+                isCrmSettingsControlRun(this.model.root) ||
+                isCrmOfflineTransientForm(
+                    this.props.resModel,
+                    this.props.context,
+                    this.env.config?.actionXmlId
+                )) &&
             this.offlinePlugin.isOffline()
         ) {
             return Promise.resolve(false);
         }
-        return super.beforeExecuteActionButton(...arguments);
+        if (!isCrmControl) {
+            return super.beforeExecuteActionButton(...arguments);
+        }
+        return runCrmSettingsControl(this.model.root, this.offlinePlugin, () =>
+            super.beforeExecuteActionButton(...arguments)
+        );
     },
 });
 
@@ -3068,7 +3746,11 @@ patch(settingsFormView.Model.prototype, {
      */
     load(params) {
         if (
-            isCrmOfflineTransientForm(this.config.resModel, this.config.context) &&
+            isCrmOfflineTransientForm(
+                this.config.resModel,
+                this.config.context,
+                this.env.config?.actionXmlId
+            ) &&
             this.isReady() &&
             this.offlinePlugin.isOffline()
         ) {
@@ -3079,14 +3761,25 @@ patch(settingsFormView.Model.prototype, {
 });
 
 // -----------------------------------------------------------------------------
-// Guard: Sales Team form multi-membership button
+// Guard: Sales Team form buttons
 // -----------------------------------------------------------------------------
 
 const patchedTeamFormControllers = new WeakSet();
 
 /**
- * Stops the multi-membership activation offline before its manager probe
- * (`user.hasGroup`) and its `set_bool` call.
+ * Offline, the Sales Team form's controller (`crm_team_form`, used by the team and
+ * the team member forms) refuses, before its parent runs:
+ *
+ * - the multi-membership activation, before its manager probe (`user.hasGroup`) and
+ *   its `set_bool` call;
+ * - every non-special `object` or `action` button of a `crm.team` record, such as
+ *   `action_assign_leads` and `action_open_opportunities`. The form controller saves
+ *   the record before running any such button, and offline that save would queue the
+ *   team's unsaved edits as a `crm.team` `web_save` before the action service's
+ *   button guard is reached.
+ *
+ * Nothing is saved, discarded or queued, so the form keeps its entered values.
+ * Special buttons (`save`, `cancel`) and every call online go to the parent.
  *
  * @param {{Controller?: typeof import("@web/views/form/form_controller").FormController}} [view]
  */
@@ -3100,6 +3793,14 @@ function guardTeamFormView(view) {
         beforeExecuteActionButton(clickParams) {
             if (
                 clickParams?.name === "crm_team_activate_multi_membership" &&
+                this.offlinePlugin.isOffline()
+            ) {
+                return Promise.resolve(false);
+            }
+            if (
+                this.props.resModel === "crm.team" &&
+                !clickParams?.special &&
+                ["object", "action"].includes(clickParams?.type) &&
                 this.offlinePlugin.isOffline()
             ) {
                 return Promise.resolve(false);

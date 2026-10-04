@@ -55,6 +55,7 @@ import {
 } from "@crm/mobile/crm_mobile_pipeline/crm_mobile_pipeline";
 import {
     CRM_OFFLINE_CREATE_KEY,
+    CRM_OFFLINE_UID_KEY,
     isQuickCreateDeepLink,
     quickCreateDeepLink,
 } from "@crm/mobile/crm_offline_hooks";
@@ -63,6 +64,7 @@ import { AutoComplete } from "@web/core/autocomplete/autocomplete";
 import { BottomSheet } from "@web/core/bottom_sheet/bottom_sheet";
 import { browser } from "@web/core/browser/browser";
 import { cookie } from "@web/core/browser/cookie";
+import { Crypto } from "@web/core/crypto";
 import { getCurrency } from "@web/core/currency";
 import { rpc } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
@@ -4224,6 +4226,356 @@ test("mobile pipeline does not reload at a sync with nothing to replay after a d
 });
 
 // -----------------------------------------------------------------------------
+// Queued moves and creates in a stage the pipeline has no group for
+// -----------------------------------------------------------------------------
+
+/**
+ * Adds the stage "Proposition", which no lead has, after the other stages, and
+ * returns its id.
+ *
+ * @returns {Promise<number>}
+ */
+async function addEmptyStage() {
+    await makeMockServer();
+    return MockServer.env["crm.stage"].create({ name: "Proposition", sequence: 4 });
+}
+
+/**
+ * Makes the mock server refuse a `crm.lead` save naming a stage it no longer
+ * holds, as the server refuses to write or create a lead in a deleted stage.
+ */
+function refuseDeletedStages() {
+    onRpc("crm.lead", "web_save", function ({ args }) {
+        const stageId = args[1]?.stage_id;
+        if (stageId && !this.env["crm.stage"].search_count([["id", "=", stageId]])) {
+            throw makeServerError({
+                type: "MissingError",
+                message: "Record does not exist or has been deleted.",
+            });
+        }
+    });
+}
+
+/** Count and revenue sum of the server's leads in a stage, as its header shows them. */
+function serverStageTotals(stageId) {
+    const leads = MockServer.env["crm.lead"].search_read(
+        [["stage_id", "=", stageId]],
+        ["expected_revenue"]
+    );
+    return [leads.length, leads.reduce((sum, lead) => sum + lead.expected_revenue, 0)];
+}
+
+/** Discards the first queued call listed in the offline systray, confirmed. */
+async function discardFirstQueuedCall() {
+    if (!queryFirst(".o_offline_systray_content")) {
+        await contains("div.o_nav_entry.o_offline_systray").click();
+    }
+    await contains(
+        ".o_offline_systray_content button[title='Discard offline changes']:first"
+    ).click();
+    await contains(".modal-dialog .modal-footer button.btn-primary").click();
+    await animationFrame();
+}
+
+test.tags("mobile");
+test("mobile pipeline keeps a lead whose parked move targets a deleted stage in its server stage", async () => {
+    const propositionId = await addEmptyStage();
+    expandStageGroups();
+    refuseDeletedStages();
+    const setOffline = mockOffline();
+    await mountWithCleanup(WebClient);
+    await openAction(ACTION_ID);
+    const select = `${card("Desk Upgrade")} .o_crm_mobile_lead_stage`;
+    const badge = `${card("Desk Upgrade")} .o_crm_mobile_pending_sync`;
+    expect(queryAllTexts(`${select} option`)).toEqual(["New", "Qualified", "Won", "Proposition"]);
+
+    // Offline, the card moves the lead to "Proposition", which is then deleted on
+    // the server: the replay of the move is refused, and the move is parked.
+    await setOffline(true);
+    await contains(select).select(String(propositionId));
+    expect(headerTexts()).toEqual(["New", "2", "$ 300"]);
+    MockServer.env["crm.stage"].unlink([propositionId]);
+    await reconnect(setOffline);
+    const [parked] = queued("crm.lead");
+    expect(queued("crm.lead")).toHaveLength(1);
+    expect([parked.method, parked.args]).toEqual(["web_save", [[3], { stage_id: propositionId }]]);
+    expect(parked.extras.error).toInclude("Record does not exist or has been deleted.");
+    // Until the search changes, the framework keeps the column of the stage it
+    // displayed, emptied: the lead is still shown in it, with "Sync failed".
+    await contains(".o_crm_mobile_pipeline_next").click();
+    await contains(".o_crm_mobile_pipeline_next").click();
+    await contains(".o_crm_mobile_pipeline_next").click();
+    expect(headerTexts()).toEqual(["Proposition", "1", "$ 300"]);
+    expect(cardNames()).toEqual(["Desk Upgrade"]);
+    expect(badge).toHaveText("Sync failed");
+
+    // Reloaded, the pipeline has no group for the deleted stage: the lead keeps its
+    // card in its server stage, with "Sync failed", and the header of that stage
+    // shows the server's count and revenue.
+    await openAction(ACTION_ID);
+    expect(serverStageTotals(NEW)).toEqual([3, 600]);
+    expect(headerTexts()).toEqual(["New", "3", "$ 600"]);
+    expect(cardNames()).toEqual(["Office Design", "Quote for Chairs", "Desk Upgrade"]);
+    expect(badge).toHaveText("Sync failed");
+    // Its selector shows the stage of the parked move as its current, unselectable
+    // option, and offers the stages the pipeline shows.
+    expect(select).toHaveValue("");
+    expect(`${select} option[disabled]`).toHaveText("Proposition");
+    expect(queryAllTexts(`${select} option:not([disabled])`)).toEqual(["New", "Qualified", "Won"]);
+    // No other stage shows or counts it.
+    await contains(".o_crm_mobile_pipeline_next").click();
+    expect(headerTexts()).toEqual(["Qualified", "3", "$ 700"]);
+    expect(cardNames()).toEqual(["Conference Room", "Lamps", "Storage Racks"]);
+    await contains(".o_crm_mobile_pipeline_next").click();
+    expect(headerTexts()).toEqual(["Won", "1", "$ 900"]);
+    expect(cardNames()).toEqual(["Signed Deal"]);
+    expect(".o_crm_mobile_pipeline_next").not.toBeEnabled();
+    await contains(".o_crm_mobile_pipeline_prev").click();
+    await contains(".o_crm_mobile_pipeline_prev").click();
+
+    // Discarded in the offline systray: the card shows its server stage, unbadged.
+    await discardFirstQueuedCall();
+    expect(queued("crm.lead")).toEqual([]);
+    expect(headerTexts()).toEqual(["New", "3", "$ 600"]);
+    expect(cardNames()).toEqual(["Office Design", "Quote for Chairs", "Desk Upgrade"]);
+    expect(badge).toHaveCount(0);
+    expect(select).toHaveValue(String(NEW));
+    expect(`${select} option[disabled]`).toHaveCount(0);
+});
+
+test.tags("mobile");
+test("mobile pipeline counts a lead whose parked move targets a deleted stage in its server stage while a progress bar filters", async () => {
+    const propositionId = await addEmptyStage();
+    // Two planned leads in "New": "Office Design" and "Desk Upgrade".
+    MockServer.env["crm.lead"].write([3], { activity_state: "planned" });
+    expandStageGroups();
+    refuseDeletedStages();
+    onRpc("crm.lead", "get_rainbowman_message", () => false);
+    const setOffline = mockOffline();
+    await mountWithCleanup(WebClient);
+    await openAction(ACTION_ID);
+    const badge = `${card("Desk Upgrade")} .o_crm_mobile_pending_sync`;
+
+    // A progress-bar filter selected on a wide screen stays active on the phone.
+    await resize({ width: 1366, height: 768 });
+    await animationFrame();
+    await contains(".o_kanban_group:first .progress-bar.bg-success").click();
+    await resize({ width: 375, height: 667 });
+    await animationFrame();
+    expect(headerTexts()).toEqual(["New", "2", null]);
+    expect(cardNames()).toEqual(["Office Design", "Desk Upgrade"]);
+
+    // Offline, the card moves "Desk Upgrade" to "Proposition", which is then deleted
+    // on the server: the replay of the move is refused, and the move is parked.
+    await setOffline(true);
+    await contains(`${card("Desk Upgrade")} .o_crm_mobile_lead_stage`).select(
+        String(propositionId)
+    );
+    expect(headerTexts()).toEqual(["New", "1", null]);
+    MockServer.env["crm.stage"].unlink([propositionId]);
+    await reconnect(setOffline);
+    expect(queued("crm.lead")[0].extras.error).toInclude(
+        "Record does not exist or has been deleted."
+    );
+
+    // Back from a lead form, the pipeline loads anew, with its progress-bar filter
+    // and without the deleted stage: the filtered count is the server's, and the
+    // lead counts, and shows, in its stage.
+    await visitLead("Office Design");
+    await animationFrame();
+    expect(queryAllTexts(`${card("Office Design")} .o_crm_mobile_lead_stage option`)).toEqual([
+        "New",
+        "Qualified",
+        "Won",
+    ]);
+    expect(headerTexts()).toEqual(["New", "2", null]);
+    expect(textOf(HEADER_STATUS)).toBe("Leads: 2");
+    expect(cardNames()).toEqual(["Office Design", "Desk Upgrade"]);
+    expect(badge).toHaveText("Sync failed");
+
+    // Discarded in the offline systray: the same count, unbadged.
+    await discardFirstQueuedCall();
+    expect(queued("crm.lead")).toEqual([]);
+    expect(headerTexts()).toEqual(["New", "2", null]);
+    expect(cardNames()).toEqual(["Office Design", "Desk Upgrade"]);
+    expect(badge).toHaveCount(0);
+});
+
+test.tags("mobile");
+test("[Offline] mobile pipeline keeps a lead whose pending move targets a stage without group in its server stage", async () => {
+    expect.errors(3);
+    const propositionId = await addEmptyStage();
+    const setOffline = mockOffline();
+    await mountWithCleanup(WebClient);
+    await openAction(ACTION_ID);
+    const select = `${card("Desk Upgrade")} .o_crm_mobile_lead_stage`;
+    const badge = `${card("Desk Upgrade")} .o_crm_mobile_pending_sync`;
+    // No lead has "Proposition": the pipeline has no group for it.
+    expect(queryAllTexts(`${select} option`)).toEqual(["New", "Qualified", "Won"]);
+    await contains(`${card("Desk Upgrade")} .o_crm_mobile_lead_open`).click();
+
+    // Offline, the lead form moves the lead to "Proposition": the save is queued.
+    await setOffline(true);
+    await contains(STAGE_DROPDOWN_TOGGLE).click();
+    await contains(".o-dropdown--menu .dropdown-item:contains(Proposition)").click();
+    await contains(".o_form_button_save").click();
+    expect(queued("crm.lead").map(({ method, args }) => [method, args])).toEqual([
+        ["web_save", [[3], { stage_id: propositionId }]],
+    ]);
+
+    // Back in the pipeline, reloaded from the cache: the lead keeps its card in its
+    // server stage, with "Pending sync", counted there and nowhere else.
+    await contains(".o_back_button").click();
+    expect(headerTexts()).toEqual(["New", "3", "$ 600"]);
+    expect(cardNames()).toEqual(["Office Design", "Quote for Chairs", "Desk Upgrade"]);
+    expect(badge).toHaveText("Pending sync");
+    expect(select).toHaveValue("");
+    expect(`${select} option[disabled]`).toHaveText("Proposition");
+    await contains(".o_crm_mobile_pipeline_next").click();
+    expect(headerTexts()).toEqual(["Qualified", "3", "$ 700"]);
+    expect(cardNames()).toEqual(["Conference Room", "Lamps", "Storage Racks"]);
+    await contains(".o_crm_mobile_pipeline_prev").click();
+
+    // Its card moves it back to the stage holding it: the choice is queued after the
+    // form's write, so it wins on replay.
+    await contains(select).select(String(NEW));
+    expect(queued("crm.lead").map(({ method, args }) => [method, args])).toEqual([
+        ["web_save", [[3], { stage_id: propositionId }]],
+        ["web_save", [[3], { stage_id: NEW }]],
+    ]);
+    expect(select).toHaveValue(String(NEW));
+    expect(badge).toHaveText("Pending sync");
+    expect(headerTexts()).toEqual(["New", "3", "$ 600"]);
+
+    // Both discarded in the offline systray: the card shows the server values again.
+    await discardFirstQueuedCall();
+    await discardFirstQueuedCall();
+    expect(queued("crm.lead")).toEqual([]);
+    expect(headerTexts()).toEqual(["New", "3", "$ 600"]);
+    expect(cardNames()).toEqual(["Office Design", "Quote for Chairs", "Desk Upgrade"]);
+    expect(badge).toHaveCount(0);
+    expect(select).toHaveValue(String(NEW));
+    // The framework's own cached pipeline loads offline: back from the form, and the
+    // reload after each discard.
+    expect.verifyErrors([
+        "/web/dataset/call_kw/crm.lead/web_read_group",
+        "/web/dataset/call_kw/crm.lead/web_read_group",
+        "/web/dataset/call_kw/crm.lead/web_read_group",
+    ]);
+});
+
+test.tags("mobile");
+test("mobile pipeline shows a parked create whose stage was deleted in its first stage", async () => {
+    const propositionId = await addEmptyStage();
+    expandStageGroups();
+    refuseDeletedStages();
+    const setOffline = mockOffline();
+    await mountWithCleanup(WebClient);
+    await openAction(ACTION_ID);
+    const orphan = card("Orphan Lead");
+
+    // Offline, a lead created in "Proposition", which is then deleted on the server:
+    // the replay of the create is refused, and the create is parked.
+    await setOffline(true);
+    await quickCreateLead({ name: "Orphan Lead", revenue: 70, stageId: propositionId });
+    expect(headerTexts()).toEqual(["Proposition", "1", "$ 70"]);
+    expect(cardNames()).toEqual(["Orphan Lead"]);
+    MockServer.env["crm.stage"].unlink([propositionId]);
+    await reconnect(setOffline);
+    const [parked] = queued("crm.lead");
+    expect(queued("crm.lead")).toHaveLength(1);
+    expect([parked.method, parked.args[0], parked.args[1].stage_id]).toEqual([
+        "web_save",
+        [],
+        propositionId,
+    ]);
+    expect(parked.extras.error).toInclude("Record does not exist or has been deleted.");
+    expect(MockServer.env["crm.lead"].search_count([["name", "=", "Orphan Lead"]])).toBe(0);
+
+    // Reloaded, the pipeline has no group for the deleted stage: the provisional card
+    // shows in the first stage, after its leads, with "Sync failed", and that
+    // stage's header counts it once.
+    await openAction(ACTION_ID);
+    expect(headerTexts()).toEqual(["New", "4", "$ 670"]);
+    expect(cardNames()).toEqual([
+        "Office Design",
+        "Quote for Chairs",
+        "Desk Upgrade",
+        "Orphan Lead",
+    ]);
+    expect(orphan).toHaveClass("o_crm_mobile_lead_card_provisional");
+    expect(`${orphan} .o_crm_mobile_pending_sync`).toHaveText("Sync failed");
+    expect(`${orphan} .o_crm_mobile_lead_open`).toHaveAttribute("disabled");
+    await contains(".o_crm_mobile_pipeline_next").click();
+    expect(headerTexts()).toEqual(["Qualified", "3", "$ 700"]);
+    expect(cardNames()).toEqual(["Conference Room", "Lamps", "Storage Racks"]);
+    await contains(".o_crm_mobile_pipeline_next").click();
+    expect(headerTexts()).toEqual(["Won", "1", "$ 900"]);
+    expect(cardNames()).toEqual(["Signed Deal"]);
+    await contains(".o_crm_mobile_pipeline_prev").click();
+    await contains(".o_crm_mobile_pipeline_prev").click();
+
+    // Discarded in the offline systray: the first stage shows the server values.
+    await discardFirstQueuedCall();
+    expect(queued("crm.lead")).toEqual([]);
+    expect(orphan).toHaveCount(0);
+    expect(serverStageTotals(NEW)).toEqual([3, 600]);
+    expect(headerTexts()).toEqual(["New", "3", "$ 600"]);
+    expect(cardNames()).toEqual(["Office Design", "Quote for Chairs", "Desk Upgrade"]);
+});
+
+test.tags("mobile");
+test("mobile pipeline hides the empty-data helper while a parked create whose stage was deleted shows", async () => {
+    const propositionId = await addEmptyStage();
+    expandStageGroups();
+    refuseDeletedStages();
+    const setOffline = mockOffline();
+    await mountWithCleanup(WebClient);
+    // A search no lead matches: the stages are listed, empty, with the helper.
+    const openEmptySearch = () =>
+        getService("action").doAction(
+            {
+                type: "ir.actions.act_window",
+                res_model: "crm.lead",
+                views: [
+                    [false, "kanban"],
+                    [false, "form"],
+                ],
+                domain: OFFLINE_LEAD_DOMAIN,
+                context: PIPELINE_CONTEXT,
+                cache: true,
+            },
+            { clearBreadcrumbs: true }
+        );
+    await openEmptySearch();
+    expect(ROOT_HELPER).toHaveCount(1);
+
+    // Offline, a lead created in "Proposition", deleted on the server before the
+    // replay, which parks the create.
+    await setOffline(true);
+    await quickCreateLead({ name: "Offline Lead", revenue: 70, stageId: propositionId });
+    MockServer.env["crm.stage"].unlink([propositionId]);
+    await reconnect(setOffline);
+    expect(queued("crm.lead")[0].extras.error).toInclude(
+        "Record does not exist or has been deleted."
+    );
+
+    // Reloaded: the provisional card shows in the first stage instead of the helper.
+    await openEmptySearch();
+    expect(headerTexts()).toEqual(["New", "1", "$ 70"]);
+    expect(cardNames()).toEqual(["Offline Lead"]);
+    expect(`${card("Offline Lead")} .o_crm_mobile_pending_sync`).toHaveText("Sync failed");
+    expect(".o_view_nocontent").toHaveCount(0);
+
+    // Discarded in the offline systray: empty again, with the helper.
+    await discardFirstQueuedCall();
+    expect(queued("crm.lead")).toEqual([]);
+    expect(".o_crm_mobile_lead_card").toHaveCount(0);
+    expect(headerTexts()).toEqual(["New", "0", "$ 0"]);
+    expect(ROOT_HELPER).toHaveCount(1);
+});
+
+// -----------------------------------------------------------------------------
 // Replay hold: what the replay has just sent shows until the views reload
 // -----------------------------------------------------------------------------
 
@@ -5246,6 +5598,45 @@ test("mobile pipeline has no cached stage choice outside a secure context", asyn
         STAGES_IN_ORDER
     );
     expect(await pipeline.crmOffline.getCachedStages()).toEqual([]);
+});
+
+test.tags("mobile");
+test("mobile pipeline offers its leads' stages on an ungrouped list reopened offline after another user cached a stage", async () => {
+    expect.errors(1);
+    let pipeline = null;
+    patchWithCleanup(CrmMobilePipeline.prototype, {
+        setup() {
+            super.setup(...arguments);
+            pipeline = this;
+        },
+    });
+    await addPropositionStage();
+    const stageGroups = expandStageChoices();
+    const setOffline = mockOffline();
+    const select = `${card("Lamps")} .o_crm_mobile_lead_stage`;
+    await mountWithCleanup(WebClient);
+    // Visited online: the server's stages, stored in the relational-field cache.
+    await openAction(UNGROUPED_LEADS_ACTION_ID);
+    await animationFrame();
+    expect(stageGroups).toHaveLength(1);
+    expect(queryAllTexts(`${select} option`)).toEqual(STAGES_IN_ORDER);
+    // Another user of this browser cached a stage: the read of the cached stages fails.
+    await writeOtherUserCacheRows("crm.stage", [{ id: 77, display_name: "Other stage" }]);
+    await expectUndecryptableCache("crm.stage");
+
+    // Reopened offline: no cached stage is usable, so the cards offer the stages of
+    // the loaded leads, with no request and no error; a lead still moves, queued.
+    await setOffline(true);
+    await openAction(UNGROUPED_LEADS_ACTION_ID);
+    await animationFrame();
+    expect(await pipeline.crmOffline.getCachedStages()).toEqual([]);
+    expect(queryAllTexts(`${select} option`)).toEqual(["New", "Qualified", "Won"]);
+    expect(stageGroups).toHaveLength(1);
+    expect(".o_error_dialog").toHaveCount(0);
+    await contains(select).select(String(NEW));
+    expect(queued("crm.lead").map(({ args }) => args)).toEqual([[[5], { stage_id: NEW }]]);
+    // The framework's cached root load of the offline opening; CRM code adds none.
+    expect.verifyErrors(["/web/dataset/call_kw/crm.lead/web_search_read"]);
 });
 
 test.tags("mobile");
@@ -6452,13 +6843,19 @@ test("mobile lead card stage move queues offline", async () => {
     expect(move.args[0]).toEqual([3]);
     expect(move.args[1]).toEqual({ stage_id: QUALIFIED });
     // The record's save, in the context of the record: the pipeline context and the
-    // `default_stage_id` the framework gives the stage group the lead was loaded in.
+    // `default_stage_id` the framework gives the stage group the lead was loaded in,
+    // queued with the id of the session user.
     const moveCall = {
         model: "crm.lead",
         method: "web_save",
         args: [[3], { stage_id: QUALIFIED }],
         kwargs: {
-            context: { ...user.context, ...PIPELINE_CONTEXT, default_stage_id: NEW },
+            context: {
+                ...user.context,
+                ...PIPELINE_CONTEXT,
+                default_stage_id: NEW,
+                [CRM_OFFLINE_UID_KEY]: user.userId,
+            },
             specification: {},
         },
     };
@@ -7513,10 +7910,15 @@ test("mobile quick create queues a create offline in two cached stages without a
     expect(qualifiedLeadKey).toMatch(DELIVERY_KEY);
     expect(qualifiedLeadKey).not.toBe(newLeadKey);
     // Creates (no id) in the pipeline list context, which holds the action's
-    // `default_type`, with the delivery key and an empty specification, in queue
-    // order.
+    // `default_type`, with the delivery key, the id of the session user and an empty
+    // specification, in queue order.
     const createKwargs = (key) => ({
-        context: { ...user.context, ...PIPELINE_CONTEXT, [CRM_OFFLINE_CREATE_KEY]: key },
+        context: {
+            ...user.context,
+            ...PIPELINE_CONTEXT,
+            [CRM_OFFLINE_CREATE_KEY]: key,
+            [CRM_OFFLINE_UID_KEY]: user.userId,
+        },
         specification: {},
     });
     const createCalls = [
@@ -7752,7 +8154,8 @@ test("mobile quick create whose replay answer is lost is sent again with its key
     await setOffline(true);
     await quickCreateLead({ name: "Lost Lead", revenue: 30 });
     expect(headerTexts()).toEqual(["New", "4", "$ 630"]);
-    // Queued with a new delivery key in the pipeline list context.
+    // Queued with a new delivery key and the id of the session user in the pipeline
+    // list context.
     const [create] = queued("crm.lead");
     const key = create.kwargs.context[CRM_OFFLINE_CREATE_KEY];
     expect(key).toMatch(DELIVERY_KEY);
@@ -7761,7 +8164,12 @@ test("mobile quick create whose replay answer is lost is sent again with its key
         method: "web_save",
         args: [[], quickCreateValues("Lost Lead", 30)],
         kwargs: {
-            context: { ...user.context, ...PIPELINE_CONTEXT, [CRM_OFFLINE_CREATE_KEY]: key },
+            context: {
+                ...user.context,
+                ...PIPELINE_CONTEXT,
+                [CRM_OFFLINE_CREATE_KEY]: key,
+                [CRM_OFFLINE_UID_KEY]: user.userId,
+            },
             specification: {},
         },
     };
@@ -7823,7 +8231,12 @@ test("mobile quick create whose online answer is lost queues the key it sent and
         method: "web_save",
         args: [[], quickCreateValues("Lost Lead", 30)],
         kwargs: {
-            context: { ...user.context, ...PIPELINE_CONTEXT, [CRM_OFFLINE_CREATE_KEY]: key },
+            context: {
+                ...user.context,
+                ...PIPELINE_CONTEXT,
+                [CRM_OFFLINE_CREATE_KEY]: key,
+                [CRM_OFFLINE_UID_KEY]: user.userId,
+            },
             specification: {},
         },
     });
@@ -7831,12 +8244,19 @@ test("mobile quick create whose online answer is lost queues the key it sent and
     expect(card("Lost Lead")).toHaveClass("o_crm_mobile_lead_card_provisional");
     expect(headerTexts()).toEqual(["New", "4", "$ 630"]);
 
-    // Its replay sends the call the online save sent, which the server answers with
-    // the lead it created: no second lead, and no lookup.
+    // Its replay sends the call the online save sent, queued with the id of the
+    // session user, which the server answers with the lead it created: no second
+    // lead, and no lookup.
     await reconnect(setOffline);
     expect.verifySteps(["create Lost Lead (delivered)"]);
     expect(server.received).toHaveLength(2);
-    expect(server.received[1]).toEqual(sent);
+    expect(server.received[1]).toEqual({
+        ...sent,
+        kwargs: {
+            ...sent.kwargs,
+            context: { ...sent.kwargs.context, [CRM_OFFLINE_UID_KEY]: user.userId },
+        },
+    });
     expect(lookups).toEqual([]);
     expect(countLeads("Lost Lead")).toBe(1);
     expect(queued("crm.lead")).toEqual([]);
@@ -8624,7 +9044,7 @@ test("mobile activities: log a call queues the Call type offline and shows pendi
                 },
             ],
         ],
-        kwargs: { context: user.context },
+        kwargs: { context: { ...user.context, [CRM_OFFLINE_UID_KEY]: user.userId } },
     };
     expect(create.args).toEqual(createCall.args);
     // The user context: no default of the lead action becomes an activity default.
@@ -8756,7 +9176,7 @@ test("mobile activities: schedule follow-up queues offline and shows pending", a
         model: "mail.activity",
         method: "create",
         args: [[followUpValues]],
-        kwargs: { context: user.context },
+        kwargs: { context: { ...user.context, [CRM_OFFLINE_UID_KEY]: user.userId } },
     };
     expect(queued("mail.activity").map(ormCall)).toEqual([createCall]);
     const pending = ".o_crm_mobile_activity_pending";
@@ -8850,7 +9270,7 @@ test("mobile activities: mark done queues action_done offline and the list updat
         model: "mail.activity",
         method: "action_done",
         args: [[1]],
-        kwargs: { context: user.context },
+        kwargs: { context: { ...user.context, [CRM_OFFLINE_UID_KEY]: user.userId } },
     };
     expect(queued("mail.activity").map(ormCall)).toEqual([doneCall]);
     expect(calls).toEqual([]);
@@ -9547,6 +9967,189 @@ test("mobile activities: follow-up assignees list the cached salespeople after t
     expect(".o_crm_mobile_activity_pending .o_crm_mobile_activity_assignee").toHaveText(
         "Marc Demo"
     );
+});
+
+/**
+ * A `DOMException` carrying the stack Hoot reads to report an error, which a
+ * `DOMException` built by a script lacks.
+ *
+ * @param {string} message
+ * @param {string} name
+ */
+function domExceptionWithStack(message, name) {
+    const error = new DOMException(message, name);
+    const frames = new Error().stack.split("\n").slice(1).join("\n");
+    Object.defineProperty(error, "stack", { value: `${name}: ${message}\n${frames}` });
+    return error;
+}
+
+/**
+ * Writes `rows` into the framework relational-field cache of `model` as another
+ * user of the same browser leaves them there. That cache is shared by the users of
+ * a browser, and each user's rows are encrypted with that user's own key, so this
+ * session's decryption of those rows rejects as the Web Crypto API rejects a row
+ * encrypted with another key: with an "OperationError". Hoot's Web Crypto API mock
+ * decrypts every row, so that rejection is applied to this session's decryption of
+ * the rows written here.
+ *
+ * @param {string} model
+ * @param {{id: number, display_name: string}[]} rows
+ */
+async function writeOtherUserCacheRows(model, rows) {
+    const plugin = getService(OfflinePlugin);
+    // Another user's key: any key other than this session's (`browser_cache_secret`).
+    const otherUserCrypto = new Crypto("5a".repeat(16));
+    const otherUserValues = new WeakSet();
+    const values = [];
+    for (const { id, display_name } of rows) {
+        const value = await otherUserCrypto.encrypt(display_name);
+        otherUserValues.add(value);
+        values.push({ key: id, value });
+    }
+    patchWithCleanup(plugin._crypto, {
+        async decrypt(value) {
+            if (otherUserValues.has(value)) {
+                throw domExceptionWithStack(
+                    "The operation failed for an operation-specific reason",
+                    "OperationError"
+                );
+            }
+            return super.decrypt(...arguments);
+        },
+    });
+    await plugin._idb.write(OfflinePlugin.MANY2X_TABLE_PREFIX + model, values);
+}
+
+/**
+ * Reads every row of the framework relational-field cache of `model` and expects
+ * the read to reject as the Web Crypto API rejects a row encrypted with another key.
+ *
+ * @param {string} model
+ */
+async function expectUndecryptableCache(model) {
+    let error = null;
+    try {
+        await getService(OfflinePlugin).searchMany2XRecords(model, "");
+    } catch (readError) {
+        error = readError;
+    }
+    expect(error).toBeInstanceOf(DOMException);
+    expect(error.name).toBe("OperationError");
+}
+
+test.tags("mobile");
+test("mobile activities: another user's cached types and users leave the server's types online, none offline, and the session user", async () => {
+    const received = receivedCalls("mail.activity", "create");
+    const setOffline = mockOffline();
+    const calls = trackCalls();
+    const typeReads = () => calls.filter((call) => call === "mail.activity.type/web_search_read");
+    await mountPipeline();
+    await animationFrame();
+    expect(typeReads()).toHaveLength(1);
+    // Another user of this browser cached a salesperson and an activity type that
+    // this session's loads do not cache again: each read of those caches fails.
+    await writeOtherUserCacheRows("res.users", [{ id: 77, display_name: "Other salesperson" }]);
+    await writeOtherUserCacheRows("mail.activity.type", [{ id: 77, display_name: "Other type" }]);
+    await expectUndecryptableCache("res.users");
+    await expectUndecryptableCache("mail.activity.type");
+
+    // Online: the sheet opens with no error. As without cache, the types are read
+    // from the server, and the session user is the only assignee.
+    await openActivities("Office Design");
+    expect(".o_error_dialog").toHaveCount(0);
+    expect(typeReads()).toHaveLength(2);
+    expect(".o_crm_mobile_log_call").toBeEnabled();
+    expect(".o_crm_mobile_schedule_followup").toBeEnabled();
+    expect(".o_crm_mobile_activity_types_notice").toHaveCount(0);
+    await contains(".o_crm_mobile_schedule_followup").click();
+    expect(queryAllTexts(".o_crm_mobile_activity_type option")).toEqual([
+        "Email",
+        "Call",
+        "Upload Document",
+    ]);
+    expect(
+        queryAll(".o_crm_mobile_activity_user option").map((option) => Number(option.value))
+    ).toEqual([serverState.userId]);
+    expect(".o_crm_mobile_activity_user").toHaveValue(String(serverState.userId));
+    await contains(".o_crm_mobile_activity_save").click();
+    await animationFrame();
+    expect(
+        received.map(({ args: [[vals]] }) => [vals.res_id, vals.activity_type_id, vals.user_id])
+    ).toEqual([[1, 1, serverState.userId]]);
+    expect(queued("mail.activity")).toEqual([]);
+    await closeSheet();
+
+    // Offline: as without cached types, no type is offered. Both openers are
+    // disabled with the reason, "Mark done" stays usable, and nothing is requested.
+    await setOffline(true);
+    await openActivities("Office Design");
+    expect(".o_error_dialog").toHaveCount(0);
+    expect(".o_crm_mobile_log_call").not.toBeEnabled();
+    expect(".o_crm_mobile_schedule_followup").not.toBeEnabled();
+    expect(".o_crm_mobile_activity_types_notice").toHaveText("Activity types load after sync");
+    expect(`${activityRow(1)} .o_crm_mobile_activity_done`).toBeEnabled();
+    expect(typeReads()).toHaveLength(2);
+    expect(queued("mail.activity")).toEqual([]);
+});
+
+test.tags("mobile");
+test("mobile activities: a warmed type another user cached again is left out, the others are offered", async () => {
+    // Ten lead activity types: more than the first page (8) of the cache search, so
+    // the sheet reads the last two warmed types by id.
+    await makeMockServer();
+    const extraIds = MockServer.env["mail.activity.type"].create(
+        ["Type 4", "Type 5", "Type 6", "Type 7", "Type 8", "Type 9", "Type 10"].map((name) => ({
+            name,
+        }))
+    );
+    const setOffline = mockOffline();
+    await mountPipeline();
+    await animationFrame();
+    const allIds = [1, CALL_TYPE_ID, 28, ...extraIds];
+    expect(await cachedActivityTypeIds()).toEqual(allIds.slice(0, 8));
+    // Another user of this browser caches the last warmed type again with that
+    // user's key: the read by id of the last two fails, the cache search does not.
+    await writeOtherUserCacheRows("mail.activity.type", [
+        { id: extraIds.at(-1), display_name: "Type 10" },
+    ]);
+    expect(await cachedActivityTypeIds()).toEqual(allIds.slice(0, 8));
+
+    // Online and offline, the types the search returned are offered, with no error.
+    for (const offline of [false, true]) {
+        if (offline) {
+            await setOffline(true);
+        }
+        await openActivities("Office Design");
+        expect(".o_error_dialog").toHaveCount(0);
+        await contains(".o_crm_mobile_schedule_followup").click();
+        expect(
+            queryAll(".o_crm_mobile_activity_type option")
+                .map((option) => Number(option.value))
+                .sort((a, b) => a - b)
+        ).toEqual(allIds.slice(0, 8));
+        await contains(".o_crm_mobile_activity_cancel").click();
+        await closeSheet();
+    }
+});
+
+test.tags("mobile");
+test("mobile activities: a cache read failing otherwise than on another user's row is reported", async () => {
+    expect.errors(1);
+    patchWithCleanup(OfflinePlugin.prototype, {
+        async searchMany2XRecords(model) {
+            if (model === "res.users") {
+                // A failure of the cache itself, not of a decryption.
+                throw domExceptionWithStack("Cached users unreadable", "DataError");
+            }
+            return super.searchMany2XRecords(...arguments);
+        },
+    });
+    await mountPipeline();
+    await animationFrame();
+    await contains(`${card("Office Design")} .o_crm_mobile_lead_activities_button`).click();
+    await animationFrame();
+    expect.verifyErrors([/Cached users unreadable/]);
+    expect(".o_crm_mobile_lead_activities_sheet").toHaveCount(0);
 });
 
 test.tags("mobile");
@@ -11544,6 +12147,29 @@ test("[Offline] phone partner field searches cached names with zero requests and
 });
 
 test.tags("mobile");
+test("[Offline] phone partner field offers no cached partner, with no error, after another user cached one", async () => {
+    const setOffline = mockOffline();
+    await openQuoteForChairs();
+    // Another user of this browser cached a partner: every read of the cached
+    // partners fails.
+    await writeOtherUserCacheRows("res.partner", [{ id: 1, display_name: "Other partner" }]);
+    await expectUndecryptableCache("res.partner");
+
+    // Offline, the field's inline search of every cached partner offers none, as
+    // without cache, with no create option and no error.
+    await setOffline(true);
+    expect(PARTNER_INPUT).not.toHaveAttribute("readonly");
+    await contains(PARTNER_INPUT).click();
+    await animationFrame();
+    expect(queryAllTexts(".o-autocomplete--dropdown-item")).toEqual(["No records"]);
+    for (const option of NON_RECORD_OPTIONS) {
+        expect(option).toHaveCount(0);
+    }
+    expect(".o_error_dialog").toHaveCount(0);
+    expect(queued("crm.lead")).toEqual([]);
+});
+
+test.tags("mobile");
 test("[Offline] stale enrichment and create options opened online do nothing", async () => {
     const autocompletes = [];
     patchWithCleanup(AutoComplete.prototype, {
@@ -11951,8 +12577,13 @@ test("[Offline] card stage choices after a move back to the server stage replay 
     // Each a lead write with an empty specification, in the context of its Record: B
     // in the form's (the pipeline context), the card's writes in the card's, which
     // adds the `default_stage_id` the framework gives the stage group the lead was
-    // loaded in. B and the card's own write share a timestamp: either may come first.
-    const formContext = { ...user.context, ...PIPELINE_CONTEXT };
+    // loaded in. Each is queued with the id of the session user. B and the card's own
+    // write share a timestamp: either may come first.
+    const formContext = {
+        ...user.context,
+        ...PIPELINE_CONTEXT,
+        [CRM_OFFLINE_UID_KEY]: user.userId,
+    };
     const cardContext = { ...formContext, default_stage_id: NEW };
     const stageWrite = (stageId, context) => ({
         model: "crm.lead",

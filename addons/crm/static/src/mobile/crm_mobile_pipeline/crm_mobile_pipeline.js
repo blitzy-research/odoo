@@ -976,12 +976,12 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             return !this.getUngroupedRecords().length;
         }
         const groups = this.stageGroups;
-        if (groups.some((group) => this.crmOffline.pendingCreates(group.value).length)) {
+        if (groups.some((group) => this.crmStagePendingCreates(group, groups).length)) {
             return false;
         }
-        const stageIds = new Set(groups.map((group) => group.value));
+        const stageIds = this.crmStageIds(groups);
         return !this.crmLoadedLeads().some(({ record, group }) =>
-            stageIds.has(this.crmProjectedStage(record, group))
+            stageIds.has(this.crmProjectedStage(record, group, stageIds))
         );
     }
 
@@ -1323,23 +1323,34 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      *
      * @param {Object} record
      * @param {Object} [group] the group whose list holds `record`
+     * @param {Set<number|false>} [stageIds] the stage groups' values (`crmStageIds`),
+     *  as for `crmStageOf`
      * @returns {number|false|null} the stage id (`false`: no stage), or `null` while
      *  a pending delete or archive hides the lead
      */
-    crmProjectedStage(record, group) {
-        return this.crmStageOf(this.crmOffline.projectLead(record), group);
+    crmProjectedStage(record, group, stageIds) {
+        return this.crmStageOf(this.crmOffline.projectLead(record), group, stageIds);
     }
 
     /**
      * The stage a lead projection is displayed in (rules of `crmProjectedStage`),
      * for a projection already computed.
      *
+     * With `group` and `stageIds`, a projected stage that no stage group shows is
+     * displayed in `group`: a queued move to a stage the displayed root has no
+     * group for, such as one deleted on the server since, whose replay parks the
+     * move. The lead then keeps its card, count and revenue in the stage that holds
+     * it, with its pending or failed sync badge, instead of being shown nowhere.
+     * Without `stageIds`, the projected stage itself is returned (a stage move
+     * compares the choice with it).
+     *
      * @param {Object|null} projection `projectLead` of the lead's record
      * @param {Object} [group] the group whose list holds the record
+     * @param {Set<number|false>} [stageIds] the stage groups' values (`crmStageIds`)
      * @returns {number|false|null} the stage id (`false`: no stage), or `null` while
      *  a pending delete or archive hides the lead
      */
-    crmStageOf(projection, group) {
+    crmStageOf(projection, group, stageIds) {
         if (!projection) {
             return null;
         }
@@ -1347,7 +1358,22 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             // Stage not loaded (offline desktop-variant fallback): the group's.
             return group ? group.value : false;
         }
-        return many2oneId(projection.stage_id);
+        const stageId = many2oneId(projection.stage_id);
+        if (group && stageIds && !stageIds.has(stageId)) {
+            return group.value;
+        }
+        return stageId;
+    }
+
+    /**
+     * Values of the stage groups (`stageGroups`), the stages a lead or a lead
+     * created offline can be displayed in.
+     *
+     * @param {Object[]} [groups] `stageGroups` already read
+     * @returns {Set<number|false>}
+     */
+    crmStageIds(groups = this.stageGroups) {
+        return new Set(groups.map((group) => group.value));
     }
 
     /**
@@ -1371,15 +1397,42 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     /**
      * Loaded leads of every group (`crmLoadedLeads`), each projected once: its
      * `projection` (`projectLead`, one queue read) and the `stageId` it is
-     * displayed in (`crmStageOf`). Computed on each call, never stored.
+     * displayed in (`crmStageOf`, a stage no group shows displayed in the group
+     * holding the lead). Computed on each call, never stored.
      *
      * @returns {{record: Object, group: Object, projection: Object|null, stageId: number|false|null}[]}
      */
     crmProjectedLeads() {
+        const stageIds = this.crmStageIds();
         return this.crmLoadedLeads().map(({ record, group }) => {
             const projection = this.crmOffline.projectLead(record);
-            return { record, group, projection, stageId: this.crmStageOf(projection, group) };
+            return {
+                record,
+                group,
+                projection,
+                stageId: this.crmStageOf(projection, group, stageIds),
+            };
         });
+    }
+
+    /**
+     * Leads created offline displayed in a stage, as provisional card data: the
+     * stage's own (`pendingCreates`), then, in the first stage group, those created
+     * in a stage no stage group shows (`pendingCreatesOutside`), such as one deleted
+     * on the server since, whose replay parks the create. Every create the queue
+     * holds thus keeps a card, counted in the header of the stage showing it.
+     *
+     * @param {Object} group
+     * @param {Object[]} [groups] `stageGroups` already read
+     * @returns {Object[]}
+     */
+    crmStagePendingCreates(group, groups = this.stageGroups) {
+        const pending = this.crmOffline.pendingCreates(group.value);
+        if (!groups.length || group.id !== groups[0].id) {
+            return pending;
+        }
+        const outside = this.crmOffline.pendingCreatesOutside(this.crmStageIds(groups));
+        return outside.length ? [...pending, ...outside] : pending;
     }
 
     /**
@@ -1394,12 +1447,12 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      *  pending: Object[],
      *  count: number,
      *  revenue: {value: number, currencies: number[]|undefined}|null,
-     * }} `records` as `getStageRecords`, `pending` as `pendingCreates`, `count` as
-     *  `getStageCount`, `revenue` as `getStageRevenue`
+     * }} `records` as `getStageRecords`, `pending` as `crmStagePendingCreates`,
+     *  `count` as `getStageCount`, `revenue` as `getStageRevenue`
      */
     crmStageView(group) {
         const leads = this.crmProjectedLeads();
-        const pending = this.crmOffline.pendingCreates(group.value);
+        const pending = this.crmStagePendingCreates(group);
         return {
             records: this.getStageRecords(group, leads),
             pending,
@@ -1467,10 +1520,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     }
 
     /**
-     * Lead count of a stage header: a base, plus the leads created offline in it,
-     * minus the loaded leads the base counts in it that are hidden or projected
-     * elsewhere, plus the loaded leads it does not count there projected into it.
-     * Never below 0.
+     * Lead count of a stage header: a base, plus the leads created offline it shows
+     * (`crmStagePendingCreates`), minus the loaded leads the base counts in it that
+     * are hidden or projected elsewhere, plus the loaded leads it does not count
+     * there projected into it. Never below 0.
      *
      * - Without an active progress-bar filter, the base is `group.count`, which the
      *   framework's moves adjust: a loaded lead counts in the group holding it.
@@ -1486,13 +1539,13 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      *
      * @param {Object} group
      * @param {Object[]} [leads] `crmProjectedLeads()` already computed for this render
-     * @param {Object[]} [pending] `pendingCreates(group.value)` already read for this render
+     * @param {Object[]} [pending] `crmStagePendingCreates(group)` already read for this render
      * @returns {number}
      */
     getStageCount(group, leads, pending) {
         const barCount = this.crmGetBarCount(group);
         let count = barCount ?? group.count;
-        count += (pending ?? this.crmOffline.pendingCreates(group.value)).length;
+        count += (pending ?? this.crmStagePendingCreates(group)).length;
         const { list } = this.props;
         const savedStages = barCount === undefined ? null : barStages(list);
         // The snapshot of the displayed root, as for the revenue (`getStageRevenue`).
@@ -1526,7 +1579,8 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      *   and revenue of the leads loaded since that root's load), its server revenue
      *   leaves its server stage and its current (projected) revenue joins its
      *   current stage; a hidden or no longer listed lead joins no stage;
-     * - plus the revenue of the leads created offline in the stage.
+     * - plus the revenue of the leads created offline the stage shows
+     *   (`crmStagePendingCreates`).
      *
      * `null` while a progress-bar filter is active (the aggregates are unfiltered)
      * or when the root load aggregated no revenue (offline desktop-variant fallback
@@ -1534,7 +1588,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      *
      * @param {Object} group
      * @param {Object[]} [leads] `crmProjectedLeads()` already computed for this render
-     * @param {Object[]} [pending] `pendingCreates(group.value)` already read for this render
+     * @param {Object[]} [pending] `crmStagePendingCreates(group)` already read for this render
      * @returns {{value: number, currencies: number[]|undefined}|null}
      */
     getStageRevenue(group, leads, pending) {
@@ -1569,7 +1623,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                 }
             }
         }
-        for (const create of pending ?? this.crmOffline.pendingCreates(group.value)) {
+        for (const create of pending ?? this.crmStagePendingCreates(group)) {
             value += amount(create.expected_revenue);
         }
         return { value, currencies: this.crmStageCurrencies(group) };

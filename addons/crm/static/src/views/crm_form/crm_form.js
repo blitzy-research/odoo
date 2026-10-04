@@ -32,7 +32,11 @@ import {
 } from "@mail/js/rotting_mixin/rotting_statusbar";
 import { Chatter } from "@mail/chatter/web_portal_project/chatter";
 import { Composer } from "@mail/core/common/composer";
+import { MailAttachmentDropzone } from "@mail/core/common/mail_attachment_dropzone";
 import { Thread } from "@mail/core/common/thread";
+import { Follower } from "@mail/core/web/follower";
+import { FollowerList } from "@mail/core/web/follower_list";
+import { FollowerSubtypeDialog } from "@mail/core/web/follower_subtype_dialog";
 import {
     CRM_MOBILE_ACTIVITY_LIMIT,
     crmReportError,
@@ -2415,10 +2419,20 @@ if (offlineSystrayItem) {
 }
 
 /**
+ * Lead chatters by their root ref, on which their attachment dropzones (the
+ * chatter's own and its composer's) are placed.
+ *
+ * @type {WeakMap<Function, Chatter>}
+ */
+const LEAD_CHATTERS_BY_DROPZONE_REF = new WeakMap();
+
+/**
  * Lead chatter read-only offline. Scoped to `crm.lead` threads, checked before the
  * offline signal is read, so other chatters neither subscribe to it nor change.
  * Its Send, Log note, Activities, attachment and follow controls are buttons, which
- * the framework already disables offline.
+ * the framework already disables offline; activity scheduling, the followers menu,
+ * the attachments and the dropzone are also guarded where they run (below and in
+ * the follower and dropzone patches).
  *
  * What a lead chatter skips offline is remembered for the displayed thread and
  * loaded once when the connection returns, so a lead opened or reloaded offline
@@ -2428,6 +2442,20 @@ patch(Chatter.prototype, {
     setup() {
         super.setup(...arguments);
         this.crmOfflinePlugin = usePlugin(OfflinePlugin);
+        /**
+         * Upload handlers of lead threads, guarded offline, by mail's handler.
+         *
+         * @type {WeakMap<Function, Function>}
+         */
+        this.crmUploadHandlers = new WeakMap();
+        if (this.threadModel() === "crm.lead") {
+            // The dropzone and the file input upload through this chatter's own
+            // uploader, which the attachment list also deletes through; the search
+            // input and its filters search through its own message search.
+            this.crmGuardOffline(this.attachmentUploader, ["uploadFile", "unlink"]);
+            this.crmGuardOffline(this.messageSearch, ["run", "fetch", "fetchMessages"]);
+            LEAD_CHATTERS_BY_DROPZONE_REF.set(this.rootRef, this);
+        }
         /**
          * Thread requests skipped offline, for one thread only.
          *
@@ -2442,6 +2470,21 @@ patch(Chatter.prototype, {
                 if (this.state.composerType) {
                     this.state.composerType = false;
                 }
+                // The followers menu items are not buttons, which the framework would
+                // disable: a menu opened online closes, and so does one forced open
+                // offline, as this branch follows the menu state.
+                if (this.followerListDropdown.isOpen) {
+                    untrack(() => this.followerListDropdown.close());
+                }
+                // So are the pinned messages' jump links, which load the messages
+                // around one not shown, and the search input, which searches as it is
+                // typed in: their panel closes in the same way.
+                const activePanel = this.state.activePanel;
+                if (activePanel === this.CHATTER_PANEL.PINNED_MESSAGES) {
+                    untrack(() => (this.state.activePanel = this.CHATTER_PANEL.NONE));
+                } else if (activePanel === this.CHATTER_PANEL.SEARCH) {
+                    untrack(() => this.closeSearch());
+                }
                 return;
             }
             // The load reads and writes thread state: this effect follows only the
@@ -2454,6 +2497,34 @@ patch(Chatter.prototype, {
         // in the order they were added (a capture listener gets no precedence), so
         // this one is added at setup: before the Thread child, and this chatter, mount.
         useListener(this.env.bus, "MAIL:RELOAD-THREAD", (ev) => this.crmOnReloadThread(ev));
+    },
+
+    /** Scope first (lead thread), then the offline signal. */
+    get crmOfflineReadOnly() {
+        const threadModel = this.state.thread?.model ?? this.threadModel();
+        return threadModel === "crm.lead" && this.crmOfflinePlugin.isOffline();
+    },
+
+    /**
+     * Offline, makes the given methods of one of this lead chatter's helpers resolve
+     * without running, so without a request, even when called directly. Online, and
+     * once the chatter shows another model, they run unchanged (same `this`,
+     * arguments and result).
+     *
+     * @param {Object} helper
+     * @param {string[]} methodNames
+     */
+    crmGuardOffline(helper, methodNames) {
+        const chatter = this;
+        for (const methodName of methodNames) {
+            const method = helper[methodName];
+            helper[methodName] = function () {
+                if (chatter.crmOfflineReadOnly) {
+                    return Promise.resolve();
+                }
+                return method.apply(this, arguments);
+            };
+        }
     },
 
     /**
@@ -2486,6 +2557,91 @@ patch(Chatter.prototype, {
             return;
         }
         return super.load(...arguments);
+    },
+
+    /**
+     * @override
+     * Offline, a lead chatter schedules no activity, even when called directly: it
+     * opens no activity dialog (whose views are a server request) and saves no new
+     * lead to get a thread, and it resolves (no rejection, no error).
+     */
+    async scheduleActivity() {
+        if (this.crmOfflineReadOnly) {
+            return;
+        }
+        return super.scheduleActivity(...arguments);
+    },
+
+    /**
+     * @override
+     * Offline, a lead chatter removes no attachment, even when called directly or
+     * from a removal confirmed offline: the attachment stays, and the call resolves.
+     */
+    async unlinkAttachment(attachment) {
+        if (this.crmOfflineReadOnly) {
+            return;
+        }
+        return super.unlinkAttachment(...arguments);
+    },
+
+    /**
+     * @override
+     * The file input keeps the handler it got when its chooser was opened online:
+     * for a lead thread it uploads nothing, and opens no attachment panel, when the
+     * files are chosen, or the handler called, offline.
+     */
+    onUploaded({ thread } = {}) {
+        const handleUpload = super.onUploaded(...arguments);
+        if (thread?.model !== "crm.lead") {
+            return handleUpload;
+        }
+        if (!this.crmUploadHandlers.has(handleUpload)) {
+            this.crmUploadHandlers.set(handleUpload, (data) =>
+                this.crmOfflinePlugin.isOffline() ? Promise.resolve() : handleUpload(data)
+            );
+        }
+        return this.crmUploadHandlers.get(handleUpload);
+    },
+
+    /**
+     * @override
+     * Offline, a lead chatter's pinned messages do not open, so they are not
+     * fetched, even when called directly; a closing call still closes them.
+     */
+    onClickPinnedMessages() {
+        if (
+            this.crmOfflineReadOnly &&
+            this.state.activePanel !== this.CHATTER_PANEL.PINNED_MESSAGES
+        ) {
+            return;
+        }
+        return super.onClickPinnedMessages(...arguments);
+    },
+
+    /**
+     * @override
+     * Offline, a lead chatter's file chooser does not open (`false` stops the file
+     * uploader), and a new lead is not saved to get a thread.
+     */
+    async onClickAttachFile() {
+        if (this.crmOfflineReadOnly) {
+            return false;
+        }
+        return super.onClickAttachFile(...arguments);
+    },
+
+    /**
+     * @override
+     * Offline, a lead chatter opens no composer, even when called directly: it saves
+     * no new lead to get a thread and looks up no recipients. A closing call still
+     * closes it; on a new lead, where no composer is open, such a call would only
+     * save the lead, so it does nothing.
+     */
+    toggleComposer(mode = false) {
+        if (this.crmOfflineReadOnly && (mode || !this.state.thread?.id)) {
+            return;
+        }
+        return super.toggleComposer(...arguments);
     },
 
     /**
@@ -2554,11 +2710,27 @@ patch(Chatter.prototype, {
 });
 
 /**
+ * A lead chatter's attachment dropzones render nothing offline (template extension
+ * in `crm_mobile_pipeline.xml`), also when one is shown as the connection drops: a
+ * file dropped on the chatter saves no new lead and uploads nothing. Scoped to lead
+ * chatters by the root the dropzone is placed on, checked before the offline signal
+ * is read; every other dropzone is mail's.
+ */
+patch(MailAttachmentDropzone.prototype, {
+    get crmOfflineInert() {
+        return Boolean(LEAD_CHATTERS_BY_DROPZONE_REF.get(this.props.ref)?.crmOfflineReadOnly);
+    },
+});
+
+/**
  * A lead chatter's message list loads its older (or newer) messages when their
  * "Load More" control comes into view, without a click the framework could
  * disable. Offline it loads none, so the messages already shown stay without a
- * loading error, and the control loads them once online. Scoped to lead chatters,
- * checked before the offline signal is read; other threads are untouched.
+ * loading error, and the control loads them once online. Its handlers that fetch
+ * messages (load older, retry, and a jump to the present that reloads the newest
+ * page) fetch nothing offline either, even when called directly. Scoped to lead
+ * chatters, checked before the offline signal is read; other threads, and every
+ * online call, go to the original code.
  */
 patch(Thread.prototype, {
     setup() {
@@ -2566,16 +2738,50 @@ patch(Thread.prototype, {
         this.crmOfflinePlugin = usePlugin(OfflinePlugin);
     },
 
+    /** Scope first (lead chatter thread), then the offline signal. */
+    get crmOfflineReadOnly() {
+        return Boolean(
+            this.env.inChatter &&
+                this.props.thread.model === "crm.lead" &&
+                this.crmOfflinePlugin.isOffline()
+        );
+    },
+
     /** @override */
     get shouldTriggerLoadOnVisible() {
-        if (
-            this.env.inChatter &&
-            this.props.thread.model === "crm.lead" &&
-            this.crmOfflinePlugin.isOffline()
-        ) {
+        if (this.crmOfflineReadOnly) {
             return false;
         }
         return super.shouldTriggerLoadOnVisible;
+    },
+
+    /** @override */
+    onClickLoadOlder() {
+        if (this.crmOfflineReadOnly) {
+            return;
+        }
+        return super.onClickLoadOlder(...arguments);
+    },
+
+    /** @override */
+    onClickRetry() {
+        if (this.crmOfflineReadOnly) {
+            return;
+        }
+        return super.onClickRetry(...arguments);
+    },
+
+    /**
+     * @override
+     * Offline, a jump that would reload the newest messages does nothing (the
+     * messages shown, the highlight and the scroll position stay); an immediate
+     * jump with no newer messages to load only scrolls, as online.
+     */
+    async jumpToPresent({ immediate = false } = {}) {
+        if (this.crmOfflineReadOnly && (!immediate || this.props.thread.loadNewer)) {
+            return;
+        }
+        return super.jumpToPresent(...arguments);
     },
 });
 
@@ -2613,5 +2819,121 @@ patch(Composer.prototype, {
             return;
         }
         return super.sendMessage(...arguments);
+    },
+});
+
+/**
+ * Offline, a lead's followers can be neither changed nor looked up. The followers
+ * menu items are not buttons, so the framework leaves them active: the chatter
+ * closes the menu when the connection drops, and these handlers, reached from its
+ * items, from a subtype dialog opened online or by a direct call, return before
+ * any follow, unfollow, subscription or partner request, wizard or dialog. Scoped
+ * to lead threads, checked before the offline signal is read; other threads, and
+ * every online call, go to the original code.
+ */
+patch(FollowerList.prototype, {
+    setup() {
+        super.setup(...arguments);
+        this.crmOfflinePlugin = usePlugin(OfflinePlugin);
+    },
+
+    /** Scope first (lead thread), then the offline signal. */
+    get crmOfflineReadOnly() {
+        return this.props.thread?.model === "crm.lead" && this.crmOfflinePlugin.isOffline();
+    },
+
+    /** @override */
+    onClickAddFollowers() {
+        if (this.crmOfflineReadOnly) {
+            return;
+        }
+        return super.onClickAddFollowers(...arguments);
+    },
+
+    /** @override */
+    async onClickFollow() {
+        if (this.crmOfflineReadOnly) {
+            return;
+        }
+        return super.onClickFollow(...arguments);
+    },
+
+    /** @override */
+    async onClickUnfollow() {
+        if (this.crmOfflineReadOnly) {
+            return;
+        }
+        return super.onClickUnfollow(...arguments);
+    },
+
+    /** @override */
+    async onClickEdit() {
+        if (this.crmOfflineReadOnly) {
+            return;
+        }
+        return super.onClickEdit(...arguments);
+    },
+});
+
+patch(Follower.prototype, {
+    setup() {
+        super.setup(...arguments);
+        this.crmOfflinePlugin = usePlugin(OfflinePlugin);
+    },
+
+    /** Scope first (lead thread), then the offline signal. */
+    get crmOfflineReadOnly() {
+        return (
+            this.props.follower.thread?.model === "crm.lead" && this.crmOfflinePlugin.isOffline()
+        );
+    },
+
+    /** @override */
+    onClickDetails(ev) {
+        if (this.crmOfflineReadOnly) {
+            return;
+        }
+        return super.onClickDetails(...arguments);
+    },
+
+    /** @override */
+    async onClickEdit() {
+        if (this.crmOfflineReadOnly) {
+            return;
+        }
+        return super.onClickEdit(...arguments);
+    },
+
+    /** @override */
+    async onClickRemove() {
+        if (this.crmOfflineReadOnly) {
+            return;
+        }
+        return super.onClickRemove(...arguments);
+    },
+});
+
+patch(FollowerSubtypeDialog.prototype, {
+    setup() {
+        super.setup(...arguments);
+        this.crmOfflinePlugin = usePlugin(OfflinePlugin);
+    },
+
+    /** Scope first (lead thread), then the offline signal. */
+    get crmOfflineReadOnly() {
+        return (
+            this.props.follower.thread?.model === "crm.lead" && this.crmOfflinePlugin.isOffline()
+        );
+    },
+
+    /**
+     * @override
+     * Offline the dialog stays open, so its choices can still be applied online.
+     */
+    async onClickApply() {
+        if (this.crmOfflineReadOnly) {
+            return;
+        }
+        return super.onClickApply(...arguments);
     },
 });

@@ -68,14 +68,22 @@ import {
     toggleActionMenu,
     toggleMenuItem,
 } from "@web/../tests/web_test_helpers";
+import { clickDate } from "@web/../tests/views/calendar/calendar_test_helpers";
 import { defineCrmModels } from "@crm/../tests/crm_test_helpers";
-import { start, startServer } from "@mail/../tests/mail_test_helpers";
+import { dragenterFiles, dropFiles, start, startServer } from "@mail/../tests/mail_test_helpers";
+import { MailComposerFormController } from "@mail/chatter/web/mail_composer_form";
+import { Chatter } from "@mail/chatter/web_portal_project/chatter";
 import { Composer } from "@mail/core/common/composer";
+import { Thread } from "@mail/core/common/thread";
 import { ActivityButton } from "@mail/core/web/activity_button";
+import { Follower } from "@mail/core/web/follower";
+import { FollowerList } from "@mail/core/web/follower_list";
+import { FollowerSubtypeDialog } from "@mail/core/web/follower_subtype_dialog";
 import {
     CRM_MOBILE_ACTIVITY_LIMIT,
     CRM_OFFLINE_CREATE_KEY,
     CRM_OFFLINE_DISABLED_ACTIONS,
+    CRM_OFFLINE_UID_KEY,
     CRM_OFFLINE_DISABLED_MENUS,
     useCrmOffline,
 } from "@crm/mobile/crm_offline_hooks";
@@ -96,11 +104,13 @@ import { registerTemplate } from "@web/core/templates";
 import { user } from "@web/core/user";
 import { useService } from "@web/core/utils/hooks";
 import { ActionMenus } from "@web/search/action_menus/action_menus";
+import { session } from "@web/session";
 import { computeM2OProps, Many2One } from "@web/views/fields/many2one/many2one";
 import { buildM2OFieldDescription, Many2OneField } from "@web/views/fields/many2one/many2one_field";
 import { Many2ManyTagsField } from "@web/views/fields/many2many_tags/many2many_tags_field";
 import { PhoneField } from "@web/views/fields/phone/phone_field";
 import { Many2XAutocomplete } from "@web/views/fields/relational_utils";
+import { FormController } from "@web/views/form/form_controller";
 import { KanbanRecord } from "@web/views/kanban/kanban_record";
 import { View } from "@web/views/view";
 import { AnimatedNumber } from "@web/views/view_components/animated_number";
@@ -1255,6 +1265,18 @@ function callContext(actionContext = {}, viewKeys = {}) {
 }
 
 /**
+ * The context of a call the view queues offline: its `callContext`, plus the id of
+ * the session user, who queued it (`CRM_OFFLINE_UID_KEY`).
+ *
+ * @param {Object} [actionContext]
+ * @param {Object} [viewKeys]
+ * @returns {Object}
+ */
+function queuedContext(actionContext = {}, viewKeys = {}) {
+    return { ...callContext(actionContext, viewKeys), [CRM_OFFLINE_UID_KEY]: serverState.userId };
+}
+
+/**
  * The payload of an ORM call as the mock server receives it, `{model, method, args,
  * kwargs}`, copied when it arrives and without the mock server's keyword-argument flag.
  *
@@ -1533,7 +1555,7 @@ test("[Offline] form stage change save skips rainbowman lookup", async () => {
             model: "crm.lead",
             method: "web_save",
             args: [[1], { stage_id: STAGE_WON }],
-            kwargs: { context: callContext(), specification: {} },
+            kwargs: { context: queuedContext(), specification: {} },
         },
     ]);
     expect(".o_form_button_save").not.toBeVisible();
@@ -1583,7 +1605,7 @@ test("[Offline] kanban stage move skips rainbowman lookup", async () => {
             method: "web_save",
             args: [[1], { stage_id: STAGE_WON }],
             kwargs: {
-                context: callContext({}, { default_stage_id: STAGE_NEW }),
+                context: queuedContext({}, { default_stage_id: STAGE_NEW }),
                 specification: {},
             },
         },
@@ -1700,7 +1722,7 @@ test("[Offline] queued lead write includes forced email and phone", async () => 
                 phone: "+32 470 11 22 33",
             },
         ],
-        kwargs: { context: callContext(), specification: {} },
+        kwargs: { context: queuedContext(), specification: {} },
     };
     expect(queuedCalls("crm.lead")).toEqual([save]);
     expect.verifySteps([]);
@@ -1816,7 +1838,7 @@ test("[Offline] partner change queues no stale forced email and phone", async ()
     await contains(`${PARTNER_OPTIONS}:contains(New Partner)`).click();
     expect(PARTNER_INPUT).toHaveValue("New Partner");
     await contains(".o_form_button_save").click();
-    const kwargs = { context: callContext(), specification: {} };
+    const kwargs = { context: queuedContext(), specification: {} };
     expect(queuedCalls("crm.lead")).toEqual([
         {
             model: "crm.lead",
@@ -1903,7 +1925,7 @@ test("[Offline] partner change after a forced save does not replay the forced em
     await setOffline(true);
     await contains(".o_field_widget[name=name] input").edit("Lead 2 renamed");
     await contains(".o_form_button_save").click();
-    const kwargs = { context: callContext(), specification: {} };
+    const kwargs = { context: queuedContext(), specification: {} };
     expect(queuedCalls("crm.lead")).toEqual([
         {
             model: "crm.lead",
@@ -1959,7 +1981,7 @@ test("[Offline] partner change on a reopened lead drops the restored forced emai
     await setOffline(true);
     await contains(".o_field_widget[name=name] input").edit("Lead 2 renamed");
     await contains(".o_form_button_save").click();
-    const kwargs = { context: callContext(), specification: {} };
+    const kwargs = { context: queuedContext(), specification: {} };
     expect(queuedCalls("crm.lead")).toEqual([
         {
             model: "crm.lead",
@@ -2024,7 +2046,7 @@ test("[Offline] email typed before an offline partner change is superseded by th
         model: "crm.lead",
         method: "web_save",
         args: [[2], { partner_id: newPartnerId }],
-        kwargs: { context: callContext(), specification: {} },
+        kwargs: { context: queuedContext(), specification: {} },
     };
     expect(queuedCalls("crm.lead")).toEqual([save]);
     expect.verifySteps([]);
@@ -2053,7 +2075,7 @@ test("[Offline] email saved before an offline partner change is superseded by th
     const newPartnerId = setupLeadOwnContacts(env);
     await openLeadContactForm("Lead 2");
     const emailInput = ".o_field_widget[name=email_from] input";
-    const kwargs = { context: callContext(), specification: {} };
+    const kwargs = { context: queuedContext(), specification: {} };
 
     // Offline, a saved email is queued, with the phone forced for the partner.
     await setOffline(true);
@@ -2102,7 +2124,7 @@ test("[Offline] email typed after an offline partner change is kept", async () =
     const newPartnerId = setupLeadOwnContacts(env);
     await openLeadContactForm("Lead 2");
     const emailInput = ".o_field_widget[name=email_from] input";
-    const kwargs = { context: callContext(), specification: {} };
+    const kwargs = { context: queuedContext(), specification: {} };
 
     // Offline, an email typed after the partner change is an edit of the user, which
     // the save keeps; the phone, which nothing changed, is not forced.
@@ -2182,7 +2204,7 @@ test("[Offline] online save after an offline partner change writes no stale forc
             model: "crm.lead",
             method: "web_save",
             args: [[2], forced],
-            kwargs: { context: callContext(), specification: {} },
+            kwargs: { context: queuedContext(), specification: {} },
         },
     ]);
     await goBack();
@@ -2217,7 +2239,7 @@ test("[Offline] online save after an offline partner change writes no stale forc
             model: "crm.lead",
             method: "web_save",
             args: [[2], { name: "Lead 2 renamed" }],
-            kwargs: { context: callContext(), specification: {} },
+            kwargs: { context: queuedContext(), specification: {} },
         },
     ]);
     expect.verifyErrors([LEAD_LIST_LOAD, LEAD_RECORD_LOAD]);
@@ -2260,7 +2282,7 @@ test("[Offline] save as the connection returns writes and replays no stale force
                     phone: "+32 494 12 12 12",
                 },
             ],
-            kwargs: { context: callContext(), specification: {} },
+            kwargs: { context: queuedContext(), specification: {} },
         },
     ]);
     await goBack();
@@ -2332,7 +2354,7 @@ test("[Offline] partner change saved after a later write of the lead queues no s
     const { env } = await makeMockServer();
     const newPartnerId = setupLeadOwnContacts(env);
     await openLeadContactForm("Lead 2");
-    const kwargs = { context: callContext(), specification: {} };
+    const kwargs = { context: queuedContext(), specification: {} };
     const phoneInput = ".o_field_widget[name=phone] input";
 
     // T1: offline, a rename forces the lead's email and phone for its partner.
@@ -2465,7 +2487,7 @@ test("[Offline] phone edit shows the saved number", async () => {
         model: "crm.lead",
         method: "web_save",
         args: [[2], { phone: "+32 470 65 43 21" }],
-        kwargs: { context: callContext(), specification: {} },
+        kwargs: { context: queuedContext(), specification: {} },
     };
     expect(queuedCalls("crm.lead")).toEqual([save]);
 
@@ -2520,7 +2542,7 @@ test("[Offline] lead create and edit queue and replay", async () => {
     expect(".o_field_widget[name=name] input").toHaveValue("Lead 2 edited offline");
 
     // One create and one edit, in the order they were made.
-    const kwargs = { context: callContext(), specification: {} };
+    const kwargs = { context: queuedContext(), specification: {} };
     const createValues = queuedCalls("crm.lead")[0].args[1];
     expect(createValues).toMatchObject({ name: "Offline Lead", type: "opportunity" });
     const create = { model: "crm.lead", method: "web_save", args: [[], createValues], kwargs };
@@ -2637,7 +2659,7 @@ test("[Offline] lead form create can be discarded or parked", async () => {
             model: "crm.lead",
             method: "web_save",
             args: [[], args[1]],
-            kwargs: { context: callContext(PIPELINE_ACTION.context), specification: {} },
+            kwargs: { context: queuedContext(PIPELINE_ACTION.context), specification: {} },
         };
         expect(queuedCalls("crm.lead")).toEqual([create]);
         expect(queued("crm.lead")[0].value.kwargs.context.default_type).toBe("opportunity");
@@ -2778,7 +2800,7 @@ test("[Offline] lead created in a form kept open is created once on reconnect", 
                 model: "crm.lead",
                 method: "web_save",
                 args: [[], args[1]],
-                kwargs: { context: callContext(), specification: {} },
+                kwargs: { context: queuedContext(), specification: {} },
             },
         ]);
         expect.verifySteps([]);
@@ -2875,7 +2897,7 @@ test("[Offline] form stage change queues through the statusbar", async () => {
         model: "crm.lead",
         method: "web_save",
         args: [[1], { stage_id: STAGE_QUALIFIED }],
-        kwargs: { context: callContext(PIPELINE_ACTION.context), specification: {} },
+        kwargs: { context: queuedContext(PIPELINE_ACTION.context), specification: {} },
     };
     expect(queuedCalls("crm.lead")).toEqual([save]);
     expect.verifySteps([]);
@@ -2994,7 +3016,9 @@ test("[Offline] kanban stage move to an unfolded stage queues one web_save and r
         method: "web_save",
         args: [[1], { stage_id: STAGE_QUALIFIED }],
         kwargs: {
-            context: callContext(LIMITED_PIPELINE_ACTION.context, { default_stage_id: STAGE_NEW }),
+            context: queuedContext(LIMITED_PIPELINE_ACTION.context, {
+                default_stage_id: STAGE_NEW,
+            }),
             specification: {},
         },
     };
@@ -3136,7 +3160,7 @@ test("[Offline] kanban drag of a lead not opened online moves it and queues one 
         method: "web_save",
         args: [[1], { stage_id: STAGE_QUALIFIED }],
         kwargs: {
-            context: callContext(ACTIVITY_PIPELINE_ACTION.context, {
+            context: queuedContext(ACTIVITY_PIPELINE_ACTION.context, {
                 default_stage_id: STAGE_NEW,
             }),
             specification: {},
@@ -3352,7 +3376,7 @@ test("[Offline] card menu delete removes the card and queues unlink", async () =
         model: "crm.lead",
         method: "unlink",
         args: [[1]],
-        kwargs: { context: callContext(PIPELINE_ACTION.context) },
+        kwargs: { context: queuedContext(PIPELINE_ACTION.context) },
     };
     expect(queuedCalls("crm.lead")).toEqual([unlink]);
     expect.verifySteps([]);
@@ -3419,7 +3443,7 @@ test("[Offline] card menu colour changes the card and replays", async () => {
         method: "web_save",
         args: [[1], { color: 3 }],
         kwargs: {
-            context: callContext(PIPELINE_ACTION.context, { default_stage_id: STAGE_NEW }),
+            context: queuedContext(PIPELINE_ACTION.context, { default_stage_id: STAGE_NEW }),
             specification: {},
         },
     };
@@ -3493,7 +3517,7 @@ test("[Offline] team card colour from a menu opened online queues and replays", 
         model: "crm.team",
         method: "web_save",
         args: [[1], { color: 5 }],
-        kwargs: { context: callContext(), specification: {} },
+        kwargs: { context: queuedContext(), specification: {} },
     };
     expect(queuedCalls("crm.team")).toEqual([save]);
     expect.verifySteps([]);
@@ -3545,7 +3569,7 @@ test("[Offline] stage form edit queues and replays", async () => {
         model: "crm.stage",
         method: "web_save",
         args: [[STAGE_QUALIFIED], { name: "Qualified (offline)" }],
-        kwargs: { context: callContext(), specification: {} },
+        kwargs: { context: queuedContext(), specification: {} },
     };
     expect(queuedCalls("crm.stage")).toEqual([save]);
     expect.verifySteps([]);
@@ -3617,7 +3641,7 @@ test("[Offline] form archive shows archived at once", async () => {
         model: "crm.lead",
         method: "action_archive",
         args: [[1]],
-        kwargs: { context: callContext(PIPELINE_ACTION.context) },
+        kwargs: { context: queuedContext(PIPELINE_ACTION.context) },
     };
     expect(queuedCalls("crm.lead")).toEqual([archive]);
     await goBack();
@@ -3692,7 +3716,7 @@ test("[Offline] form delete leaves the form at once", async () => {
         model: "crm.lead",
         method: "unlink",
         args: [[1]],
-        kwargs: { context: callContext(PIPELINE_ACTION.context) },
+        kwargs: { context: queuedContext(PIPELINE_ACTION.context) },
     };
     expect(queuedCalls("crm.lead")).toEqual([unlink]);
     await openLead(1);
@@ -3801,7 +3825,7 @@ test("[Offline] mark won queues action_set_won and shows won", async () => {
         model: "crm.lead",
         method: "action_set_won",
         args: [[1]],
-        kwargs: { context: callContext(PIPELINE_ACTION.context) },
+        kwargs: { context: queuedContext(PIPELINE_ACTION.context) },
     };
     expect(queuedCalls("crm.lead")).toEqual([won]);
 
@@ -3851,7 +3875,7 @@ test("[Offline] mark won saves pending edits first as their own web_save", async
     expect(".o_form_status_indicator_buttons").toHaveClass("invisible");
     // The save holds the edits only: the won values are local, and the server sets
     // them (with the won stage) when it replays the won call.
-    const context = callContext(PIPELINE_ACTION.context);
+    const context = queuedContext(PIPELINE_ACTION.context);
     const save = {
         model: "crm.lead",
         method: "web_save",
@@ -3910,7 +3934,7 @@ test("[Offline] mark won with a missing required name saves and queues nothing",
     await contains(".o_field_widget[name=name] input").edit("Lead 1 renamed");
     await contains(".o_form_statusbar button[name=action_set_won_rainbowman]").click();
     expect(".ribbon:contains(Won)").toHaveCount(1);
-    const context = callContext(PIPELINE_ACTION.context);
+    const context = queuedContext(PIPELINE_ACTION.context);
     expect(queuedCalls("crm.lead")).toEqual([
         {
             model: "crm.lead",
@@ -3961,7 +3985,7 @@ test("[Offline] mark won on an unsynced new lead queues its create only", async 
                 won_status: "pending",
             },
         ],
-        kwargs: { context: callContext(PIPELINE_ACTION.context), specification: {} },
+        kwargs: { context: queuedContext(PIPELINE_ACTION.context), specification: {} },
     };
     expect(queuedCalls("crm.lead")).toEqual([create]);
     expect(".ribbon:contains(Won)").toHaveCount(0);
@@ -4091,7 +4115,7 @@ async function markWonOffline(setOffline, resId) {
         model: "crm.lead",
         method: "action_set_won",
         args: [[resId]],
-        kwargs: { context: callContext(PIPELINE_ACTION.context) },
+        kwargs: { context: queuedContext(PIPELINE_ACTION.context) },
     };
     expect(queuedCalls("crm.lead")).toEqual([won]);
     return won;
@@ -4457,13 +4481,17 @@ const FOLLOWERS_ACTION = {
     context: "{'default_res_model': 'crm.lead'}",
 };
 
-/** Lead meetings, returned by Schedule Meeting (`crm.act_crm_opportunity_calendar_event_new`). */
+/** Lead meetings (`crm.act_crm_opportunity_calendar_event_new`, `list,form,calendar`). */
 const MEETING_ACTION = {
     id: 28,
     xml_id: "crm.act_crm_opportunity_calendar_event_new",
     name: "Meetings",
     res_model: "calendar.event",
-    views: [[false, "list"]],
+    views: [
+        [false, "list"],
+        [false, "form"],
+        [false, "calendar"],
+    ],
 };
 
 defineActions([
@@ -5862,6 +5890,732 @@ test("[Offline] blocked actions requested by a numeric-string id stay closed", a
 });
 
 /**
+ * An action id written with the decimal digits of another Unicode script, whose zero
+ * is at code point `zero` (the server's `int()` reads every such form as the id).
+ *
+ * @param {number} zero
+ * @param {number} id
+ * @returns {string}
+ */
+function idInDigits(zero, id) {
+    return [...String(id)].map((digit) => String.fromCodePoint(zero + Number(digit))).join("");
+}
+
+/**
+ * The forms of an action id other than the integer that the server reads as that id:
+ * its numeric string, padded with Unicode whitespace, signed, zero-filled, with
+ * underscores between its digits, and written with other scripts' decimal digits
+ * (Arabic-Indic, fullwidth, and the mathematical bold and monospace digits, outside
+ * the Basic Multilingual Plane).
+ *
+ * @param {number} id
+ * @returns {string[]}
+ */
+function actionIdForms(id) {
+    return [
+        String(id),
+        ` ${id}\n`,
+        `\u00a0+${id}\u2003`,
+        `00${id}`,
+        [...String(id)].join("_"),
+        `\u3000${idInDigits(0x0660, id)}`,
+        idInDigits(0xff10, id),
+        idInDigits(0x1d7ce, id),
+        idInDigits(0x1d7f6, id),
+    ];
+}
+
+test("[Offline] blocked actions known by one id form stay closed under every other", async () => {
+    const setOffline = mockOffline();
+    const stepping = stepRoutes(
+        (route) => route.includes("/crm.lead/") || route === "/web/action/load"
+    );
+    stepping.active = false;
+    await mountWithCleanup(WebClient);
+    // Online, the forecast is loaded by its integer id, the recurring plans by their
+    // id as a string.
+    await getService("action").doAction(FORECAST_ACTION.id);
+    await expectCurrentView("crm.crm_lead_action_forecast/kanban");
+    await getService("action").doAction(String(RECURRING_PLAN_ACTION.id));
+    await expectCurrentView("crm.crm_recurring_plan_action/list");
+    await getService("action").doAction(PIPELINE_ACTION.id, { clearBreadcrumbs: true });
+    await expectCurrentView("crm.crm_lead_action_pipeline/kanban");
+    await flushStartupSync();
+    const lostLoad = /Connection to "\/web\/action\/load" couldn't be established/;
+
+    await setOffline(true);
+    stepping.active = true;
+    // Every other form of the forecast's id, and a number the server truncates to it:
+    // `doAction` and the URL state stop with no request.
+    for (const request of [...actionIdForms(FORECAST_ACTION.id), FORECAST_ACTION.id + 0.5]) {
+        await getService("action").doAction(request);
+        expect(await getService("action").loadState({ action: request })).toBe(false);
+        const nestedState = { action: request, actionStack: [{ action: request }] };
+        expect(await getService("action").loadState(nestedState)).toBe(false);
+    }
+    // The recurring plans, known by their id as a string, by the integer.
+    await getService("action").doAction(RECURRING_PLAN_ACTION.id);
+    expect(await getService("action").loadState({ action: RECURRING_PLAN_ACTION.id })).toBe(false);
+    await settle();
+    expect(currentView()).toBe("crm.crm_lead_action_pipeline/kanban");
+    expect(".o_kanban_renderer").toHaveCount(1);
+    expect(".o_action_manager .o_view_nocontent .fa-chain-broken").toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+    // Another id (the sign is applied) and an action of another app the guards do not
+    // know: each goes to the original, whose own load alone is attempted.
+    for (const request of [`-${FORECAST_ACTION.id}`, String(CONTACTS_ACTION.id)]) {
+        await expect(getService("action").doAction(request)).rejects.toThrow(lostLoad);
+        expect.verifySteps(["/web/action/load"]);
+    }
+    expect(currentView()).toBe("crm.crm_lead_action_pipeline/kanban");
+    stepping.active = false;
+
+    // Online, both open again by either form of their id.
+    await reconnect(setOffline);
+    await getService("action").doAction(String(FORECAST_ACTION.id));
+    await expectCurrentView("crm.crm_lead_action_forecast/kanban");
+    expect(await getService("action").loadState({ action: RECURRING_PLAN_ACTION.id })).toBe(true);
+    await expectCurrentView("crm.crm_recurring_plan_action/list");
+});
+
+test("[Offline] the action stored in the session is known by every form of its id", async () => {
+    const setOffline = mockOffline();
+    stepRoutes((route) => route === "/web/action/load");
+    await mountWithCleanup(WebClient);
+    // Online, the forecast is opened from its descriptor: no action load, so the
+    // session's stored action alone identifies it.
+    await getService("action").doAction({ ...FORECAST_ACTION, type: "ir.actions.act_window" });
+    await expectCurrentView("crm.crm_lead_action_forecast/kanban");
+    await flushStartupSync();
+    expect(JSON.parse(browser.sessionStorage.getItem("current_action")).id).toBe(
+        FORECAST_ACTION.id
+    );
+    expect.verifySteps([]);
+
+    await setOffline(true);
+    // The mounted forecast shows the offline helper; no form of its id opens it.
+    for (const request of [FORECAST_ACTION.id, ...actionIdForms(FORECAST_ACTION.id)]) {
+        await getService("action").doAction(request);
+        expect(await getService("action").loadState({ action: request })).toBe(false);
+    }
+    await settle();
+    expect(currentView()).toBe("crm.crm_lead_action_forecast/kanban");
+    expect(".o_action_manager .o_view_nocontent .fa-chain-broken").toHaveCount(1);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+
+    // Online, the forecast shows again and opens by its id as a string.
+    await reconnect(setOffline);
+    expect(".o_action_manager .o_view_nocontent .fa-chain-broken").toHaveCount(0);
+    expect(".o_kanban_renderer").toHaveCount(1);
+    await getService("action").doAction(String(FORECAST_ACTION.id), { clearBreadcrumbs: true });
+    await expectCurrentView("crm.crm_lead_action_forecast/kanban");
+    expect.verifySteps(["/web/action/load"]);
+});
+
+test("[Offline] action buttons naming a disabled action open nothing, whatever their model", async () => {
+    const setOffline = mockOffline();
+    const stepping = stepRoutes();
+    stepping.active = false;
+    const { env } = await makeMockServer();
+    const partnerId = env["res.partner"].create({ name: "Azure Interior" });
+    await mountWithCleanup(WebClient);
+    /** A `type="action"` button call, as a view button issues it, without a model. */
+    const actionButton = (name, params = {}) =>
+        getService("action").doActionButton({ type: "action", name, context: {}, ...params });
+    // Online, the recurring plans and the lead mail composer open from buttons naming
+    // their `xml_id`: those exact action loads are now in the RPC cache, which serves
+    // them again with no request.
+    await actionButton(RECURRING_PLAN_ACTION.xml_id);
+    await expectCurrentView("crm.crm_recurring_plan_action/list");
+    await actionButton(MAIL_COMPOSE_ACTION.xml_id);
+    await waitFor(".modal .o_form_view .o_field_widget[name=body]");
+    await cancelDialog();
+    await getService("action").doAction(PIPELINE_ACTION.id, { clearBreadcrumbs: true });
+    await expectCurrentView("crm.crm_lead_action_pipeline/kanban");
+    await flushStartupSync();
+
+    await setOffline(true);
+    stepping.active = true;
+    // Each action named by its `xml_id` (the cached call included), its integer id or
+    // any other form of its id, on a button without a model and on a partner button:
+    // nothing loads, opens or is queued.
+    const partner = { resModel: "res.partner", resId: partnerId, resIds: [partnerId] };
+    for (const action of [RECURRING_PLAN_ACTION, MAIL_COMPOSE_ACTION]) {
+        expect(CRM_OFFLINE_DISABLED_ACTIONS.has(action.xml_id)).toBe(true);
+        for (const name of [action.xml_id, action.id, ...actionIdForms(action.id)]) {
+            await actionButton(name);
+            await actionButton(name, partner);
+        }
+    }
+    await settle();
+    expect(currentView()).toBe("crm.crm_lead_action_pipeline/kanban");
+    expect(".o_kanban_renderer").toHaveCount(1);
+    expect(".o_list_view").toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+    expect(queued("crm.recurring.plan")).toEqual([]);
+    expect(queued("mail.compose.message")).toEqual([]);
+    stepping.active = false;
+
+    // Online, each opens again from a partner button naming its id.
+    await reconnect(setOffline);
+    await actionButton(String(MAIL_COMPOSE_ACTION.id), partner);
+    await waitFor(".modal .o_form_view .o_field_widget[name=body]");
+    await cancelDialog();
+    await actionButton(RECURRING_PLAN_ACTION.id, partner);
+    await expectCurrentView("crm.crm_recurring_plan_action/list");
+    expect(".o_list_view").toHaveCount(1);
+});
+
+test("[Offline] views of a disabled action stay closed however they are reached", async () => {
+    const setOffline = mockOffline();
+    const stepping = stepRoutes(
+        (route) => route === "/web/action/load" || route.includes("/crm.recurring.plan/")
+    );
+    stepping.active = false;
+    await mountWithCleanup(WebClient);
+    const helper = ".o_action_manager .o_view_nocontent .fa-chain-broken";
+    // Online: the recurring plans, whose breadcrumb is then kept below the pipeline.
+    await getService("action").doAction(RECURRING_PLAN_ACTION.id);
+    await expectCurrentView("crm.crm_recurring_plan_action/list");
+    expect(".o_list_view .o_data_row").toHaveCount(1);
+    const plansJsId = getService("action").currentController.jsId;
+    await flushStartupSync();
+
+    // Mounted online, the list gives way to the offline helper as soon as the
+    // connection drops, so no plan can be edited, created, archived or deleted.
+    await setOffline(true);
+    stepping.active = true;
+    await animationFrame();
+    expect(helper).toHaveCount(1);
+    expect(".o_list_view").toHaveCount(0);
+    expect.verifySteps([]);
+    stepping.active = false;
+    await reconnect(setOffline);
+    await waitFor(".o_list_view .o_data_row");
+    expect(helper).toHaveCount(0);
+
+    // Reached offline by its breadcrumb, which the action guards do not see (as an id
+    // loaded in an earlier page session, then answered from the disk cache), the list
+    // mounts the offline helper, with no request and nothing queued.
+    await getService("action").doAction(PIPELINE_ACTION.id);
+    await expectCurrentView("crm.crm_lead_action_pipeline/kanban");
+    await setOffline(true);
+    stepping.active = true;
+    await getService("action").restore(plansJsId);
+    await settle();
+    expect(currentView()).toBe("crm.crm_recurring_plan_action/list");
+    expect(helper).toHaveCount(1);
+    expect(".o_list_view").toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+    expect(queued("crm.recurring.plan")).toEqual([]);
+
+    // Online, the list blocked at mount loads.
+    await setOffline(false);
+    await waitFor(".o_list_view .o_data_row");
+    expect(helper).toHaveCount(0);
+    expect.verifySteps(["/web/dataset/call_kw/crm.recurring.plan/web_search_read"]);
+});
+
+test("[Offline] meeting from a lead activity issues no request", async () => {
+    onRpc("mail.activity", "action_create_calendar_event", ({ args }) =>
+        stepServerCall("action_create_calendar_event", args[0])
+    );
+    const { env } = await makeMockServer();
+    const activityValues = { user_id: serverState.userId, date_deadline: "2999-01-01" };
+    const [leadActivityId, storedActivityId, partnerActivityId] = env["mail.activity"].create([
+        { ...activityValues, res_model: "crm.lead", res_id: 1 },
+        { ...activityValues, res_model: "crm.lead", res_id: 2 },
+        { ...activityValues, res_model: "res.partner", res_id: serverState.partnerId },
+    ]);
+    const setOffline = mockOffline();
+    stepRoutes((route) => route.startsWith("/web/dataset/call_button/"));
+    await mountWithCleanup(WebClient);
+    // The second lead's activity is in the mail store, as the lead's chatter and
+    // activity widgets load it.
+    getService("mail.store")["mail.activity"].insert({
+        id: storedActivityId,
+        res_model: "crm.lead",
+        res_id: 2,
+    });
+    // Another app's view is displayed.
+    await getService("action").doAction(CONTACTS_ACTION.id);
+    await expectCurrentView("contacts.action_contacts/list");
+    await flushStartupSync();
+    const calendarRoute = buttonRoute("mail.activity", "action_create_calendar_event");
+    /** The activity form's "Schedule meeting" button call (`type="object"`). */
+    const meetingButton = (resId, { context = {}, buttonContext = {} } = {}) =>
+        getService("action").doActionButton({
+            type: "object",
+            name: "action_create_calendar_event",
+            resModel: "mail.activity",
+            resId,
+            resIds: [resId],
+            context,
+            buttonContext,
+        });
+
+    await setOffline(true);
+    // A lead's activity named by the call's own context or found in the mail store.
+    for (const key of ["active_model", "default_res_model", "res_model"]) {
+        await meetingButton(leadActivityId, { context: { [key]: "crm.lead", active_id: 1 } });
+        await meetingButton(leadActivityId, { buttonContext: { [key]: "crm.lead" } });
+    }
+    await meetingButton(storedActivityId);
+    await settle();
+    expect.verifySteps([]);
+    // Another model's activity, outside CRM: the original's own request alone.
+    await expect(meetingButton(partnerActivityId)).rejects.toThrow(
+        /Connection to "\/web\/dataset\/call_button\/mail.activity\/action_create_calendar_event"/
+    );
+    expect.verifySteps([calendarRoute]);
+    expect(currentView()).toBe("contacts.action_contacts/list");
+    expect(".modal").toHaveCount(0);
+
+    // In a lead view (the pipeline, then a lead form opened online), a call without
+    // context for an activity the store does not hold.
+    await setOffline(false);
+    await getService("action").doAction(PIPELINE_ACTION.id);
+    await expectCurrentView("crm.crm_lead_action_pipeline/kanban");
+    await setOffline(true);
+    await meetingButton(leadActivityId);
+    await setOffline(false);
+    await openLead(1);
+    await expectCurrentView("crm.crm_lead_action_pipeline/form");
+    await setOffline(true);
+    await meetingButton(leadActivityId);
+    await settle();
+    expect.verifySteps([]);
+    expect(queued("mail.activity")).toEqual([]);
+
+    // Online, the method runs on the server.
+    await reconnect(setOffline);
+    await meetingButton(leadActivityId);
+    expect.verifySteps([calendarRoute, `action_create_calendar_event [${leadActivityId}]`]);
+});
+
+// -----------------------------------------------------------------------------
+// DISABLE: lead meetings (`calendar.event`) are neither saved nor queued offline
+// -----------------------------------------------------------------------------
+
+/** Meeting tags (`calendar.event.type`), coloured by the meeting form's tag editor. */
+class CalendarEventType extends models.Model {
+    _name = "calendar.event.type";
+
+    name = fields.Char();
+    color = fields.Integer();
+
+    _records = [{ id: 1, name: "Customer Meeting", color: 2 }];
+}
+
+/**
+ * Meetings (`calendar.event`), on calendar's own meeting form (`js_class="calendar_form"`,
+ * `calendar.view_calendar_event_form`): its "Send email" header button, its attendees
+ * (which its Delete sends), the lead the CRM inherit adds, its tags with their colour
+ * editor, and the `active` field that gives its Action menu Archive. Its calendar opens
+ * calendar's quick-create form (`calendar.view_calendar_event_form_quick_create`).
+ */
+class CalendarEvent extends models.Model {
+    _name = "calendar.event";
+
+    name = fields.Char({ string: "Meeting Subject", required: true });
+    start = fields.Datetime();
+    stop = fields.Datetime();
+    active = fields.Boolean({ default: true });
+    partner_ids = fields.Many2many({ string: "Attendees", relation: "res.partner" });
+    opportunity_id = fields.Many2one({ string: "Opportunity", relation: "crm.lead" });
+    categ_ids = fields.Many2many({ string: "Tags", relation: "calendar.event.type" });
+
+    _records = [
+        {
+            id: 1,
+            name: "Lead 1 demo",
+            start: "2026-03-10 09:00:00",
+            stop: "2026-03-10 10:00:00",
+            opportunity_id: 1,
+            categ_ids: [1],
+        },
+        {
+            id: 2,
+            name: "Team lunch",
+            start: "2026-03-11 12:00:00",
+            stop: "2026-03-11 13:00:00",
+            categ_ids: [1],
+        },
+    ];
+
+    _views = {
+        form: /* xml */ `
+            <form js_class="calendar_form">
+                <header>
+                    <button name="action_open_composer" type="object" string="Send email" class="btn btn-primary"/>
+                </header>
+                <sheet>
+                    <field name="active" invisible="1"/>
+                    <field name="name"/>
+                    <field name="partner_ids" widget="many2many_tags"/>
+                    <field name="opportunity_id"/>
+                    <field name="categ_ids" widget="many2many_tags" options="{'color_field': 'color', 'on_tag_click': 'edit_color'}"/>
+                </sheet>
+            </form>`,
+        "form,74": /* xml */ `
+            <form js_class="calendar_quick_create_form_view">
+                <field name="name"/>
+                <field name="start"/>
+                <field name="stop"/>
+            </form>`,
+        list: /* xml */ `<list><field name="name"/></list>`,
+        calendar: /* xml */ `
+            <calendar string="Meetings" date_start="start" date_stop="stop" mode="month" quick_create_view_id="74">
+                <field name="name"/>
+            </calendar>`,
+        search: /* xml */ `<search/>`,
+    };
+
+    /** Read by the meeting form's model when it starts. */
+    get_discuss_videocall_location() {
+        return "/calendar/join_videocall/test";
+    }
+
+    action_open_composer(ids) {
+        return stepServerCall("action_open_composer", ids);
+    }
+}
+
+defineModels([CalendarEventType, CalendarEvent]);
+
+/** The Calendar app's meetings (`calendar.action_calendar_event`), which Schedule Meeting returns. */
+const CALENDAR_ACTION = {
+    id: 73,
+    xml_id: "calendar.action_calendar_event",
+    name: "Meetings",
+    res_model: "calendar.event",
+    views: [
+        [false, "calendar"],
+        [false, "list"],
+        [false, "form"],
+    ],
+};
+
+defineActions([CALENDAR_ACTION]);
+
+/** The context `crm.lead.action_schedule_meeting` gives the calendar of "Lead 1". */
+const SCHEDULE_MEETING_CONTEXT = {
+    search_default_opportunity_id: 1,
+    default_opportunity_id: 1,
+    default_partner_ids: [serverState.partnerId],
+    calendar_include_user_events: true,
+    default_team_id: 1,
+    default_name: "Lead 1",
+};
+
+/** The context of the calendar a lead's activity scheduling opens ("Open Calendar"). */
+const LEAD_ACTIVITY_CALENDAR_CONTEXT = {
+    default_res_model: "crm.lead",
+    default_res_id: 1,
+    default_name: "Lead 1",
+};
+
+/** Name input of the meeting form. */
+const MEETING_NAME = ".o_form_view .o_field_widget[name=name] input";
+
+/** Every request that writes, copies or deletes a meeting or one of its tags. */
+function isMeetingWriteRoute(route) {
+    return (
+        /^\/web\/dataset\/call_kw\/calendar\.event(\.type)?\/(web_save|write|create|unlink|copy|action_archive|action_unarchive|action_unlink_event|action_mass_archive)$/.test(
+            route
+        ) || route.startsWith("/web/dataset/call_button/calendar.event/")
+    );
+}
+
+test("[Offline] lead meeting form opened online saves, sends and queues nothing", async () => {
+    const controllers = captureFormControllers();
+    let actionMenus = null;
+    patchWithCleanup(ActionMenus.prototype, {
+        setup() {
+            super.setup(...arguments);
+            actionMenus = this;
+        },
+    });
+    const setOffline = mockOffline();
+    stepRoutes(isMeetingWriteRoute);
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(LEADS_ACTION.id);
+    await flushStartupSync();
+    const sendEmail = ".o_form_view button[name=action_open_composer]";
+
+    /**
+     * A lead's meeting form, opened online the ways CRM screens open one: the CRM
+     * meetings action, the calendar of Schedule Meeting, the calendar of a lead's
+     * activity scheduling, and a new meeting of Schedule Meeting.
+     */
+    const openers = [
+        { open: () => getService("action").doAction(MEETING_ACTION.id), resId: 1 },
+        {
+            open: () =>
+                getService("action").doAction(CALENDAR_ACTION.id, {
+                    additionalContext: SCHEDULE_MEETING_CONTEXT,
+                    viewType: "list",
+                }),
+            resId: 1,
+        },
+        {
+            open: () =>
+                getService("action").doAction(CALENDAR_ACTION.id, {
+                    additionalContext: LEAD_ACTIVITY_CALENDAR_CONTEXT,
+                    viewType: "list",
+                }),
+            resId: 1,
+        },
+        {
+            open: () =>
+                getService("action").doAction(CALENDAR_ACTION.id, {
+                    additionalContext: SCHEDULE_MEETING_CONTEXT,
+                    viewType: "list",
+                }),
+            resId: false,
+        },
+    ];
+
+    for (const [index, { open, resId }] of openers.entries()) {
+        const name = `Proposal call ${index}`;
+        await open();
+        await getService("action").switchView("form", resId ? { resId } : {});
+        await animationFrame();
+        expect(".o_form_view").toHaveCount(1);
+        const originalName = queryFirst(MEETING_NAME).value;
+        await contains(MEETING_NAME).edit(name, { confirm: "blur" });
+        const controller = controllers.findLast((form) => form.props.resModel === "calendar.event");
+        const { root } = controller.model;
+        expect(root.isNew).toBe(!resId);
+        await setOffline(true);
+
+        // Offline, Save, a direct save of the meeting and the defence for a save
+        // whose request loses the connection request and queue nothing; the form
+        // keeps what was entered.
+        await contains(".o_form_button_save").click();
+        await settle();
+        expect(await root.save()).toBe(false);
+        expect(await root.save({ reload: false })).toBe(false);
+        expect(root._offlineSave()).toBe(false);
+        // Its buttons: "Send email" (framework-disabled, then forced) and the button
+        // entry point, whose pre-save would otherwise queue the meeting.
+        await revealFormControl(sendEmail);
+        expect(sendEmail).not.toBeEnabled();
+        forceClick(sendEmail);
+        await settle();
+        expect(
+            await controller.beforeExecuteActionButton({
+                name: "action_open_composer",
+                type: "object",
+            })
+        ).toBe(false);
+        await settle();
+        expect(MEETING_NAME).toHaveValue(name);
+        expect(root.isNew).toBe(!resId);
+        expect(root.dirty).toBe(true);
+        if (resId) {
+            // A tag colour, which the form's tag editor saves on its own.
+            const [tag] = root.data.categ_ids.records;
+            await tag.update({ color: 5 });
+            expect(await tag.save()).toBe(false);
+            expect(tag._offlineSave()).toBe(false);
+            // Its Action menu: Duplicate, Archive and Delete are dimmed and inert.
+            await expectInertActionMenuItems(["Duplicate", "Archive", "Delete"], () => actionMenus);
+            if (queryAll(".o-dropdown--menu .o_menu_item").length) {
+                await toggleActionMenu();
+            }
+        }
+        expect(".modal").toHaveCount(0);
+        expect(queued("calendar.event")).toEqual([]);
+        expect(queued("calendar.event.type")).toEqual([]);
+        expect.verifySteps([]);
+
+        // Discard still drops the entry: an existing meeting shows its saved values
+        // again, a new one goes back to its list.
+        await contains(".o_form_button_cancel").click();
+        await settle();
+        if (resId) {
+            expect(MEETING_NAME).toHaveValue(originalName);
+        } else {
+            expect(".o_form_view").toHaveCount(0);
+        }
+        expect.verifySteps([]);
+
+        // Back online, nothing is replayed, and Save writes the meeting.
+        await reconnect(setOffline);
+        expect(queued("calendar.event")).toEqual([]);
+        expect.verifySteps([]);
+        if (!resId) {
+            await getService("action").switchView("form");
+            await animationFrame();
+        }
+        await contains(MEETING_NAME).edit(name, { confirm: "blur" });
+        await contains(".o_form_button_save").click();
+        await expect.waitForSteps(["/web/dataset/call_kw/calendar.event/web_save"]);
+        const savedId = resId || MockServer.env["calendar.event"].search([]).at(-1);
+        expect(MockServer.env["calendar.event"].browse(savedId)[0]).toMatchObject({ name });
+        if (resId) {
+            await openActionMenu();
+            expect(actionMenuItems("Archive")[0]).not.toHaveClass("pe-none");
+            await toggleActionMenu();
+        } else {
+            // The new meeting is the lead's, as Schedule Meeting creates it.
+            expect(MockServer.env["calendar.event"].browse(savedId)[0].opportunity_id).toBe(1);
+        }
+    }
+});
+
+test("[Offline] meeting form of another app keeps the framework offline save", async () => {
+    const setOffline = mockOffline();
+    stepRoutes(isMeetingWriteRoute);
+    await mountWithCleanup(WebClient);
+    // The Calendar app's own meetings, with no lead in their context.
+    await getService("action").doAction(CALENDAR_ACTION.id, { viewType: "list" });
+    await flushStartupSync();
+    await getService("action").switchView("form", { resId: 2 });
+    await animationFrame();
+    await contains(MEETING_NAME).edit("Team dinner", { confirm: "blur" });
+    await setOffline(true);
+
+    // Offline, its Archive keeps the framework's offline availability, and Save
+    // follows the framework, as before: the save is attempted, then queued.
+    await openActionMenu();
+    expect(actionMenuItems("Archive")[0]).not.toHaveClass("pe-none");
+    await toggleActionMenu();
+    await contains(".o_form_button_save").click();
+    await settle();
+    expect.verifySteps(["/web/dataset/call_kw/calendar.event/web_save"]);
+    expect(queuedCalls("calendar.event").map(({ method, args }) => ({ method, args }))).toEqual([
+        { method: "web_save", args: [[2], { name: "Team dinner" }] },
+    ]);
+
+    // Back online, the framework replays the queued save.
+    await reconnect(setOffline);
+    expect.verifySteps(["/web/dataset/call_kw/calendar.event/web_save"]);
+    expect(queued("calendar.event")).toEqual([]);
+    expect(MockServer.env["calendar.event"].browse(2)[0].name).toBe("Team dinner");
+});
+
+test("[Offline] lead meeting views opened online give way to the offline helper", async () => {
+    const setOffline = mockOffline();
+    const stepping = stepRoutes((route) => route.includes("/calendar.event"));
+    stepping.active = false;
+    await mountWithCleanup(WebClient);
+    const helper = ".o_action_manager .o_view_nocontent .fa-chain-broken";
+
+    // The calendar and list of a lead's meetings (Schedule Meeting, a lead's activity
+    // scheduling), opened online: as soon as the connection drops they give way to
+    // the offline helper, so no meeting can be created, moved, edited or deleted.
+    for (const additionalContext of [SCHEDULE_MEETING_CONTEXT, LEAD_ACTIVITY_CALENDAR_CONTEXT]) {
+        for (const [viewType, selector] of [
+            ["calendar", ".o_calendar_view"],
+            ["list", ".o_list_view"],
+        ]) {
+            await getService("action").doAction(CALENDAR_ACTION.id, {
+                additionalContext,
+                viewType,
+            });
+            await waitFor(selector);
+            await flushStartupSync();
+            await setOffline(true);
+            stepping.active = true;
+            await animationFrame();
+            expect(helper).toHaveCount(1);
+            expect(selector).toHaveCount(0);
+            expect.verifySteps([]);
+            stepping.active = false;
+            // Online, the view loads again.
+            await reconnect(setOffline);
+            await waitFor(selector);
+            expect(helper).toHaveCount(0);
+        }
+    }
+
+    // The Calendar app's own calendar and list stay mounted offline, as before.
+    for (const [viewType, selector] of [
+        ["calendar", ".o_calendar_view"],
+        ["list", ".o_list_view"],
+    ]) {
+        await getService("action").doAction(CALENDAR_ACTION.id, { viewType });
+        await waitFor(selector);
+        await setOffline(true);
+        await animationFrame();
+        expect(selector).toHaveCount(1);
+        expect(helper).toHaveCount(0);
+        await reconnect(setOffline);
+    }
+});
+
+test("[Offline] lead meeting quick create opened online keeps its entry and saves nothing", async () => {
+    mockDate("2026-03-10 08:00:00");
+    const controllers = captureFormControllers();
+    const setOffline = mockOffline();
+    stepRoutes(isMeetingWriteRoute);
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(CALENDAR_ACTION.id, {
+        additionalContext: SCHEDULE_MEETING_CONTEXT,
+        viewType: "calendar",
+    });
+    await waitFor(".o_calendar_view");
+    await flushStartupSync();
+    const helper = ".o_action_manager .o_view_nocontent .fa-chain-broken";
+    const quickCreateName = ".modal .o_field_widget[name=name] input";
+    const name = "Quick proposal call";
+
+    // The quick create of the lead's meeting calendar, filled in online.
+    await clickDate("2026-03-12");
+    await waitFor(quickCreateName);
+    await contains(quickCreateName).edit(name, { confirm: "blur" });
+    const { root } = controllers.findLast((form) => form.props.resModel === "calendar.event").model;
+    await setOffline(true);
+    await animationFrame();
+
+    // Offline, the dialog stays open over the calendar with its entry, and neither its
+    // Save (framework-disabled, then forced) nor a direct save requests or queues the
+    // meeting.
+    expect(".modal .o_form_view").toHaveCount(1);
+    expect(".o_calendar_view").toHaveCount(1);
+    expect(helper).toHaveCount(0);
+    expect(".modal .o_form_button_save").not.toBeEnabled();
+    forceClick(".modal .o_form_button_save");
+    await settle();
+    expect(await root.save()).toBe(false);
+    expect(root._offlineSave()).toBe(false);
+    expect(".modal .o_form_view").toHaveCount(1);
+    expect(quickCreateName).toHaveValue(name);
+    expect(root.isNew).toBe(true);
+    expect(queued("calendar.event")).toEqual([]);
+    expect.verifySteps([]);
+
+    // The dialog's close, which the framework keeps offline, drops the entry, and the
+    // calendar then gives way to the offline helper.
+    await contains(".modal button[aria-label=Close]").click();
+    await waitFor(helper);
+    expect(".modal").toHaveCount(0);
+    expect(helper).toHaveCount(1);
+    expect(".o_calendar_view").toHaveCount(0);
+    expect.verifySteps([]);
+
+    // Back online, nothing is replayed, and the quick create saves the lead's meeting.
+    await reconnect(setOffline);
+    await waitFor(".o_calendar_view");
+    expect(queued("calendar.event")).toEqual([]);
+    expect.verifySteps([]);
+    await clickDate("2026-03-12");
+    await waitFor(quickCreateName);
+    await contains(quickCreateName).edit(name, { confirm: "blur" });
+    await contains(".modal .o_form_button_save").click();
+    await expect.waitForSteps(["/web/dataset/call_kw/calendar.event/web_save"]);
+    expect(".modal").toHaveCount(0);
+    const [savedId] = MockServer.env["calendar.event"].search([["name", "=", name]]);
+    expect(MockServer.env["calendar.event"].browse(savedId)[0].opportunity_id).toBe(1);
+});
+
+/**
  * Contacts (`contacts.action_contacts`): an action of another app. Its id, like that
  * of `CUSTOMERS_ACTION`, is used by no other action of this file: the mock server
  * merges every action sharing an id into one.
@@ -6393,8 +7147,8 @@ test("[Offline] leaving the changed CRM settings page queues no settings save", 
 
     // Offline, the page is changed, then left through its breadcrumb. Its "Unsaved
     // changes" confirmation, whose buttons are disabled offline, is dismissed: the
-    // changes are discarded and the page is saved again, which fails offline, so
-    // nothing is queued, and the page is left.
+    // changes are discarded and the page's save is refused before its request, so
+    // nothing is requested or queued, and the page is left.
     await setOffline(true);
     await contains(".o_field_widget[name=group_use_recurring_revenues] input").click();
     await contains(".o_control_panel .breadcrumb-item a, .o_back_button").click();
@@ -6404,7 +7158,7 @@ test("[Offline] leaving the changed CRM settings page queues no settings save", 
     expect(".modal").toHaveCount(0);
     expect(".o_list_view").toHaveCount(1);
     expect.verifyErrors([LEAD_LIST_LOAD]);
-    expect.verifySteps(["/web/dataset/call_kw/res.config.settings/web_save"]);
+    expect.verifySteps([]);
     expect(queued("res.config.settings")).toEqual([]);
 
     // Back online, nothing is replayed.
@@ -6412,6 +7166,534 @@ test("[Offline] leaving the changed CRM settings page queues no settings save", 
     expect(queued("res.config.settings")).toEqual([]);
     expect.verifySteps([]);
 });
+
+/**
+ * Captures every form controller set up from now on (wizards, composers and settings
+ * included), so a test can reach the real loaded controller of a dialog or page.
+ *
+ * @returns {FormController[]}
+ */
+function captureFormControllers() {
+    const controllers = [];
+    patchWithCleanup(FormController.prototype, {
+        setup() {
+            super.setup(...arguments);
+            controllers.push(this);
+        },
+    });
+    return controllers;
+}
+
+test("[Offline] direct save of a CRM wizard or of the CRM settings requests nothing", async () => {
+    registerInlineViewArchs("res.config.settings", {
+        [`form,${CRM_SETTINGS_VIEW_ID}`]: CRM_SETTINGS_ARCH,
+    });
+    const controllers = captureFormControllers();
+    const setOffline = mockOffline();
+    stepRoutes((route) => route.endsWith("/web_save"));
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(LEADS_ACTION.id);
+    await flushStartupSync();
+    const activeContext = { active_id: 1, active_ids: [1, 2], active_model: "crm.lead" };
+    const recurringRevenues = ".o_field_widget[name=group_use_recurring_revenues] input";
+
+    /**
+     * The four CRM wizards and the CRM settings page, each opened online with a value
+     * entered, and the value its online save writes.
+     */
+    const targets = [
+        {
+            action: LOST_ACTION,
+            model: "crm.lead.lost",
+            enter: () =>
+                contains(".modal .o_field_widget[name=lost_feedback] input").edit("Too pricey", {
+                    confirm: "blur",
+                }),
+            expectEntered: () => {
+                expect(".modal .o_field_widget[name=lost_feedback] input").toHaveValue("Too pricey");
+            },
+            saved: { lost_feedback: "Too pricey" },
+        },
+        {
+            action: MASS_CONVERT_ACTION,
+            model: "crm.lead2opportunity.partner.mass",
+            enter: () => contains(".modal .o_field_widget[name=name] input[data-value=merge]").click(),
+            expectEntered: () => {
+                expect(".modal .o_field_widget[name=name] input[data-value=merge]").toBeChecked();
+            },
+            saved: { name: "merge" },
+        },
+        {
+            action: MERGE_ACTION,
+            model: "crm.merge.opportunity",
+            // The wizard is filled with the selected leads.
+            enter: async () => {},
+            expectEntered: () => {
+                expect(".modal .o_field_widget[name=opportunity_ids] .o_data_row").toHaveCount(2);
+            },
+            saved: { opportunity_ids: [1, 2] },
+        },
+        {
+            action: PLS_UPDATE_ACTION,
+            model: "crm.lead.pls.update",
+            enter: () =>
+                contains(".modal .o_field_widget[name=pls_start_date] input").edit("2026-01-01", {
+                    confirm: "blur",
+                }),
+            expectEntered: () => {
+                expect(".modal .o_field_widget[name=pls_start_date] input").toHaveValue("2026-01-01");
+            },
+            saved: { pls_start_date: "2026-01-01" },
+        },
+        {
+            action: CRM_BASE_SETTINGS_ACTION,
+            model: "res.config.settings",
+            enter: () => contains(recurringRevenues).click(),
+            expectEntered: () => {
+                expect(recurringRevenues).toBeChecked();
+            },
+            saved: { group_use_recurring_revenues: true },
+        },
+    ];
+
+    for (const { action, model, enter, expectEntered, saved } of targets) {
+        await getService("action").doAction(action.id, { additionalContext: activeContext });
+        await enter();
+        const controller = controllers.findLast((form) => form.props.resModel === model);
+        const { root } = controller.model;
+        expect(root.isNew).toBe(true);
+
+        // Offline, the loaded form's own record refuses its save before any request:
+        // nothing is requested or queued, and the record keeps what was entered.
+        await setOffline(true);
+        expect(await root.save()).toBe(false);
+        expect(await root.save({ reload: false })).toBe(false);
+        // The defence for a save whose request loses the connection still refuses.
+        expect(root._offlineSave()).toBe(false);
+        await settle();
+        expect(root.isNew).toBe(true);
+        expectEntered();
+        expect(queued(model)).toEqual([]);
+        expect.verifySteps([]);
+
+        // Back online, nothing is replayed, and the same save writes the record.
+        await reconnect(setOffline);
+        expect(queued(model)).toEqual([]);
+        expect.verifySteps([]);
+        expect(await root.save()).toBe(true);
+        expect.verifySteps([`/web/dataset/call_kw/${model}/web_save`]);
+        expect(root.isNew).toBe(false);
+        expect(MockServer.env[model].browse(root.resId)[0]).toMatchObject(saved);
+        if (model !== "res.config.settings") {
+            await cancelDialog();
+            expect(".modal").toHaveCount(0);
+        }
+    }
+});
+
+/**
+ * The mail composer on the real composer view (`js_class="mail_composer_form"`): its
+ * Send saves the composer, then calls `action_send_mail`.
+ */
+const MAIL_COMPOSER_ARCH = /* xml */ `
+    <form js_class="mail_composer_form">
+        <field name="subject"/>
+        <footer>
+            <button name="action_send_mail" type="object" string="Send" class="btn-primary" data-hotkey="q"/>
+            <button special="cancel" string="Discard"/>
+        </footer>
+    </form>`;
+
+test("[Offline] mail composer opened online by a CRM action sends and saves nothing", async () => {
+    registerInlineViewArchs("mail.compose.message", { "form,false": MAIL_COMPOSER_ARCH });
+    onRpc("mail.compose.message", "action_send_mail", ({ args }) =>
+        stepServerCall("action_send_mail", args[0])
+    );
+    const controllers = captureFormControllers();
+    const setOffline = mockOffline();
+    stepRoutes(
+        (route) => route.startsWith("/web/dataset/call_button/") || route.endsWith("/web_save")
+    );
+    const { env } = await makeMockServer();
+    const partnerId = env["res.partner"].create({ name: "Azure Interior" });
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(LEADS_ACTION.id);
+    await flushStartupSync();
+    const send = ".modal footer button[name=action_send_mail]";
+    const subject = ".modal .o_field_widget[name=subject] input";
+
+    /** The CRM bound composers, opened online the ways CRM screens open them. */
+    const openers = [
+        // The lead form's "Send email" bound action.
+        () =>
+            getService("action").doAction(MAIL_COMPOSE_ACTION.id, {
+                additionalContext: { active_id: 1, active_ids: [1], active_model: "crm.lead" },
+            }),
+        // A button naming that action by `xml_id`, here on a partner record.
+        () =>
+            getService("action").doActionButton({
+                type: "action",
+                name: MAIL_COMPOSE_ACTION.xml_id,
+                resModel: "res.partner",
+                resId: partnerId,
+                resIds: [partnerId],
+                context: {},
+                buttonContext: {},
+            }),
+        // The lead list's "Send email" mass mail bound action.
+        () =>
+            getService("action").doAction(MASS_MAIL_ACTION.id, {
+                additionalContext: { active_ids: [1, 2], active_model: "crm.lead" },
+            }),
+    ];
+
+    for (const open of openers) {
+        // Opened and filled online, then the connection drops.
+        await open();
+        expect(".modal .o_form_view").toHaveCount(1);
+        await contains(subject).edit("Proposal", { confirm: "blur" });
+        const controller = controllers.findLast(
+            (form) => form.props.resModel === "mail.compose.message"
+        );
+        expect(controller).toBeInstanceOf(MailComposerFormController);
+        await setOffline(true);
+
+        // A forced Send, a direct call of the controller's button entry point and a
+        // direct save of its record request nothing and queue nothing; the composer
+        // stays, with what was entered.
+        expect(send).not.toBeEnabled();
+        forceClick(send);
+        await settle();
+        expect(
+            await controller.beforeExecuteActionButton({ name: "action_send_mail", type: "object" })
+        ).toBe(false);
+        expect(await controller.model.root.save()).toBe(false);
+        await settle();
+        expect(".modal .o_form_view").toHaveCount(1);
+        expect(subject).toHaveValue("Proposal");
+        expect(controller.model.root.isNew).toBe(true);
+        expect(queued("mail.compose.message")).toEqual([]);
+        expect.verifySteps([]);
+
+        // Back online, nothing is replayed, and Send saves the composer and sends.
+        await reconnect(setOffline);
+        expect(queued("mail.compose.message")).toEqual([]);
+        expect.verifySteps([]);
+        const composerId = MockServer.env["mail.compose.message"].search([]).length + 1;
+        await contains(send).click();
+        await expect.waitForSteps([
+            "/web/dataset/call_kw/mail.compose.message/web_save",
+            buttonRoute("mail.compose.message", "action_send_mail"),
+            `action_send_mail [${composerId}]`,
+        ]);
+        expect(".modal").toHaveCount(0);
+        expect(MockServer.env["mail.compose.message"].browse(composerId)[0]).toMatchObject({
+            subject: "Proposal",
+        });
+    }
+});
+
+test("[Offline] mail composer of another action keeps the framework offline save", async () => {
+    // The Send button's call, attempted offline once the framework has queued the save.
+    expect.errors(1);
+    registerInlineViewArchs("mail.compose.message", { "form,false": MAIL_COMPOSER_ARCH });
+    onRpc("mail.compose.message", "action_send_mail", ({ args }) =>
+        stepServerCall("action_send_mail", args[0])
+    );
+    const setOffline = mockOffline();
+    stepRoutes(
+        (route) => route.startsWith("/web/dataset/call_button/") || route.endsWith("/web_save")
+    );
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(LEADS_ACTION.id);
+    await flushStartupSync();
+    const send = ".modal footer button[name=action_send_mail]";
+    const subject = ".modal .o_field_widget[name=subject] input";
+
+    // A composer opened by an action without a CRM `xml_id`, as the chatter opens its
+    // full composer.
+    await getService("action").doAction({
+        type: "ir.actions.act_window",
+        res_model: "mail.compose.message",
+        target: "new",
+        views: [[false, "form"]],
+    });
+    expect(".modal .o_form_view").toHaveCount(1);
+    await contains(subject).edit("Hello", { confirm: "blur" });
+
+    // Offline, a forced Send follows the framework, as before: the save is queued, then
+    // the button's call is attempted.
+    await setOffline(true);
+    forceClick(send);
+    await settle();
+    expect.verifySteps([
+        "/web/dataset/call_kw/mail.compose.message/web_save",
+        buttonRoute("mail.compose.message", "action_send_mail"),
+    ]);
+    expect.verifyErrors([buttonRoute("mail.compose.message", "action_send_mail")]);
+    expect(
+        queuedCalls("mail.compose.message").map(({ method, args }) => ({ method, args }))
+    ).toEqual([{ method: "web_save", args: [[], { subject: "Hello" }] }]);
+
+    // Back online, the framework replays the queued save.
+    await reconnect(setOffline);
+    expect.verifySteps(["/web/dataset/call_kw/mail.compose.message/web_save"]);
+    expect(queued("mail.compose.message")).toEqual([]);
+});
+
+/** View id of `GENERAL_SETTINGS_ARCH`, registered for the tests that open it. */
+const GENERAL_SETTINGS_VIEW_ID = 506;
+
+/**
+ * The General Settings (`base.res_config_settings_view_form` with every app's
+ * inherit) on the real settings view: another app's block, then the CRM app as
+ * `CRM_SETTINGS_ARCH` shows it.
+ */
+const GENERAL_SETTINGS_ARCH = /* xml */ `
+    <form string="Settings" class="oe_form_configuration o_base_settings" js_class="base_settings">
+        <app string="General Settings" name="general_settings" logo="${SETTINGS_APP_LOGO}">
+            <block title="Users">
+                <setting string="Users">
+                    <button name="action_open_users" type="object" string="Manage Users" class="btn-link"/>
+                </setting>
+            </block>
+        </app>
+        <app string="CRM" name="crm" logo="${SETTINGS_APP_LOGO}">
+            <block title="CRM">
+                <setting string="Recurring Revenues">
+                    <field name="group_use_recurring_revenues"/>
+                    <button type="action" name="crm.crm_recurring_plan_action" string="Recurring Plans" class="btn-link"/>
+                </setting>
+                <setting string="Predictive Lead Scoring">
+                    <button name="${PLS_UPDATE_ACTION.id}" type="action" string="Update Probabilities" class="btn-link"/>
+                </setting>
+                <setting string="Rule-Based Assignment">
+                    <field name="crm_use_auto_assignment"/>
+                    <button name="action_crm_assign_leads" type="object" string="Assign now" class="btn-link"/>
+                </setting>
+            </block>
+        </app>
+    </form>`;
+
+/**
+ * The General Settings action (`base_setup.action_general_configuration`), opened on
+ * its own app (`context.module` "general_settings"), on `GENERAL_SETTINGS_ARCH`.
+ */
+const GENERAL_SETTINGS_ACTION = {
+    id: 71,
+    xml_id: "base_setup.action_general_configuration",
+    name: "Settings",
+    res_model: "res.config.settings",
+    views: [[GENERAL_SETTINGS_VIEW_ID, "form"]],
+    context: { module: "general_settings", bin_size: false },
+};
+
+defineActions([GENERAL_SETTINGS_ACTION]);
+
+/**
+ * Opens the CRM app of a settings page showing several apps, while online: its side
+ * tab, or on a phone the app dropdown, whose toggle is disabled offline.
+ */
+async function openCrmSettingsApp() {
+    if (isSmall()) {
+        await contains(".settings_tab .o-dropdown").click();
+        await contains(".o-dropdown-item:contains(CRM)").click();
+    } else {
+        await contains(".settings_tab .tab[data-key=crm]").click();
+    }
+    expect(".app_settings_block[data-key=crm]").toHaveCount(1);
+}
+
+/** Id of the next `res.config.settings` record the mock server creates. */
+function nextSettingsId() {
+    return MockServer.env["res.config.settings"].search([]).length + 1;
+}
+
+test("[Offline] CRM controls of the General Settings request and queue nothing", async () => {
+    registerInlineViewArchs("res.config.settings", {
+        [`form,${GENERAL_SETTINGS_VIEW_ID}`]: GENERAL_SETTINGS_ARCH,
+    });
+    onRpc("res.config.settings", "execute", ({ args }) => stepServerCall("execute", args[0]));
+    const setOffline = mockOffline();
+    // The next settings save loses the connection while its request runs.
+    const lostSave = { next: false };
+    onRpc("/*", (request) => {
+        const route = new URL(request.url).pathname;
+        if (lostSave.next && route === "/web/dataset/call_kw/res.config.settings/web_save") {
+            lostSave.next = false;
+            return new Response("", { status: 502 });
+        }
+    });
+    stepRoutes(
+        (route) =>
+            route.endsWith("/web_save") ||
+            route === "/web/action/load" ||
+            route.startsWith("/web/dataset/call_button/")
+    );
+    await mountWithCleanup(WebClient);
+    await flushStartupSync();
+    await getService("action").doAction(GENERAL_SETTINGS_ACTION.id);
+    expect.verifySteps(["/web/action/load"]);
+    expect(".app_settings_block[data-key=general_settings]").toHaveCount(1);
+    await openCrmSettingsApp();
+    const recurringPlans = "button[name='crm.crm_recurring_plan_action']";
+    const update = `button[name='${PLS_UPDATE_ACTION.id}']`;
+    const assign = "button[name=action_crm_assign_leads]";
+    const recurringRevenues = ".o_field_widget[name=group_use_recurring_revenues] input";
+    const generalSettingsView = `${GENERAL_SETTINGS_ACTION.xml_id}/form`;
+
+    // Offline, a forced activation of each CRM control, on the unchanged page then on
+    // the changed page, stops before the settings record is saved and before any
+    // confirmation opens; so does a direct call of the CRM settings method through
+    // the action service: no request, nothing queued, the page stays as it is.
+    await setOffline(true);
+    for (const selector of [recurringPlans, update, assign]) {
+        expect(selector).not.toBeEnabled();
+        forceClick(selector);
+        await settle();
+    }
+    expect(".modal").toHaveCount(0);
+    await contains(recurringRevenues).click();
+    for (const selector of [recurringPlans, update, assign]) {
+        forceClick(selector);
+        await settle();
+    }
+    expect(".modal").toHaveCount(0);
+    await callButton({
+        resModel: "res.config.settings",
+        name: "action_crm_assign_leads",
+        context: { module: "general_settings" },
+    });
+    await settle();
+    expect(recurringRevenues).toBeChecked();
+    expect(currentView()).toBe(generalSettingsView);
+    expect(queued("res.config.settings")).toEqual([]);
+    expect.verifySteps([]);
+    // Back online, nothing is replayed.
+    await reconnect(setOffline);
+    expect(queued("res.config.settings")).toEqual([]);
+    expect.verifySteps([]);
+
+    // A CRM control on the changed page opens the "Unsaved changes" confirmation
+    // online; the connection drops, then its disabled Save, or Discard, is forced: no
+    // settings save or `execute` is requested or queued, and the control does not run.
+    for (const [answer, selector] of [
+        ["Save", recurringPlans],
+        ["Discard", update],
+    ]) {
+        expect(recurringRevenues).toBeChecked();
+        await contains(selector).click();
+        expect(".modal .modal-title").toHaveText("Unsaved changes");
+        await setOffline(true);
+        forceClick(`.modal footer button:contains(${answer})`);
+        await settle();
+        expect(".modal").toHaveCount(0);
+        expect(currentView()).toBe(generalSettingsView);
+        expect(queued("res.config.settings")).toEqual([]);
+        expect.verifySteps([]);
+        await reconnect(setOffline);
+        expect(queued("res.config.settings")).toEqual([]);
+        expect.verifySteps([]);
+    }
+    // Discard reverted the change.
+    expect(recurringRevenues).not.toBeChecked();
+
+    // Online, the connection is lost while a CRM control's settings save runs: the
+    // save is not queued, and the control does not run.
+    lostSave.next = true;
+    await contains(assign).click();
+    await settle();
+    expect.verifySteps(["/web/dataset/call_kw/res.config.settings/web_save"]);
+    expect(queued("res.config.settings")).toEqual([]);
+    await reconnect(setOffline);
+    expect(queued("res.config.settings")).toEqual([]);
+    expect.verifySteps([]);
+
+    // Online, each CRM control works as before: it saves the settings, then runs.
+    let settingsId = nextSettingsId();
+    await contains(assign).click();
+    await expect.waitForSteps([
+        "/web/dataset/call_kw/res.config.settings/web_save",
+        buttonRoute("res.config.settings", "action_crm_assign_leads"),
+        `action_crm_assign_leads [${settingsId}]`,
+    ]);
+    await contains(update).click();
+    await expect.waitForSteps([
+        "/web/dataset/call_kw/res.config.settings/web_save",
+        "/web/action/load",
+    ]);
+    expect(".modal .o_form_view").toHaveCount(1);
+    await contains(".modal button[aria-label=Close]:visible").click();
+    expect(".modal").toHaveCount(0);
+    // On the changed page, the confirmation's Save applies the settings, and the
+    // control does not run.
+    await contains(recurringRevenues).click();
+    await contains(recurringPlans).click();
+    expect(".modal .modal-title").toHaveText("Unsaved changes");
+    settingsId = nextSettingsId();
+    await contains(".modal footer .btn-primary").click();
+    await expect.waitForSteps([
+        "/web/dataset/call_kw/res.config.settings/web_save",
+        buttonRoute("res.config.settings", "execute"),
+        `execute [${settingsId}]`,
+    ]);
+    expect(".modal").toHaveCount(0);
+    expect(currentView()).toBe(generalSettingsView);
+    await contains(recurringPlans).click();
+    await expect.waitForSteps([
+        "/web/dataset/call_kw/res.config.settings/web_save",
+        "/web/action/load",
+    ]);
+    await expectCurrentView("crm.crm_recurring_plan_action/list");
+    expect(queued("res.config.settings")).toEqual([]);
+});
+
+test("[Offline] other apps' controls of the General Settings keep their behaviour", async () => {
+    // The other app's button call, attempted offline once the framework has queued
+    // the settings save.
+    expect.errors(1);
+    registerInlineViewArchs("res.config.settings", {
+        [`form,${GENERAL_SETTINGS_VIEW_ID}`]: GENERAL_SETTINGS_ARCH,
+    });
+    onRpc("res.config.settings", "action_open_users", ({ args }) =>
+        stepServerCall("action_open_users", args[0])
+    );
+    const setOffline = mockOffline();
+    stepRoutes(
+        (route) => route.endsWith("/web_save") || route.startsWith("/web/dataset/call_button/")
+    );
+    await mountWithCleanup(WebClient);
+    await flushStartupSync();
+    await getService("action").doAction(GENERAL_SETTINGS_ACTION.id);
+    const manageUsers = "button[name=action_open_users]";
+
+    // Online, the button saves the settings, then calls its method.
+    const settingsId = nextSettingsId();
+    await contains(manageUsers).click();
+    await expect.waitForSteps([
+        "/web/dataset/call_kw/res.config.settings/web_save",
+        buttonRoute("res.config.settings", "action_open_users"),
+        `action_open_users [${settingsId}]`,
+    ]);
+
+    // Offline, a forced activation follows the framework, as before: the settings
+    // save is queued, then the button's call is attempted.
+    await setOffline(true);
+    forceClick(manageUsers);
+    await settle();
+    expect.verifySteps([
+        "/web/dataset/call_kw/res.config.settings/web_save",
+        buttonRoute("res.config.settings", "action_open_users"),
+    ]);
+    expect.verifyErrors([buttonRoute("res.config.settings", "action_open_users")]);
+    expect(queuedCalls("res.config.settings").map(({ method }) => method)).toEqual(["web_save"]);
+
+    // Back online, the framework replays the queued save.
+    await reconnect(setOffline);
+    expect.verifySteps(["/web/dataset/call_kw/res.config.settings/web_save"]);
+    expect(queued("res.config.settings")).toEqual([]);
+});
+
 
 /** Closes every open dropdown (Escape), whatever closed or kept them open before. */
 async function closeOpenDropdowns() {
@@ -6633,6 +7915,16 @@ test("[Offline] team form multi-membership skips the manager probe", async () =>
             teamController = this;
         },
     });
+    // The form controller's own boundary, which saves the record before every button
+    // but `special="cancel"`: steps the special buttons that reach it.
+    patchWithCleanup(FormController.prototype, {
+        beforeExecuteActionButton(clickParams) {
+            if (clickParams?.special) {
+                expect.step(`form controller special ${clickParams.special}`);
+            }
+            return super.beforeExecuteActionButton(...arguments);
+        },
+    });
     patchWithCleanup(user, {
         hasGroup(group) {
             if (group === "sales_team.group_sale_manager") {
@@ -6649,7 +7941,9 @@ test("[Offline] team form multi-membership skips the manager probe", async () =>
     const setOffline = mockOffline();
     stepRoutes(
         (route) =>
-            route.startsWith("/web/dataset/call_button/") || route.includes("/ir.config_parameter/")
+            route.startsWith("/web/dataset/call_button/") ||
+            route.includes("/ir.config_parameter/") ||
+            route === "/web/dataset/call_kw/crm.team/web_save"
     );
     await mountWithCleanup(WebClient);
     await getService("action").doAction({
@@ -6663,8 +7957,12 @@ test("[Offline] team form multi-membership skips the manager probe", async () =>
     const activate = `${alert} button[name=crm_team_activate_multi_membership]`;
     const assignLeads = ".o_statusbar_buttons button[name=action_assign_leads]";
     const opportunities = "button[name=action_open_opportunities]";
+    const nameInput = ".o_form_view .o_field_widget[name=name] input";
     expect(alert).toHaveCount(1);
     expect(alert).not.toHaveClass("d-none");
+    // An unsaved edit of the team, made online.
+    await contains(nameInput).edit("Europe (unsaved)");
+    expect(await teamController.model.root.isDirty()).toBe(true);
 
     await setOffline(true);
     // The direct boundary call is refused before the probe and the write.
@@ -6684,10 +7982,25 @@ test("[Offline] team form multi-membership skips the manager probe", async () =>
     for (const name of ["action_assign_leads", "action_open_opportunities"]) {
         await callButton({ resModel: "crm.team", name, resId: 1 });
     }
+    // The team form refuses its object and action buttons before the form controller
+    // saves the record ahead of them: the unsaved edit is neither saved nor queued.
+    for (const params of [
+        { name: "action_assign_leads", type: "object" },
+        { name: "action_open_opportunities", type: "object" },
+        { name: `${TEAM_PIPELINE_ACTION_ID}`, type: "action" },
+    ]) {
+        expect(await teamController.beforeExecuteActionButton(params)).toBe(false);
+    }
+    // A special button is not refused: it reaches the form controller's boundary,
+    // which saves nothing for "cancel".
+    expect(await teamController.beforeExecuteActionButton({ special: "cancel" })).toBe(undefined);
+    expect.verifySteps(["form controller special cancel"]);
     await settle();
     expect(".modal").toHaveCount(0);
     expect(getService("action").currentController.action.res_model).toBe("crm.team");
-    expect(".o_form_view .o_field_widget[name=name] input").toHaveValue("Europe");
+    expect(nameInput).toHaveValue("Europe (unsaved)");
+    expect(await teamController.model.root.isDirty()).toBe(true);
+    expect(MockServer.env["crm.team"].browse(1)[0].name).toBe("Europe");
     expect(queued("crm.team")).toEqual([]);
     expect(queued("ir.config_parameter")).toEqual([]);
     expect.verifySteps([]);
@@ -6705,10 +8018,13 @@ test("[Offline] team form multi-membership skips the manager probe", async () =>
     await revealFormControl(opportunities);
     expectUnguarded(opportunities, 1);
     await contains(opportunities).click();
+    // Online, the button saves the unsaved edit first, then runs.
     await expect.waitForSteps([
+        "/web/dataset/call_kw/crm.team/web_save",
         buttonRoute("crm.team", "action_open_opportunities"),
         "action_open_opportunities [1]",
     ]);
+    expect(MockServer.env["crm.team"].browse(1)[0].name).toBe("Europe (unsaved)");
     expectUnguarded(assignLeads, 1);
     await contains(assignLeads).click();
     await contains(".modal-footer .btn-primary:contains(Assign Leads)").click();
@@ -7812,7 +9128,7 @@ test("[Offline] share target lead creation started online: no form fallback once
             method: "web_save",
             args: [[], args[1]],
             kwargs: {
-                context: callContext({}, { ...leadItem.context, default_name: "card.png" }),
+                context: queuedContext({}, { ...leadItem.context, default_name: "card.png" }),
                 specification: {},
             },
         },
@@ -8310,7 +9626,7 @@ test("[Offline] partner field searches cache, no enrichment lookup, no create", 
             model: "crm.lead",
             method: "web_save",
             args: [[1], { partner_id: partnerId }],
-            kwargs: { context: callContext(LEADS_ACTION.context), specification: {} },
+            kwargs: { context: queuedContext(LEADS_ACTION.context), specification: {} },
         },
     ]);
     expect(".modal").toHaveCount(0);
@@ -8567,6 +9883,435 @@ test("[Offline] open lead composer posts nothing after disconnect", async () => 
     await waitFor(".o-mail-Message:contains(Online hello)");
 });
 
+test("[Offline] lead chatter activity scheduling opens nothing", async () => {
+    const chatters = [];
+    patchWithCleanup(Chatter.prototype, {
+        setup() {
+            super.setup(...arguments);
+            chatters.push(this);
+        },
+    });
+    /** The last lead chatter mounted (the displayed one). */
+    const leadChatter = () =>
+        chatters.findLast((chatter) => chatter.state.thread?.model === "crm.lead");
+    await startServer();
+    const setOffline = mockOffline();
+    const mailRequests = trackMailRequests();
+    const stepping = stepRoutes();
+    stepping.active = false;
+    await start();
+    await getService("action").doAction(LEADS_ACTION.id);
+    await flushStartupSync();
+    await openLead(1);
+    await waitFor(".o-mail-Chatter-activity:enabled");
+    const chatter = leadChatter();
+    expect(chatter.state.thread.id).toBe(1);
+    await settle();
+    mailRequests.length = 0;
+
+    // Offline, a forced click of the disabled Activity button and a direct call of
+    // its handler open no activity dialog, and request, queue and raise nothing.
+    await setOffline(true);
+    stepping.active = true;
+    forceClick(".o-mail-Chatter-activity");
+    await chatter.scheduleActivity();
+    await settle();
+    expect(".modal").toHaveCount(0);
+    expect(mailRequests).toEqual([]);
+    expect.verifySteps([]);
+    expect(Object.keys(getService(OfflinePlugin)._ormToSync())).toEqual([]);
+    stepping.active = false;
+
+    // Online, the same call opens the activity schedule dialog.
+    await setOffline(false);
+    await settle();
+    await chatter.scheduleActivity();
+    await waitFor(".modal .o_form_view");
+    await contains(".modal button[aria-label=Close]:visible").click();
+    await settle();
+    expect(".modal").toHaveCount(0);
+
+    // A new lead, named online: offline, scheduling its activity does not save it
+    // (no queued create to get a thread) and opens nothing.
+    await goBack();
+    await getService("action").switchView("form");
+    await animationFrame();
+    await contains(".o_field_widget[name=name] input").edit("Unsaved lead");
+    await waitFor(".o-mail-Chatter-activity:enabled");
+    const newLeadChatter = leadChatter();
+    expect(newLeadChatter.state.thread.id).toBe(false);
+    await settle();
+    mailRequests.length = 0;
+    await setOffline(true);
+    stepping.active = true;
+    forceClick(".o-mail-Chatter-activity");
+    await newLeadChatter.scheduleActivity();
+    await settle();
+    expect(".modal").toHaveCount(0);
+    expect(mailRequests).toEqual([]);
+    expect.verifySteps([]);
+    expect(Object.keys(getService(OfflinePlugin)._ormToSync())).toEqual([]);
+    expect(newLeadChatter.state.thread.id).toBe(false);
+    expect(".o_field_widget[name=name] input").toHaveValue("Unsaved lead");
+});
+
+test("[Offline] lead followers menu opened online closes and its handlers request nothing", async () => {
+    // The real chatter, followers menu, follower and subtype dialog instances.
+    const chatters = [];
+    const followerLists = [];
+    const followers = [];
+    const subtypeDialogs = [];
+    for (const [Component, instances] of [
+        [Chatter, chatters],
+        [FollowerList, followerLists],
+        [Follower, followers],
+        [FollowerSubtypeDialog, subtypeDialogs],
+    ]) {
+        patchWithCleanup(Component.prototype, {
+            setup() {
+                super.setup(...arguments);
+                instances.push(this);
+            },
+        });
+    }
+    const pyEnv = await startServer();
+    const subtypeId = pyEnv["mail.message.subtype"].create({ default: true, name: "Discussions" });
+    const otherPartnerId = pyEnv["res.partner"].create({ name: "Bob Follower" });
+    pyEnv["mail.followers"].create([
+        {
+            partner_id: serverState.partnerId,
+            res_id: 1,
+            res_model: "crm.lead",
+            subtype_ids: [subtypeId],
+        },
+        { partner_id: otherPartnerId, res_id: 1, res_model: "crm.lead", subtype_ids: [subtypeId] },
+    ]);
+    /** The lead's followers on the server, as `[partner id, subtype ids]`. */
+    const serverFollowers = () =>
+        pyEnv["mail.followers"]
+            .browse(
+                pyEnv["mail.followers"].search([
+                    ["res_model", "=", "crm.lead"],
+                    ["res_id", "=", 1],
+                ])
+            )
+            .map(({ partner_id, subtype_ids }) => [partner_id, [...subtype_ids]]);
+    const onlineFollowers = serverFollowers();
+    expect(onlineFollowers).toEqual([
+        [serverState.partnerId, [subtypeId]],
+        [otherPartnerId, [subtypeId]],
+    ]);
+    const setOffline = mockOffline();
+    const mailRequests = trackMailRequests();
+    const stepping = stepRoutes();
+    stepping.active = false;
+    await start();
+    await getService("action").doAction(LEADS_ACTION.id);
+    await flushStartupSync();
+    await openLead(1);
+    await waitFor(".o-mail-Followers-counter:contains(2)");
+    const chatter = chatters.findLast((candidate) => candidate.state.thread?.model === "crm.lead");
+
+    // Online, the followers menu (a bottom sheet with touch) offers Unfollow (the
+    // self follower) and Add Followers, and lists the other follower.
+    const menu = ".o-mail-Followers-dropdown";
+    await contains(".o-mail-Followers-button").click();
+    await waitFor(`${menu} .o-mail-Follower:contains(Bob Follower)`);
+    expect(".o_bottom_sheet").toHaveCount(isSmall() ? 1 : 0);
+    expect(`${menu} .o-mail-FollowerList-unfollow`).toHaveCount(1);
+    expect(`${menu} .o-dropdown-item:contains(Add Followers)`).toHaveCount(1);
+    const followerList = followerLists.at(-1);
+    expect(followerList.props.thread.model).toBe("crm.lead");
+    const leadFollowers = followers.filter(
+        (follower) => follower.props.follower.thread?.model === "crm.lead"
+    );
+    expect(leadFollowers.map((follower) => follower.props.follower.partner_id.id)).toEqual([
+        otherPartnerId,
+    ]);
+    await settle();
+    mailRequests.length = 0;
+
+    // The connection drops: the menu opened online closes. Forced open offline, by a
+    // click of its disabled button or through its state, it closes again.
+    await setOffline(true);
+    await settle();
+    expect(menu).toHaveCount(0);
+    expect(".o_bottom_sheet").toHaveCount(0);
+    expect(chatter.followerListDropdown.isOpen).toBe(false);
+    stepping.active = true;
+    forceClick(".o-mail-Followers-button");
+    await settle();
+    expect(menu).toHaveCount(0);
+    chatter.followerListDropdown.open();
+    await settle();
+    expect(menu).toHaveCount(0);
+    expect(".o_bottom_sheet").toHaveCount(0);
+    expect(chatter.followerListDropdown.isOpen).toBe(false);
+
+    // Offline, direct calls of the menu's handlers (Follow, Unfollow, Add Followers,
+    // the self follower's preferences) and of each follower's (details, preferences,
+    // removal) request, open, queue and change nothing, and raise no error.
+    await followerList.onClickFollow();
+    await followerList.onClickUnfollow();
+    followerList.onClickAddFollowers();
+    await followerList.onClickEdit();
+    for (const follower of leadFollowers) {
+        follower.onClickDetails({ currentTarget: queryFirst(".o-mail-Followers-button") });
+        await follower.onClickEdit();
+        await follower.onClickRemove();
+    }
+    await settle();
+    expect(".modal").toHaveCount(0);
+    expect(".o_avatar_card").toHaveCount(0);
+    expect(mailRequests).toEqual([]);
+    expect.verifySteps([]);
+    expect(Object.keys(getService(OfflinePlugin)._ormToSync())).toEqual([]);
+    expect(serverFollowers()).toEqual(onlineFollowers);
+    stepping.active = false;
+
+    // A follower's preferences dialog opened online: offline, applying it, with its
+    // subtype kept (a subscription call) or unchecked (a removal), requests and
+    // changes nothing, and the dialog stays open until it is closed.
+    await setOffline(false);
+    await settle();
+    await contains(".o-mail-Followers-button").click();
+    await contains(
+        `${menu} .o-mail-Follower:contains(Bob Follower) [title='Edit Notification Preferences']`
+    ).click();
+    const subtypeCheckbox = `.o-mail-FollowerSubtypeDialog-subtype[data-follower-subtype-id='${subtypeId}'] input`;
+    await waitFor(`${subtypeCheckbox}:checked`);
+    const subtypeDialog = subtypeDialogs.at(-1);
+    expect(subtypeDialog.props.follower.partner_id.id).toBe(otherPartnerId);
+    await settle();
+    mailRequests.length = 0;
+    await setOffline(true);
+    await settle();
+    stepping.active = true;
+    expect(".o-mail-FollowerSubtypeDialog button.btn-primary").not.toBeEnabled();
+    await subtypeDialog.onClickApply();
+    await contains(subtypeCheckbox).click();
+    await subtypeDialog.onClickApply();
+    await settle();
+    expect(".o-mail-FollowerSubtypeDialog").toHaveCount(1);
+    expect(mailRequests).toEqual([]);
+    expect.verifySteps([]);
+    expect(serverFollowers()).toEqual(onlineFollowers);
+    stepping.active = false;
+    await contains(".modal button[aria-label=Close]:visible").click();
+    expect(".modal").toHaveCount(0);
+
+    // Online, the menu works again: Unfollow, Follow, and Add Followers opens its
+    // wizard.
+    await setOffline(false);
+    await settle();
+    mailRequests.length = 0;
+    await contains(".o-mail-Followers-button").click();
+    await contains(`${menu} .o-mail-FollowerList-unfollowBtn`).click();
+    await waitFor(".o-mail-Followers-counter:contains(1)");
+    expect(mailRequests).toInclude("/mail/thread/unsubscribe");
+    await contains(".o-mail-Followers-button").click();
+    await contains(`${menu} .o-mail-FollowerList-followBtn`).click();
+    await waitFor(".o-mail-Followers-counter:contains(2)");
+    expect(mailRequests).toInclude("/mail/thread/subscribe");
+    await contains(".o-mail-Followers-button").click();
+    await contains(`${menu} .o-dropdown-item:contains(Add Followers)`).click();
+    await waitFor(".modal .o_form_view");
+});
+
+test("[Offline] lead chatter attachments, pinned messages, search and composer request nothing", async () => {
+    const chatters = [];
+    patchWithCleanup(Chatter.prototype, {
+        setup() {
+            super.setup(...arguments);
+            chatters.push(this);
+        },
+    });
+    /** The last lead chatter mounted (the displayed one). */
+    const leadChatter = () =>
+        chatters.findLast((chatter) => chatter.state.thread?.model === "crm.lead");
+    const pyEnv = await startServer();
+    pyEnv["mail.message"].create({
+        author_id: serverState.partnerId,
+        body: "Kick-off call done",
+        message_type: "comment",
+        model: "crm.lead",
+        pinned_at: "2024-01-01 10:00:00",
+        res_id: 1,
+    });
+    const attachmentId = pyEnv["ir.attachment"].create({
+        mimetype: "text/plain",
+        name: "brief.txt",
+        res_id: 1,
+        res_model: "crm.lead",
+    });
+    /** The lead's attachments on the server, by name. */
+    const serverAttachments = () =>
+        pyEnv["ir.attachment"]
+            .search_read([
+                ["res_model", "=", "crm.lead"],
+                ["res_id", "=", 1],
+            ])
+            .map(({ name }) => name);
+    const file = new File(["offline"], "offline.txt", { type: "text/plain" });
+    const fileData = { data: btoa("offline"), name: "offline.txt", type: "text/plain" };
+    const setOffline = mockOffline();
+    const mailRequests = trackMailRequests();
+    const stepping = stepRoutes();
+    stepping.active = false;
+    await start();
+    await getService("action").doAction(LEADS_ACTION.id);
+    await flushStartupSync();
+    await openLead(1);
+    await waitFor(".o-mail-Message:contains(Kick-off call done)");
+    await waitFor("button[title='Pinned Messages']");
+    const chatter = leadChatter();
+    const thread = chatter.state.thread;
+    expect(thread.id).toBe(1);
+    const [attachment] = chatter.attachments;
+    expect(attachment.id).toBe(attachmentId);
+
+    // Online, the search panel is opened and a search shows its result in place of
+    // the thread; a file dragged over the chatter shows its dropzone.
+    await contains("button[title='Search Messages']").click();
+    await contains(".o-mail-SearchInput input").edit("Kick", { confirm: false });
+    await waitFor(".o-mail-SearchMessageResult .o-mail-Message:contains(Kick-off call done)");
+    await dragenterFiles(".o-mail-Chatter", [file]);
+    await waitFor(".o-Dropzone");
+    await settle();
+    mailRequests.length = 0;
+
+    // The connection drops: the search panel and its result close, the thread shows
+    // again, and the dropzone is gone. Forced open again, the panel closes again.
+    await setOffline(true);
+    await settle();
+    stepping.active = true;
+    expect(".o-mail-SearchMessageInput").toHaveCount(0);
+    expect(".o-mail-SearchMessageResult").toHaveCount(0);
+    expect(".o-mail-Message:contains(Kick-off call done)").toHaveCount(1);
+    expect(".o-Dropzone").toHaveCount(0);
+    expect(chatter.state.activePanel).toBe(chatter.CHATTER_PANEL.NONE);
+    forceClick("button[title='Search Messages']");
+    await settle();
+    expect(".o-mail-SearchMessageInput").toHaveCount(0);
+    expect(chatter.state.activePanel).toBe(chatter.CHATTER_PANEL.NONE);
+
+    // Offline, a search run, its fetch and its message fetch called directly search
+    // nothing; the pinned messages, called by a forced click or directly, do not open
+    // and fetch nothing; neither the attachment removal, the composer openings, the
+    // file chooser, the uploaded-file handler nor the uploader itself does anything;
+    // a file dragged and dropped on the chatter gets no dropzone and uploads nothing.
+    chatter.messageSearch.searchTerm = "Kick";
+    await chatter.messageSearch.run();
+    await chatter.messageSearch.fetch("Kick");
+    await chatter.messageSearch.fetchMessages("Kick");
+    expect(chatter.messageSearch.searching).toBe(false);
+    chatter.messageSearch.reset();
+    forceClick("button[title='Pinned Messages']");
+    chatter.onClickPinnedMessages();
+    await chatter.unlinkAttachment(attachment);
+    await chatter.attachmentUploader.unlink(attachment);
+    chatter.toggleComposer("message");
+    chatter.toggleComposer("note");
+    chatter.toggleComposer("note", { force: true });
+    expect(await chatter.onClickAttachFile()).toBe(false);
+    await chatter.onUploaded({ thread })(fileData);
+    await chatter.attachmentUploader.uploadFile(file);
+    await chatter.attachmentUploader.uploadData(fileData);
+    await dragenterFiles(".o-mail-Chatter", [file]);
+    expect(".o-Dropzone").toHaveCount(0);
+    await dropFiles(".o-mail-Chatter", [file]);
+    // A closing call of the composer keeps working.
+    chatter.toggleComposer();
+    await settle();
+    expect(".o-mail-pinnedMessages").toHaveCount(0);
+    expect(".o-mail-SearchMessageResult").toHaveCount(0);
+    expect(".o-mail-Composer").toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+    expect(chatter.state.activePanel).toBe(chatter.CHATTER_PANEL.NONE);
+    expect(chatter.state.composerType).toBe(false);
+    expect(chatter.attachments.map(({ id }) => id)).toEqual([attachmentId]);
+    expect(serverAttachments()).toEqual(["brief.txt"]);
+    expect(mailRequests).toEqual([]);
+    expect.verifySteps([]);
+    expect(Object.keys(getService(OfflinePlugin)._ormToSync())).toEqual([]);
+    stepping.active = false;
+
+    // Online, the pinned messages open and are fetched. Their jump links are not
+    // buttons: when the connection drops, the panel closes.
+    await setOffline(false);
+    await settle();
+    await contains("button[title='Pinned Messages']").click();
+    await waitFor(".o-mail-pinnedMessages .o-mail-Message:contains(Kick-off call done)");
+    expect(mailRequests).toInclude("/mail/store");
+    expect(".o-mail-pinnedMessages .o-mail-MessageCard-jump").toHaveCount(1);
+    await setOffline(true);
+    await settle();
+    expect(".o-mail-pinnedMessages").toHaveCount(0);
+    expect(chatter.state.activePanel).toBe(chatter.CHATTER_PANEL.NONE);
+    await setOffline(false);
+    await settle();
+
+    // Online, a search fetches its result, the composer opens, a dropped file is
+    // uploaded and the attachment is removed.
+    mailRequests.length = 0;
+    await contains("button[title='Search Messages']").click();
+    await contains(".o-mail-SearchInput input").edit("Kick", { confirm: false });
+    await waitFor(".o-mail-SearchMessageResult .o-mail-Message:contains(Kick-off call done)");
+    // The thread search goes through the store.
+    expect(mailRequests).toInclude("/mail/store");
+    await contains(".o-mail-SearchMessageInput button[aria-label='Close button']").click();
+    expect(".o-mail-SearchMessageInput").toHaveCount(0);
+    chatter.toggleComposer("note");
+    await waitFor(".o-mail-Composer");
+    chatter.toggleComposer("note");
+    await settle();
+    expect(".o-mail-Composer").toHaveCount(0);
+    expect(await chatter.onClickAttachFile()).toBe(undefined);
+    await dragenterFiles(".o-mail-Chatter", [file]);
+    await dropFiles(".o-Dropzone", [file]);
+    await waitFor(".o-mail-AttachmentContainer:not(.o-isUploading):contains(offline.txt)");
+    expect(mailRequests).toInclude("/mail/attachment/upload");
+    await chatter.unlinkAttachment(attachment);
+    await waitUntil(() => !serverAttachments().includes("brief.txt"));
+    expect(mailRequests).toInclude("/mail/attachment/delete");
+    expect(serverAttachments()).toEqual(["offline.txt"]);
+
+    // A new lead, named online, with a file dragged over its chatter (its dropzone
+    // shows): offline, the dropzone is gone, and its file chooser, composer openings
+    // (and a closing call) and a dropped file neither save it (no queued create to
+    // get a thread) nor request anything.
+    await goBack();
+    await getService("action").switchView("form");
+    await animationFrame();
+    await contains(".o_field_widget[name=name] input").edit("Unsaved lead");
+    await waitFor(".o-mail-Chatter-sendMessage:enabled");
+    const newLeadChatter = leadChatter();
+    expect(newLeadChatter.state.thread.id).toBe(false);
+    await dragenterFiles(".o-mail-Chatter", [file]);
+    await waitFor(".o-Dropzone");
+    await settle();
+    mailRequests.length = 0;
+    await setOffline(true);
+    await settle();
+    stepping.active = true;
+    expect(".o-Dropzone").toHaveCount(0);
+    expect(await newLeadChatter.onClickAttachFile()).toBe(false);
+    newLeadChatter.toggleComposer("message");
+    newLeadChatter.toggleComposer("note");
+    newLeadChatter.toggleComposer();
+    await dragenterFiles(".o-mail-Chatter", [file]);
+    expect(".o-Dropzone").toHaveCount(0);
+    await dropFiles(".o-mail-Chatter", [file]);
+    await settle();
+    expect(".o-mail-Composer").toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+    expect(mailRequests).toEqual([]);
+    expect.verifySteps([]);
+    expect(Object.keys(getService(OfflinePlugin)._ormToSync())).toEqual([]);
+    expect(newLeadChatter.state.thread.id).toBe(false);
+    expect(".o_field_widget[name=name] input").toHaveValue("Unsaved lead");
+});
+
 test("[Offline] same-record lead form reload fetches no thread, refetched online", async () => {
     // Offline root reloads served from the cache: after the wizard closes, and after
     // the systray discard.
@@ -8771,6 +10516,310 @@ test("[Offline] lead chatter scrolled to its older messages loads none", async (
     expect(thread.hasLoadingFailed).toBe(false);
 });
 
+test("[Offline] lead chatter load-older handlers called directly fetch nothing", async () => {
+    const threadComponents = [];
+    patchWithCleanup(Thread.prototype, {
+        setup() {
+            super.setup(...arguments);
+            threadComponents.push(this);
+        },
+    });
+    const pyEnv = await startServer();
+    const partnerId = pyEnv["res.partner"].create({ name: "Azure Interior" });
+    for (let index = 1; index <= 35; index++) {
+        pyEnv["mail.message"].create([
+            {
+                author_id: serverState.partnerId,
+                body: `Call note ${index}`,
+                message_type: "comment",
+                model: "crm.lead",
+                res_id: 1,
+            },
+            {
+                author_id: serverState.partnerId,
+                body: `Partner note ${index}`,
+                message_type: "comment",
+                model: "res.partner",
+                res_id: partnerId,
+            },
+        ]);
+    }
+    const setOffline = mockOffline();
+    const mailRequests = trackMailRequests();
+    await start();
+    await getService("action").doAction(LEADS_ACTION.id);
+    await flushStartupSync();
+    await openLead(1);
+    // Online, the chatter loads the newest page of messages.
+    await waitFor(".o-mail-Message:contains(Call note 35)");
+    expect(".o-mail-Message").toHaveCount(30);
+    const loadMore = ".o-mail-Thread button:contains(Load More)";
+    expect(loadMore).toHaveCount(1);
+    const store = getService("mail.store");
+    const thread = store["mail.thread"].get({ model: "crm.lead", id: 1 });
+    const leadThread = threadComponents.find(
+        (component) => component.env.inChatter && component.props.thread.eq(thread)
+    );
+    expect(Boolean(leadThread)).toBe(true);
+    mailRequests.length = 0;
+
+    // Offline, the handlers that load messages, called directly, request nothing and
+    // leave the thread without a loading error: load older, retry, a jump to the
+    // present (which reloads the newest page), and an immediate jump while newer
+    // messages are left to load.
+    await setOffline(true);
+    await leadThread.onClickLoadOlder();
+    leadThread.onClickRetry();
+    await leadThread.jumpToPresent();
+    thread.loadNewer = true;
+    await leadThread.jumpToPresent({ immediate: true });
+    expect(thread.loadNewer).toBe(true);
+    thread.loadNewer = false;
+    // An immediate jump with nothing newer to load only scrolls, as online.
+    await leadThread.jumpToPresent({ immediate: true });
+    await settle();
+    expect(mailRequests).toEqual([]);
+    expect(thread.hasLoadingFailed).toBe(false);
+    expect(".o-mail-Thread-error").toHaveCount(0);
+    expect(".o-mail-Message").toHaveCount(30);
+    expect(loadMore).toHaveCount(1);
+    expect(loadMore).not.toBeEnabled();
+    expect(Object.keys(getService(OfflinePlugin)._ormToSync())).toEqual([]);
+
+    // Online, the same direct call loads the older messages.
+    await setOffline(false);
+    await animationFrame();
+    await leadThread.onClickLoadOlder();
+    await waitUntil(() => queryAll(".o-mail-Message").length === 35);
+    expect(mailRequests).toEqual(["/mail/store"]);
+    expect(thread.hasLoadingFailed).toBe(false);
+
+    // Another model's chatter is untouched: offline, its load-older handler runs the
+    // original code, which requests the older messages.
+    await getService("action").doAction({
+        type: "ir.actions.act_window",
+        res_model: "res.partner",
+        res_id: partnerId,
+        views: [[false, "form"]],
+    });
+    await waitFor(".o-mail-Message:contains(Partner note 35)");
+    const partnerThread = threadComponents.find(
+        (component) =>
+            component.env.inChatter &&
+            component.props.thread.eq(
+                store["mail.thread"].get({ model: "res.partner", id: partnerId })
+            )
+    );
+    expect(Boolean(partnerThread)).toBe(true);
+    mailRequests.length = 0;
+    await setOffline(true);
+    await partnerThread.onClickLoadOlder();
+    await waitUntil(() => mailRequests.includes("/mail/store"));
+});
+
+/**
+ * The followers wizard of the followers menu (`mail.followers.edit`) on its real
+ * footer: its Add saves the wizard, then calls `edit_followers`.
+ */
+const LEAD_FOLLOWERS_WIZARD_ARCH = /* xml */ `
+    <form>
+        <field name="res_model"/>
+        <footer>
+            <button name="edit_followers" type="object" string="Add Followers" class="btn-primary"/>
+            <button special="cancel" string="Discard"/>
+        </footer>
+    </form>`;
+
+/**
+ * The full composer on the real composer view (`js_class="mail_composer_form"`), with
+ * the recipient fields mail reads back to the thread when its dialog is closed.
+ */
+const LEAD_FULL_COMPOSER_ARCH = /* xml */ `
+    <form js_class="mail_composer_form">
+        <field name="subtype_is_log" invisible="1"/>
+        <field name="partner_ids" invisible="1"/>
+        <field name="partner_cc_ids" invisible="1"/>
+        <field name="subject"/>
+        <footer>
+            <button name="action_send_mail" type="object" string="Send" class="btn-primary" data-hotkey="q"/>
+            <button special="cancel" string="Discard"/>
+        </footer>
+    </form>`;
+
+test("[Offline] lead chatter wizards opened online save, send and queue nothing", async () => {
+    // The Send of another model's composer, attempted offline once the framework has
+    // queued its save.
+    expect.errors(1);
+    const composers = [];
+    patchWithCleanup(Composer.prototype, {
+        setup() {
+            super.setup(...arguments);
+            composers.push(this);
+        },
+    });
+    const controllers = captureFormControllers();
+    registerInlineViewArchs("mail.followers.edit", { "form,false": LEAD_FOLLOWERS_WIZARD_ARCH });
+    registerInlineViewArchs("mail.compose.message", { "form,false": LEAD_FULL_COMPOSER_ARCH });
+    await startServer();
+    onRpc("mail.followers.edit", "edit_followers", ({ args }) =>
+        stepServerCall("edit_followers", args[0])
+    );
+    onRpc("mail.compose.message", "action_send_mail", ({ args }) =>
+        stepServerCall("action_send_mail", args[0])
+    );
+    const setOffline = mockOffline();
+    const mailRequests = trackMailRequests();
+    stepRoutes(
+        (route) => route.startsWith("/web/dataset/call_button/") || route.endsWith("/web_save")
+    );
+    await start();
+    await getService("action").doAction(LEADS_ACTION.id);
+    await flushStartupSync();
+    await openLead(1);
+    await waitFor(".o-mail-Chatter .o-mail-Followers-button");
+    const wizardController = (model) =>
+        controllers.findLast((form) => form.props.resModel === model);
+    const menu = ".o-mail-Followers-dropdown";
+    const add = ".modal footer button[name=edit_followers]";
+    const send = ".modal footer button[name=action_send_mail]";
+    const subject = ".modal .o_field_widget[name=subject] input";
+    const close = ".modal button[aria-label=Close]:visible";
+
+    /** Opens the followers wizard from the lead's followers menu. */
+    const openFollowersWizard = async () => {
+        await contains(".o-mail-Followers-button").click();
+        await contains(`${menu} .o-dropdown-item:contains(Add Followers)`).click();
+        await waitFor(".modal .o_form_view");
+        return wizardController("mail.followers.edit");
+    };
+    /** Opens the full composer from the lead chatter's composer. */
+    const openFullComposer = async () => {
+        await contains(".o-mail-Chatter-sendMessage").click();
+        await waitFor(".o-mail-Composer");
+        const composer = composers.findLast(
+            (candidate) => candidate.props.composer?.thread?.model === "crm.lead"
+        );
+        await composer.onClickFullComposer();
+        await waitFor(".modal .o_form_view");
+        return wizardController("mail.compose.message");
+    };
+
+    // The followers wizard, opened online on the lead.
+    const followersWizard = await openFollowersWizard();
+    expect(followersWizard.props.context.default_res_model).toBe("crm.lead");
+    await settle();
+    expect.verifySteps([]);
+
+    // Offline, its Add, forced or run through the controller, and a direct save of its
+    // record request, queue and change nothing; the wizard stays open, and its close
+    // control closes it.
+    await setOffline(true);
+    await settle();
+    expect(add).not.toBeEnabled();
+    forceClick(add);
+    await settle();
+    expect(
+        await followersWizard.beforeExecuteActionButton({ name: "edit_followers", type: "object" })
+    ).toBe(false);
+    expect(await followersWizard.model.root.save()).toBe(false);
+    await settle();
+    expect(".modal .o_form_view").toHaveCount(1);
+    expect(followersWizard.model.root.isNew).toBe(true);
+    expect(queued("mail.followers.edit")).toEqual([]);
+    expect.verifySteps([]);
+    await contains(close).click();
+    expect(".modal").toHaveCount(0);
+
+    // Back online, nothing is replayed, and the wizard adds followers again.
+    await reconnect(setOffline);
+    expect(queued("mail.followers.edit")).toEqual([]);
+    expect.verifySteps([]);
+    await openFollowersWizard();
+    const followersWizardId = MockServer.env["mail.followers.edit"].search([]).length + 1;
+    await contains(add).click();
+    await expect.waitForSteps([
+        "/web/dataset/call_kw/mail.followers.edit/web_save",
+        buttonRoute("mail.followers.edit", "edit_followers"),
+        `edit_followers [${followersWizardId}]`,
+    ]);
+    expect(".modal").toHaveCount(0);
+
+    // The full composer, opened online from the lead chatter's composer.
+    const fullComposer = await openFullComposer();
+    expect(fullComposer).toBeInstanceOf(MailComposerFormController);
+    expect(fullComposer.props.context.default_model).toBe("crm.lead");
+    await contains(subject).edit("Proposal", { confirm: "blur" });
+    await settle();
+    expect.verifySteps([]);
+
+    // Offline, the chatter's composer closes and the full composer stays: its Send,
+    // forced or run through the controller, and a direct save of its record request,
+    // queue and send nothing, and it keeps what was entered.
+    await setOffline(true);
+    await settle();
+    expect(".o-mail-Composer").toHaveCount(0);
+    expect(send).not.toBeEnabled();
+    forceClick(send);
+    await settle();
+    expect(
+        await fullComposer.beforeExecuteActionButton({ name: "action_send_mail", type: "object" })
+    ).toBe(false);
+    expect(await fullComposer.model.root.save()).toBe(false);
+    await settle();
+    expect(".modal .o_form_view").toHaveCount(1);
+    expect(subject).toHaveValue("Proposal");
+    expect(fullComposer.model.root.isNew).toBe(true);
+    expect(queued("mail.compose.message")).toEqual([]);
+    expect.verifySteps([]);
+    // Its close control closes it with no request (mail's recipient read is skipped).
+    mailRequests.length = 0;
+    await contains(close).click();
+    await settle();
+    expect(".modal").toHaveCount(0);
+    expect(mailRequests).toEqual([]);
+    expect.verifySteps([]);
+
+    // Back online, nothing is replayed, and the full composer opens with its Send
+    // enabled again.
+    await reconnect(setOffline);
+    expect(queued("mail.compose.message")).toEqual([]);
+    expect.verifySteps([]);
+    await openFullComposer();
+    expect(send).toBeEnabled();
+    await cancelDialog();
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+
+    // A composer of another model's chatter keeps mail's offline behaviour: a forced
+    // Send has the framework queue its save, then attempts the button's call, and the
+    // save replays once online.
+    await getService("action").doAction({
+        type: "ir.actions.act_window",
+        name: "Compose Email",
+        res_model: "mail.compose.message",
+        target: "new",
+        views: [[false, "form"]],
+        context: { default_model: "res.partner" },
+    });
+    await waitFor(".modal .o_form_view");
+    await contains(subject).edit("Hello", { confirm: "blur" });
+    await setOffline(true);
+    await settle();
+    forceClick(send);
+    await settle();
+    expect.verifySteps([
+        "/web/dataset/call_kw/mail.compose.message/web_save",
+        buttonRoute("mail.compose.message", "action_send_mail"),
+    ]);
+    expect.verifyErrors([buttonRoute("mail.compose.message", "action_send_mail")]);
+    expect(queuedCalls("mail.compose.message").map(({ method }) => method)).toEqual(["web_save"]);
+    await reconnect(setOffline);
+    expect.verifySteps(["/web/dataset/call_kw/mail.compose.message/web_save"]);
+    expect(queued("mail.compose.message")).toEqual([]);
+    await cancelDialog();
+    expect(".modal").toHaveCount(0);
+});
+
 /**
  * Selector of a lead card of the pipeline: a kanban card on desktop; on the mobile
  * pipeline, the card in the stage that displays it (a card shows its queued stage),
@@ -8843,14 +10892,14 @@ test("[Offline] two distinct writes to one lead replay in order, last write wins
             model: "crm.lead",
             method: "web_save",
             args: [[1], { stage_id: STAGE_QUALIFIED }],
-            kwargs: { context: callContext(PIPELINE_ACTION.context), specification: {} },
+            kwargs: { context: queuedContext(PIPELINE_ACTION.context), specification: {} },
         },
         {
             model: "crm.lead",
             method: "web_save",
             args: [[1], { stage_id: STAGE_WON }],
             kwargs: {
-                context: callContext(PIPELINE_ACTION.context, { default_stage_id: STAGE_NEW }),
+                context: queuedContext(PIPELINE_ACTION.context, { default_stage_id: STAGE_NEW }),
                 specification: {},
             },
         },
@@ -8887,7 +10936,7 @@ function pipelineLeadWonCall() {
         model: "crm.lead",
         method: "action_set_won",
         args: [[1]],
-        kwargs: { context: callContext(PIPELINE_ACTION.context) },
+        kwargs: { context: queuedContext(PIPELINE_ACTION.context) },
     };
 }
 
@@ -8998,7 +11047,7 @@ test("[Offline] lead form edit after an offline won keeps the won last", async (
     await contains(WON_BUTTON).click();
     await contains(".o_field_widget[name=expected_revenue] input").edit("15");
     await contains(".o_form_button_save").click();
-    const context = callContext(PIPELINE_ACTION.context);
+    const context = queuedContext(PIPELINE_ACTION.context);
     expect(queuedCalls("crm.lead")).toEqual([
         {
             model: "crm.lead",
@@ -9047,7 +11096,7 @@ test("[Offline] lead stage saved after an offline won replays after the won", as
     expect(won.value.method).toBe("action_set_won");
     await selectStage(STAGE_NEW, "New");
     await contains(".o_form_button_save").click();
-    const context = callContext(PIPELINE_ACTION.context);
+    const context = queuedContext(PIPELINE_ACTION.context);
     expect(queuedCalls("crm.lead")).toEqual([
         pipelineLeadWonCall(),
         {
@@ -9099,7 +11148,7 @@ test("[Offline] reopened lead stage saved after a queued won is queued again aft
     // again in a follow-up write after the won.
     await selectStage(STAGE_NEW, "New");
     await contains(".o_form_button_save").click();
-    const context = callContext(PIPELINE_ACTION.context);
+    const context = queuedContext(PIPELINE_ACTION.context);
     expect(queuedCalls("crm.lead")).toEqual([
         {
             model: "crm.lead",
@@ -9291,7 +11340,7 @@ test("[Offline] rejected replay is parked in the offline systray", async () => {
     await moveLeadCard("Lead 1", STAGE_QUALIFIED, 1);
     await moveLeadCard("Lead 2", STAGE_WON, 2);
     const kwargs = {
-        context: callContext(PIPELINE_ACTION.context, { default_stage_id: STAGE_NEW }),
+        context: queuedContext(PIPELINE_ACTION.context, { default_stage_id: STAGE_NEW }),
         specification: {},
     };
     const rejectedMove = {
@@ -9793,6 +11842,706 @@ test("[Offline] lost lead creates: each delivery key is answered with its own le
 });
 
 // -----------------------------------------------------------------------------
+// Queue identity: the offline store is shared by every session of the browser
+// -----------------------------------------------------------------------------
+
+/** The identity a CRM call is queued with: the session's user and database. */
+function sessionOrigin() {
+    return { uid: serverState.userId, db: session.db };
+}
+
+test("[Offline] CRM calls are queued with the identity of the session queuing them", async () => {
+    const rejection = rejectReplay("crm.lead", "web_save", "Save refused");
+    const setOffline = mockOffline();
+    await openPipeline();
+    await flushStartupSync();
+    const plugin = getService(OfflinePlugin);
+    await setOffline(true);
+
+    // A framework save (the card stage move): the identity is in its extras, in
+    // memory and in the offline store, and the call is the one the framework
+    // queues, with the id of the user queuing it in its context.
+    await moveLeadCard("Lead 1", STAGE_QUALIFIED, 1);
+    const [move] = queued("crm.lead");
+    expect(move.value.extras.crmOrigin).toEqual(sessionOrigin());
+    expect(queuedCalls("crm.lead")).toEqual([
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [[1], { stage_id: STAGE_QUALIFIED }],
+            kwargs: {
+                context: queuedContext(PIPELINE_ACTION.context, { default_stage_id: STAGE_NEW }),
+                specification: {},
+            },
+        },
+    ]);
+    expect(await storedQueueValue(plugin, move.key)).toEqual(
+        JSON.parse(JSON.stringify(move.value))
+    );
+
+    // Every model the CRM replay sends carries both, and no other model; the
+    // caller's kwargs and options are left as they were.
+    const options = { extras: { displayName: "Direct", timeStamp: Date.now() } };
+    const given = JSON.parse(JSON.stringify(options));
+    const kwargs = { context: { lang: "en" }, specification: {} };
+    const givenKwargs = JSON.parse(JSON.stringify(kwargs));
+    const save = (model, args) => plugin.scheduleORM(model, "web_save", args, kwargs, options);
+    const keys = {
+        "crm.stage": save("crm.stage", [[STAGE_NEW], {}]),
+        "crm.team": save("crm.team", [[1], { color: 3 }]),
+        "mail.activity": plugin.scheduleORM("mail.activity", "action_done", [[1]], {}, options),
+        "res.partner": save("res.partner", [[1], {}]),
+    };
+    expect(options).toEqual(given);
+    expect(kwargs).toEqual(givenKwargs);
+    for (const model of ["crm.stage", "crm.team", "mail.activity"]) {
+        expect(plugin._ormToSync()[keys[model]].value.extras).toEqual({
+            ...given.extras,
+            crmOrigin: sessionOrigin(),
+        });
+    }
+    for (const model of ["crm.stage", "crm.team"]) {
+        expect(plugin._ormToSync()[keys[model]].value.kwargs).toEqual({
+            context: { lang: "en", [CRM_OFFLINE_UID_KEY]: serverState.userId },
+            specification: {},
+        });
+    }
+    expect(plugin._ormToSync()[keys["mail.activity"]].value.kwargs).toEqual({
+        context: { [CRM_OFFLINE_UID_KEY]: serverState.userId },
+    });
+    expect(plugin._ormToSync()[keys["res.partner"]].value.extras).toEqual(given.extras);
+    expect(plugin._ormToSync()[keys["res.partner"]].value.kwargs).toEqual(givenKwargs);
+    // Extras and a context already naming an identity keep it.
+    const otherUid = serverState.userId + 100;
+    const otherOrigin = { uid: otherUid, db: session.db };
+    const otherKwargs = { context: { [CRM_OFFLINE_UID_KEY]: otherUid }, specification: {} };
+    const kept = plugin.scheduleORM("crm.lead", "web_save", [[2], {}], otherKwargs, {
+        extras: { crmOrigin: otherOrigin, timeStamp: Date.now() },
+    });
+    expect(plugin._ormToSync()[kept].value.extras.crmOrigin).toEqual(otherOrigin);
+    expect(plugin._ormToSync()[kept].value.kwargs).toEqual({
+        context: { [CRM_OFFLINE_UID_KEY]: otherUid },
+        specification: {},
+    });
+    for (const key of [...Object.values(keys), kept]) {
+        plugin.removeScheduledORM(key);
+    }
+
+    // A refused replay is sent with the id of the user who queued it, and is
+    // parked under its key with its first identity and that id.
+    stepCalls("crm.lead", "web_save");
+    rejection.reject = true;
+    await reconnect(setOffline);
+    expectParked("crm.lead", "Save refused");
+    expect.verifySteps([
+        {
+            model: "crm.lead",
+            method: "web_save",
+            args: [[1], { stage_id: STAGE_QUALIFIED }],
+            kwargs: {
+                context: queuedContext(PIPELINE_ACTION.context, { default_stage_id: STAGE_NEW }),
+                specification: {},
+            },
+        },
+    ]);
+    const [parked] = queued("crm.lead");
+    expect(parked.key).toBe(move.key);
+    expect(parked.value.extras.crmOrigin).toEqual(sessionOrigin());
+    expect(parked.value.kwargs).toEqual(move.value.kwargs);
+    const stored = await storedQueueValue(plugin, move.key);
+    expect(stored.extras.crmOrigin).toEqual(sessionOrigin());
+    expect(stored.kwargs.context[CRM_OFFLINE_UID_KEY]).toBe(serverState.userId);
+});
+
+/** JSON-RPC error name of the server's `CrmOfflineOriginError`. */
+const ORIGIN_ERROR_NAME = "odoo.addons.crm.models.crm_lead.CrmOfflineOriginError";
+/** Message of the server's `CrmOfflineOriginError`. */
+const ORIGIN_ERROR_MESSAGE =
+    "This offline change was sent in another user's session and was not applied.";
+
+/** Client action standing for a signed-out web client: it mounts no view. */
+class CrmTestSignedOut extends Component {
+    static template = xml`<div class="o_crm_test_signed_out"/>`;
+    static props = ["*"];
+}
+
+/**
+ * Signs an identity in on this browser, as a user signing out then another signing
+ * in does: the web client leaves its views, its session then belongs to `uid` on
+ * `db` (the identity its calls are queued with, and the user its call context
+ * names), and that session loads the queue from the offline store every session of
+ * the browser shares.
+ *
+ * @param {number|false} uid `false` for a session without a user
+ * @param {string} [db] the test session's database by default
+ */
+async function switchUser(uid, db = serverState.db) {
+    registry.category("actions").add("crm_test_signed_out", CrmTestSignedOut, { force: true });
+    await getService("action").doAction("crm_test_signed_out", { clearBreadcrumbs: true });
+    patchWithCleanup(user, { userId: uid });
+    patchWithCleanup(session, { db });
+    await getService(OfflinePlugin)._updateScheduledORMList();
+    await animationFrame();
+}
+
+/**
+ * A queued call as the replay of the current session sends it: the ORM adds the
+ * session user's context under the call's own (`callPayload` format).
+ *
+ * @param {{model: string, method: string, args: any[], kwargs: Object}} value
+ */
+function replayedCall({ model, method, args, kwargs }) {
+    const context = { ...user.context, ...kwargs.context };
+    return callPayload({ model, method, args, kwargs: { ...kwargs, context } });
+}
+
+/**
+ * The offline store's queue table, `{key: stored JSON}`.
+ *
+ * @param {OfflinePlugin} plugin
+ * @returns {Promise<Object<string, string>>}
+ */
+async function storedQueue(plugin) {
+    const entries = await plugin._idb.getAllEntries(OfflinePlugin.ORM_SYNC_TABLE_NAME);
+    return Object.fromEntries(entries.map(({ key, value }) => [key, value]));
+}
+
+/**
+ * Asserts the offline store holds exactly the calls of `keys`, each as `snapshot`
+ * holds it, byte for byte.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {Object<string, string>} snapshot a `storedQueue` result
+ * @param {string[]} keys
+ */
+async function expectStoredAsBefore(plugin, snapshot, keys) {
+    const stored = await storedQueue(plugin);
+    expect(Object.keys(stored).sort()).toEqual([...keys].sort());
+    for (const key of keys) {
+        expect(stored[key]).toBe(snapshot[key]);
+    }
+}
+
+/**
+ * Asserts the queue of this session holds exactly the calls of `keys`, each as
+ * `snapshot` stores it (its error included, for a parked one).
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {Object<string, string>} snapshot a `storedQueue` result
+ * @param {string[]} keys
+ */
+function expectQueuedAsStored(plugin, snapshot, keys) {
+    expect(Object.keys(plugin._ormToSync()).sort()).toEqual([...keys].sort());
+    for (const key of keys) {
+        expect(plugin._ormToSync()[key]).toEqual({ key, value: JSON.parse(snapshot[key]) });
+    }
+}
+
+/**
+ * Emulates, for the lead saves and activity creates the replay of every tab sends,
+ * the server session of the browser: it belongs to `browserSession.uid`, the session
+ * user by default, and refuses, as the server does (`_check_offline_queue_origin`,
+ * `CrmOfflineOriginError`), such a call whose context names another user under
+ * `CRM_OFFLINE_UID_KEY`. Signed out (`false`), it refuses each of them as expired.
+ *
+ * @returns {{uid: number|false}}
+ */
+function mockBrowserSession() {
+    const browserSession = { uid: serverState.userId };
+    const refuse = ({ kwargs }) => {
+        if (browserSession.uid === false) {
+            throw makeServerError({
+                errorName: "odoo.http.session.SessionExpiredException",
+                message: "user is not connected",
+            });
+        }
+        const queuedBy = kwargs.context?.[CRM_OFFLINE_UID_KEY];
+        if (Number.isInteger(queuedBy) && queuedBy !== browserSession.uid) {
+            throw makeServerError({ errorName: ORIGIN_ERROR_NAME, message: ORIGIN_ERROR_MESSAGE });
+        }
+    };
+    onRpc("crm.lead", "web_save", refuse);
+    onRpc("mail.activity", "create", refuse);
+    return browserSession;
+}
+
+/**
+ * Queues a lead create as the mobile quick create of "My Pipeline" does offline
+ * (`createLead`): the pipeline's call context with a delivery key, and the display
+ * values of its provisional card.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {Object} vals the six quick-create values, in the "New" stage
+ * @param {string} deliveryKey
+ * @returns {string} its queue key
+ */
+function queueQuickCreate(plugin, vals, deliveryKey) {
+    return plugin.scheduleORM(
+        "crm.lead",
+        "web_save",
+        [[], { ...vals, stage_id: STAGE_NEW }],
+        {
+            context: {
+                ...callContext(PIPELINE_ACTION.context),
+                [CRM_OFFLINE_CREATE_KEY]: deliveryKey,
+            },
+            specification: {},
+        },
+        {
+            extras: {
+                actionId: PIPELINE_ACTION.id,
+                actionName: PIPELINE_ACTION.name,
+                viewType: "kanban",
+                displayName: vals.name,
+                timeStamp: Date.now() + 1,
+                changes: { ...vals, stage_id: { id: STAGE_NEW, display_name: "New" } },
+            },
+        }
+    );
+}
+
+/**
+ * Queues an activity create of a pipeline lead as the mobile activity sheet does
+ * (`scheduleActivity`): the session user's context and the pipeline's extras.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {number} resId the lead
+ * @param {string} summary
+ * @param {number} userId the assignee
+ * @returns {string} its queue key
+ */
+function queueLeadActivity(plugin, resId, summary, userId) {
+    return plugin.scheduleORM(
+        "mail.activity",
+        "create",
+        [
+            [
+                {
+                    res_model: "crm.lead",
+                    res_id: resId,
+                    activity_type_id: CALL_ACTIVITY_TYPE_ID,
+                    summary,
+                    date_deadline: "2019-01-01",
+                    user_id: userId,
+                },
+            ],
+        ],
+        { context: user.context },
+        {
+            extras: {
+                actionId: PIPELINE_ACTION.id,
+                actionName: PIPELINE_ACTION.name,
+                viewType: "kanban",
+                displayName: `Lead ${resId}`,
+                timeStamp: Date.now() + 1,
+            },
+        }
+    );
+}
+
+/**
+ * Queues a contact rename as a partner form saves it offline: the session user's
+ * context, and the change with the value it replaces.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {number} partnerId
+ * @returns {string} its queue key
+ */
+function queuePartnerRename(plugin, partnerId) {
+    return plugin.scheduleORM(
+        "res.partner",
+        "web_save",
+        [[partnerId], { name: "Partner renamed" }],
+        { context: user.context, specification: {} },
+        {
+            extras: {
+                displayName: "Partner",
+                timeStamp: Date.now() + 1,
+                changes: { name: "Partner renamed" },
+                originalValues: { name: "Partner" },
+            },
+        }
+    );
+}
+
+/**
+ * Queues a lead rename as the lead form of "My Pipeline" saves it offline: the
+ * pipeline's call context, and the change with the value it replaces.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {number} resId
+ * @param {string} name
+ * @returns {string} its queue key
+ */
+function queueLeadRename(plugin, resId, name) {
+    return plugin.scheduleORM(
+        "crm.lead",
+        "web_save",
+        [[resId], { name }],
+        { context: callContext(PIPELINE_ACTION.context), specification: {} },
+        {
+            extras: {
+                actionId: PIPELINE_ACTION.id,
+                actionName: PIPELINE_ACTION.name,
+                viewType: "form",
+                displayName: name,
+                timeStamp: Date.now() + 1,
+                changes: { name },
+                originalValues: { name: `Lead ${resId}` },
+            },
+        }
+    );
+}
+
+test("[Offline] CRM calls another user queued in this browser are neither shown, replayed nor removed", async () => {
+    // Offline root load served from the cache: this user's pipeline, opened again.
+    expect.errors(1);
+    stepCalls("crm.lead", "web_save");
+    stepCalls("mail.activity", "create");
+    stepCalls("res.partner", "web_save");
+    const setOffline = mockOffline();
+    await openPipeline();
+    await flushStartupSync();
+    const plugin = getService(OfflinePlugin);
+    const { env } = MockServer;
+    const partnerId = env["res.partner"].create({ name: "Partner" });
+    const ownUid = serverState.userId;
+    const otherUid = ownUid + 100;
+    const otherDb = `${serverState.db}_other`;
+
+    // This user moves a lead offline, and signs out with the move still queued.
+    await setOffline(true);
+    await moveLeadCard("Lead 2", STAGE_QUALIFIED, 1);
+    const [ownMove] = queued("crm.lead");
+    expect(ownMove.value.extras.crmOrigin).toEqual(sessionOrigin());
+
+    // Another user signs in on this browser: their session loads the store without
+    // this user's move, and their replay sends nothing when the connection returns.
+    await switchUser(otherUid);
+    expect(plugin._ormToSync()).toEqual({});
+    await reconnect(setOffline);
+    expect(plugin.syncingORM()).toBe(false);
+    expect(await storedQueueKeys(plugin)).toEqual([ownMove.key]);
+    expect.verifySteps([]);
+
+    // They visit their pipeline and a lead online. Offline, they rename the lead and
+    // change its revenue in its form, quick-create a lead, schedule an activity on
+    // another lead and rename a contact.
+    await getService("action").doAction(PIPELINE_ACTION.id, { clearBreadcrumbs: true });
+    await openLead(1);
+    await setOffline(true);
+    await contains(".o_field_widget[name=name] input").edit("Foreign Pending");
+    await contains(".o_field_widget[name=expected_revenue] input").edit("1777");
+    await contains(".o_form_button_save").click();
+    const [foreignEdit] = queued("crm.lead");
+    expect(foreignEdit.value.args[0]).toEqual([1]);
+    expect(foreignEdit.value.args[1]).toMatchObject({
+        name: "Foreign Pending",
+        expected_revenue: 1777,
+    });
+    const foreignCreate = queueQuickCreate(
+        plugin,
+        {
+            name: "Foreign Create",
+            contact_name: "Foreign contact",
+            phone: "",
+            email_from: "",
+            expected_revenue: 2777,
+        },
+        "0123456789abcdef".repeat(2)
+    );
+    const foreignActivity = queueLeadActivity(plugin, 2, "Foreign call", otherUid);
+    const partnerRename = queuePartnerRename(plugin, partnerId);
+
+    // This user, signed in on another database served on this browser's origin,
+    // renames a lead there.
+    await switchUser(ownUid, otherDb);
+    expect(Object.keys(plugin._ormToSync())).toEqual([partnerRename]);
+    const otherDatabaseEdit = queueLeadRename(plugin, 3, "Other database");
+
+    // Each CRM call carries the identity of the session that queued it.
+    const snapshot = await storedQueue(plugin);
+    const foreignKeys = [foreignEdit.key, foreignCreate, foreignActivity, otherDatabaseEdit];
+    expect(Object.keys(snapshot).sort()).toEqual(
+        [ownMove.key, partnerRename, ...foreignKeys].sort()
+    );
+    for (const key of [foreignEdit.key, foreignCreate, foreignActivity]) {
+        const { extras, kwargs } = JSON.parse(snapshot[key]);
+        expect(extras.crmOrigin).toEqual({ uid: otherUid, db: serverState.db });
+        expect(kwargs.context.uid).toBe(otherUid);
+        expect(kwargs.context[CRM_OFFLINE_UID_KEY]).toBe(otherUid);
+    }
+    expect(JSON.parse(snapshot[otherDatabaseEdit]).extras.crmOrigin).toEqual({
+        uid: ownUid,
+        db: otherDb,
+    });
+
+    // This user signs in on this database again: their session loads their own move
+    // and the contact rename (calls of other apps are the framework's), and none of
+    // the other identities' CRM calls. Their pipeline opens from the cache.
+    await switchUser(ownUid);
+    expectQueuedAsStored(plugin, snapshot, [ownMove.key, partnerRename]);
+    await getService("action").doAction(PIPELINE_ACTION.id, { clearBreadcrumbs: true });
+    expect.verifyErrors([LEAD_GROUPS_LOAD]);
+
+    // Neither the pipeline nor the activity sheet shows them; this user's own move
+    // shows as pending. The desktop kanban shows the leads as loaded.
+    for (const name of ["Foreign Pending", "Foreign Create", "Other database"]) {
+        expect(pipelineLeadNames()).not.toInclude(name);
+    }
+    if (isSmall()) {
+        expect(".o_crm_mobile_pipeline_stage_name").toHaveText("New");
+        expect(pipelineLeadNames().sort()).toEqual(["Lead 1", "Lead 3"]);
+        expect(".o_crm_mobile_pipeline_count").toHaveText("2");
+        expect(".o_crm_mobile_lead_card_provisional").toHaveCount(0);
+        for (const name of ["Lead 1", "Lead 3"]) {
+            expect(`${await revealLeadCard(name)} .o_crm_mobile_pending_sync`).toHaveCount(0);
+        }
+        const ownCard = await revealLeadCard("Lead 2");
+        expect(".o_crm_mobile_pipeline_stage_name").toHaveText("Qualified");
+        expect(`${ownCard} .o_crm_mobile_pending_sync`).toHaveText("Pending sync");
+        await contains(`${ownCard} .o_crm_mobile_lead_activities_button`).click();
+        expect(".o_bottom_sheet .o_crm_mobile_lead_activities_sheet").toHaveCount(1);
+        expect(".o_crm_mobile_lead_activities_sheet:contains(Foreign call)").toHaveCount(0);
+        expect(".o_crm_mobile_activity_pending").toHaveCount(0);
+        await contains(".o_bottom_sheet_backdrop").click();
+        await animationFrame();
+        expect(".o_bottom_sheet").toHaveCount(0);
+    }
+
+    // The systray lists this session's calls only.
+    await openSystray();
+    expect(
+        queryAllTexts(".o_offline_systray_content .o-dropdown-item .text-truncate").sort()
+    ).toEqual(["Lead 2", "Partner"]);
+    await press("Escape");
+    await animationFrame();
+
+    // Reconnected, the replay sends this session's calls, in order and verbatim, and
+    // none of the other identities' CRM calls, which stay in the store unchanged.
+    await reconnect(setOffline);
+    await expect.waitForSteps([
+        replayedCall(ownMove.value),
+        replayedCall(JSON.parse(snapshot[partnerRename])),
+    ]);
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(plugin._ormToSync()).toEqual({});
+    expect(env["crm.lead"].browse(2)[0].stage_id).toBe(STAGE_QUALIFIED);
+    expect(env["crm.lead"].browse(1)[0].name).toBe("Lead 1");
+    expect(env["crm.lead"].browse(1)[0].expected_revenue).toBe(5);
+    expect(env["crm.lead"].browse(3)[0].name).toBe("Lead 3");
+    expect(env["crm.lead"].search_count([["name", "=", "Foreign Create"]])).toBe(0);
+    expect(env["mail.activity"].search_count([["summary", "=", "Foreign call"]])).toBe(0);
+    expect(env["res.partner"].browse(partnerId)[0].name).toBe("Partner renamed");
+    await expectStoredAsBefore(plugin, snapshot, foreignKeys);
+
+    // The session of each identity loads its own calls, as stored, which the mobile
+    // pipeline of their user shows; a session without a user owns none.
+    await switchUser(otherUid);
+    expectQueuedAsStored(plugin, snapshot, [foreignEdit.key, foreignCreate, foreignActivity]);
+    if (isSmall()) {
+        await getService("action").doAction(PIPELINE_ACTION.id, { clearBreadcrumbs: true });
+        const foreignCard = await revealLeadCard("Foreign Pending");
+        expect(`${foreignCard} .o_crm_mobile_pending_sync`).toHaveText("Pending sync");
+        expect(".o_crm_mobile_lead_card_provisional:contains(Foreign Create)").toHaveCount(1);
+        expect(".o_crm_mobile_pipeline_count").toHaveText("3");
+    }
+    await switchUser(ownUid, otherDb);
+    expectQueuedAsStored(plugin, snapshot, [otherDatabaseEdit]);
+    await switchUser(false);
+    expect(plugin._ormToSync()).toEqual({});
+    await expectStoredAsBefore(plugin, snapshot, foreignKeys);
+    expect.verifySteps([]);
+});
+
+test("[Offline] an own CRM call refused in another user's session stays parked with Sync failed in its owner's session and can be discarded", async () => {
+    // Offline root load served from the cache: the pipeline, back from the lead form.
+    expect.errors(1);
+    const browserSession = mockBrowserSession();
+    const moveRejection = rejectReplay("crm.lead", "web_save", "Move refused");
+    const renameRejection = rejectReplay("res.partner", "web_save", "Rename refused");
+    // Registered after the refusals, so they run first: every call reaching the mock
+    // server is stepped, the refused ones included.
+    stepCalls("crm.lead", "web_save");
+    stepCalls("mail.activity", "create");
+    stepCalls("res.partner", "web_save");
+    const setOffline = mockOffline();
+    await openPipeline();
+    await flushStartupSync();
+    const plugin = getService(OfflinePlugin);
+    const { env } = MockServer;
+    const partnerId = env["res.partner"].create({ name: "Partner" });
+    const ownUid = serverState.userId;
+    const otherUid = ownUid + 100;
+    const originError = `${ORIGIN_ERROR_NAME} - ${ORIGIN_ERROR_MESSAGE}`;
+    /** Keys of the queued lead calls of the lead `resId`. */
+    const leadKeys = (resId) =>
+        Object.values(plugin._ormToSync())
+            .filter(({ value }) => value.model === "crm.lead" && value.args[0][0] === resId)
+            .map(({ key }) => key);
+
+    // This user's calls are parked by native replays the server refuses. A lead move
+    // is sent while the browser's session is signed out.
+    await setOffline(true);
+    await moveLeadCard("Lead 4", STAGE_NEW, 0);
+    const [signedOutMove] = queued("crm.lead");
+    browserSession.uid = false;
+    await reconnect(setOffline);
+    await expect.waitForSteps([replayedCall(signedOutMove.value)]);
+    browserSession.uid = ownUid;
+
+    // A lead move and a contact rename are refused for another reason.
+    await setOffline(true);
+    await moveLeadCard("Lead 2", STAGE_QUALIFIED, 1);
+    const [refusedMove] = leadKeys(2);
+    const partnerRename = queuePartnerRename(plugin, partnerId);
+    const refusedCalls = [refusedMove, partnerRename].map((key) =>
+        replayedCall(plugin._ormToSync()[key].value)
+    );
+    moveRejection.reject = true;
+    renameRejection.reject = true;
+    await reconnect(setOffline);
+    await expect.waitForSteps(refusedCalls);
+    moveRejection.reject = false;
+    renameRejection.reject = false;
+
+    // A lead edit saved in its form and an activity scheduled on another lead are
+    // sent from this user's tab once another user has signed in on the browser: the
+    // server refuses them as sent in another user's session.
+    await openLead(1);
+    await setOffline(true);
+    await contains(".o_field_widget[name=name] input").edit("Lead 1 renamed");
+    await contains(".o_form_button_save").click();
+    await goBack();
+    expect.verifyErrors([LEAD_GROUPS_LOAD]);
+    const [ownEdit] = leadKeys(1);
+    const ownActivity = queueLeadActivity(plugin, 3, "Own call", ownUid);
+    const elsewhereCalls = [ownEdit, ownActivity].map((key) =>
+        replayedCall(plugin._ormToSync()[key].value)
+    );
+    browserSession.uid = otherUid;
+    await reconnect(setOffline);
+    await expect.waitForSteps(elsewhereCalls);
+    // Parked as any refused replay: no dialog opens.
+    expect(".modal").toHaveCount(0);
+
+    // The other user's tab, once this user has signed in again: its lead edit is
+    // refused the same way.
+    browserSession.uid = ownUid;
+    await switchUser(otherUid);
+    await setOffline(true);
+    const foreignEdit = queueLeadRename(plugin, 1, "Foreign Refused");
+    const foreignCall = replayedCall(plugin._ormToSync()[foreignEdit].value);
+    await reconnect(setOffline);
+    await expect.waitForSteps([foreignCall]);
+    expect(plugin._ormToSync()[foreignEdit].value.extras.error).toBe(originError);
+
+    // Each refused call is parked in the store with the server's error.
+    const snapshot = await storedQueue(plugin);
+    const parkedErrors = {
+        [signedOutMove.key]: "odoo.http.session.SessionExpiredException - user is not connected",
+        [refusedMove]: "odoo.exceptions.UserError - Move refused",
+        [partnerRename]: "odoo.exceptions.UserError - Rename refused",
+        [ownEdit]: originError,
+        [ownActivity]: originError,
+        [foreignEdit]: originError,
+    };
+    expect(Object.keys(snapshot).sort()).toEqual(Object.keys(parkedErrors).sort());
+    for (const [key, error] of Object.entries(parkedErrors)) {
+        expect(JSON.parse(snapshot[key]).extras.error).toBe(error);
+    }
+    const ownKeys = [signedOutMove.key, refusedMove, ownEdit, ownActivity];
+
+    // This user signs in again: their session loads each of their calls as stored,
+    // parked with its error, with the contact rename and without the other user's
+    // call.
+    await switchUser(ownUid);
+    expectQueuedAsStored(plugin, snapshot, [...ownKeys, partnerRename]);
+    await getService("action").doAction(PIPELINE_ACTION.id, { clearBreadcrumbs: true });
+
+    // The pipeline shows the leads of the parked calls, and the activity, as failed,
+    // and nothing of the other user's call.
+    expect(pipelineLeadNames()).not.toInclude("Foreign Refused");
+    if (isSmall()) {
+        for (const name of ["Lead 1 renamed", "Lead 2", "Lead 4"]) {
+            const card = await revealLeadCard(name);
+            expect(`${card} .o_crm_mobile_pending_sync`).toHaveText("Sync failed");
+            expect(`${card} .o_crm_mobile_pending_sync`).toHaveClass("text-bg-danger");
+        }
+        const card = await revealLeadCard("Lead 3");
+        await contains(`${card} .o_crm_mobile_lead_activities_button`).click();
+        const row = ".o_crm_mobile_activity_pending:contains(Own call)";
+        expect(`${row} .o_crm_mobile_pending_sync`).toHaveText("Sync failed");
+        expect(`${row} .o_crm_mobile_pending_sync`).toHaveClass("text-bg-danger");
+        await contains(".o_bottom_sheet_backdrop").click();
+        await animationFrame();
+        expect(".o_bottom_sheet").toHaveCount(0);
+    }
+
+    // The systray lists every call of this session in error, with the server's
+    // message: for the edit and the activity, that it was sent in another user's
+    // session and not applied.
+    await openSystray();
+    const systrayItem = (name) =>
+        `.o_offline_systray_content .o-dropdown-item:contains(${name}) div.text-truncate`;
+    expect(
+        queryAllTexts(".o_offline_systray_content .o-dropdown-item div.text-danger").sort()
+    ).toEqual(["Lead 1 renamed", "Lead 2", "Lead 3", "Lead 4", "Partner"]);
+    expect(systrayItem("Lead 1 renamed")).toHaveAttribute("data-tooltip", ORIGIN_ERROR_MESSAGE);
+    expect(systrayItem("Lead 3")).toHaveAttribute("data-tooltip", ORIGIN_ERROR_MESSAGE);
+    await press("Escape");
+    await animationFrame();
+
+    // Reconnected, the replay sends none of them, nor does the next one after a new
+    // load of the queue: they stay queued and stored as they were.
+    await setOffline(true);
+    await reconnect(setOffline);
+    expect(plugin.syncingORM()).toBe(false);
+    expectQueuedAsStored(plugin, snapshot, [...ownKeys, partnerRename]);
+    await plugin._updateScheduledORMList();
+    await setOffline(true);
+    await reconnect(setOffline);
+    expectQueuedAsStored(plugin, snapshot, [...ownKeys, partnerRename]);
+    await expectStoredAsBefore(plugin, snapshot, Object.keys(parkedErrors));
+    expect.verifySteps([]);
+    expect(env["crm.lead"].browse(1)[0].name).toBe("Lead 1");
+    expect(env["mail.activity"].search_count([["summary", "=", "Own call"]])).toBe(0);
+
+    // Discarded from the systray, the edit and the activity leave the queue and the
+    // store: the lead shows its server values, and the sheet no longer lists the
+    // activity. The other calls stay parked as they were.
+    await discardFromSystray("Lead 1 renamed");
+    if (queryFirst(".o_offline_systray_content")) {
+        await press("Escape");
+        await animationFrame();
+    }
+    await discardFromSystray("Lead 3");
+    await animationFrame();
+    const kept = [signedOutMove.key, refusedMove, partnerRename];
+    expectQueuedAsStored(plugin, snapshot, kept);
+    await expectStoredAsBefore(plugin, snapshot, [...kept, foreignEdit]);
+    if (isSmall()) {
+        const card = await revealLeadCard("Lead 1");
+        expect(pipelineLeadNames()).not.toInclude("Lead 1 renamed");
+        expect(`${card} .o_crm_mobile_pending_sync`).toHaveCount(0);
+        await contains(
+            `${await revealLeadCard("Lead 3")} .o_crm_mobile_lead_activities_button`
+        ).click();
+        expect(".o_crm_mobile_lead_activities_sheet:contains(Own call)").toHaveCount(0);
+        await contains(".o_bottom_sheet_backdrop").click();
+        await animationFrame();
+    }
+
+    // The other user's session loads that user's call, parked as stored, with the
+    // contact rename, and none of this user's calls.
+    await switchUser(otherUid);
+    expectQueuedAsStored(plugin, snapshot, [foreignEdit, partnerRename]);
+    await expectStoredAsBefore(plugin, snapshot, [...kept, foreignEdit]);
+    expect.verifySteps([]);
+});
+
+// -----------------------------------------------------------------------------
 // Lead form reconciliation: the displayed lead after its queued calls replay or
 // are discarded, with the changes the form restored from the queue and the edits
 // made since
@@ -9844,7 +12593,7 @@ test("[Offline] reopened lead with a queued probability and won shows 100%", asy
     await contains(WON_BUTTON).click();
     expect(".ribbon:contains(Won)").toHaveCount(1);
     expect(".o_field_widget[name=probability]").toHaveText("100.00");
-    const context = callContext(PIPELINE_ACTION.context);
+    const context = queuedContext(PIPELINE_ACTION.context);
     const calls = [
         {
             model: "crm.lead",
@@ -9900,15 +12649,21 @@ test("[Offline] replay of a reopened lead's queued stage and won resends nothing
     // The replay writes stage B, then the won stage; the reconciliation saves the
     // rename only, never the replayed stage again.
     const context = callContext(PIPELINE_ACTION.context);
+    const replayContext = queuedContext(PIPELINE_ACTION.context);
     await reconnect(setOffline);
     await expect.waitForSteps([
         {
             model: "crm.lead",
             method: "web_save",
             args: [[1], { stage_id: STAGE_QUALIFIED }],
-            kwargs: { context, specification: {} },
+            kwargs: { context: replayContext, specification: {} },
         },
-        { model: "crm.lead", method: "action_set_won", args: [[1]], kwargs: { context } },
+        {
+            model: "crm.lead",
+            method: "action_set_won",
+            args: [[1]],
+            kwargs: { context: replayContext },
+        },
         {
             model: "crm.lead",
             method: "web_save",
@@ -9941,9 +12696,14 @@ test("[Offline] replay of a reopened lead's queued stage and won resends nothing
             model: "crm.lead",
             method: "web_save",
             args: [[2], { stage_id: STAGE_QUALIFIED }],
-            kwargs: { context, specification: {} },
+            kwargs: { context: replayContext, specification: {} },
         },
-        { model: "crm.lead", method: "action_set_won", args: [[2]], kwargs: { context } },
+        {
+            model: "crm.lead",
+            method: "action_set_won",
+            args: [[2]],
+            kwargs: { context: replayContext },
+        },
     ]);
     await animationFrame();
     expect.verifySteps([]);
@@ -10190,7 +12950,7 @@ test("[Offline] edits made while the replay reconciliation loads are kept", asyn
             model: "crm.lead",
             method: "web_save",
             args: [[1], { name: "Lead 1 offline" }],
-            kwargs: { context, specification: {} },
+            kwargs: { context: queuedContext(PIPELINE_ACTION.context), specification: {} },
         },
     ]);
     await contains(".o_field_widget[name=phone] input").edit("+32 470 12 34 56");
@@ -10269,7 +13029,7 @@ test("[Offline] discarding a reopened lead's queued save keeps the later edits o
             model: "crm.lead",
             method: "web_save",
             args: [[1], { phone: "+32 470 55 55 55" }],
-            kwargs: { context: callContext(PIPELINE_ACTION.context), specification: {} },
+            kwargs: { context: queuedContext(PIPELINE_ACTION.context), specification: {} },
         },
     ]);
     expect.verifyErrors([LEAD_GROUPS_LOAD, LEAD_RECORD_LOAD, LEAD_RECORD_LOAD]);
@@ -10412,7 +13172,7 @@ test("[Offline] lead form tracks only the queued calls of the displayed lead", a
                 model: "crm.lead",
                 method: `action_${label.toLowerCase()}`,
                 args: [[1]],
-                kwargs: { context: callContext(PIPELINE_ACTION.context) },
+                kwargs: { context: queuedContext(PIPELINE_ACTION.context) },
             },
         ]);
         expect([...form.crmOwnKeys]).toEqual([parked.key]);
