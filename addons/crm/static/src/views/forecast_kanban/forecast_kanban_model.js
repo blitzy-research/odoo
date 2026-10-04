@@ -73,6 +73,12 @@ export class ForecastKanbanModel extends CrmKanbanModel {
             forceRecompute,
         });
     }
+
+    /**
+     * The forecast is never available offline (CRM offline scope): never mark it visited.
+     * @override
+     */
+    _setAvailableOffline() {}
 }
 
 ForecastKanbanModel.services = [...CrmKanbanModel.services, "fillTemporalService"];

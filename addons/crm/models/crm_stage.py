@@ -74,3 +74,9 @@ class CrmStage(models.Model):
             elif won_leads and not vals.get('is_won'):
                 won_leads._compute_probabilities()
         return res
+
+    def web_save(self, vals, specification, next_id=None):
+        """ Refuse a save queued offline by another user (``crm.lead``
+        ``_check_offline_queue_origin``); saving itself is unchanged. """
+        self.env['crm.lead']._check_offline_queue_origin()
+        return super().web_save(vals, specification, next_id=next_id)

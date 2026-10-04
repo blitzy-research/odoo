@@ -1,0 +1,111 @@
+// Mobile quick-create styles; logical spacing follows the sheet's writing direction.
+
+// The framework sheet holding the form. Its `min-height: var(--sheet-height)` keeps
+// it as tall as its last measurement, and stays applied while the framework
+// re-measures it on a viewport change, so that height could only grow: the sheet
+// would keep the room of a validation message gone since. It takes its content's
+// height instead; its `max-height` still caps it at the viewport.
+.o_bottom_sheet_sheet:has(> .o_bottom_sheet_body > .o_crm_mobile_quick_create) {
+    min-height: auto;
+}
+
+// The framework sheet body, the one scroll container of the form (the sheet's rail
+// scrolls the whole sheet). Its block-end scroll padding is the sticky Save/Cancel
+// row (a touch-target button between the row's block paddings) and the gap above
+// it, so a field scrolled into view stops above that row, focus ring included,
+// instead of under it.
+.o_bottom_sheet_body:has(> .o_crm_mobile_quick_create) {
+    scroll-padding-block-end: calc(44px + #{$spacer} + var(--offcanvas-padding-y));
+}
+
+.o_crm_mobile_quick_create {
+    --CrmMobileQuickCreate-gap: #{$spacer * 0.5};
+    --CrmMobileQuickCreate-touchTarget: 44px;
+    // Darker error text keeps the WCAG AA 4.5:1 text contrast on the sheet background;
+    // the invalid field border keeps the standard danger colour.
+    --#{$prefix}form-invalid-color: #{shade-color($form-feedback-invalid-color, 20%)};
+
+    display: flex;
+    flex-direction: column;
+    gap: var(--CrmMobileQuickCreate-gap);
+    width: 100%;
+
+    .o_crm_mobile_quick_create_row {
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+
+        .form-label {
+            margin-block-end: $spacer * 0.25;
+        }
+    }
+
+    .o_crm_mobile_quick_create_field {
+        width: 100%;
+        min-width: var(--CrmMobileQuickCreate-touchTarget);
+        min-height: var(--CrmMobileQuickCreate-touchTarget);
+        // At least 16px, so iOS Safari does not zoom the page into a focused control
+        // (the backend base font size is 14px). Interpolated because LibSass cannot
+        // evaluate `max()` across rem and px.
+        font-size: #{"max(1rem, 16px)"};
+        // One radius for the inputs and the stage select: the backend resets the
+        // radius of text, number, email and tel inputs (not of selects) over
+        // `.form-control`'s.
+        border-radius: $input-border-radius;
+        // Field borders keep the WCAG AA 3:1 component boundary contrast on the sheet
+        // background. Bootstrap's border colour property, not `border-color`, so the focus,
+        // hover and invalid border colours still apply.
+        --#{$prefix}border-color: #{$o-gray-600};
+
+        // Placeholder text keeps the WCAG AA 4.5:1 text contrast on the sheet background.
+        &::placeholder {
+            color: #{$o-gray-700};
+        }
+
+        // One focus ring for every field: `.form-select` has a halo only, where
+        // `.form-control` adds a solid ring. An invalid field keeps Bootstrap's
+        // invalid focus style.
+        &:focus:not(.is-invalid) {
+            border-color: $input-focus-border-color;
+            box-shadow: $input-focus-box-shadow;
+        }
+
+        // The required name is outlined darker than the other fields, as the
+        // framework's phone form outlines its required fields, unless it is invalid
+        // or focused. The other fields already have that form's required grey, for
+        // their contrast, so the name takes the darkest grey, which keeps about that
+        // form's contrast between the two outlines.
+        &:required:not(.is-invalid):not(:focus) {
+            border-color: var(--gray-900);
+        }
+    }
+
+    // Sticky at the bottom of the sheet body, so Save and Cancel stay in view while
+    // the fields scroll. The body's padding insets its sticky area, hence the
+    // negative `bottom` and margins: the row reaches the body's padding edges, its
+    // bottom is the sheet's, and no scrolled field shows below or beside it; its
+    // own padding keeps the buttons where the body's padding would.
+    .o_crm_mobile_quick_create_buttons {
+        position: sticky;
+        bottom: calc(-1 * var(--offcanvas-padding-y));
+        z-index: 1;
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--CrmMobileQuickCreate-gap);
+        margin-inline: calc(-1 * var(--offcanvas-padding-x));
+        margin-block-end: calc(-1 * var(--offcanvas-padding-y));
+        padding: var(--CrmMobileQuickCreate-gap) var(--offcanvas-padding-x)
+            var(--offcanvas-padding-y);
+        background-color: $dropdown-bg;
+
+        .btn {
+            // A zero flex basis splits the row into two equal halves; with the
+            // default `auto` basis each button would be sized by its own label.
+            // The `max-content` floor keeps a label on one line: a row too narrow
+            // for both labels wraps a whole button instead.
+            flex: 1 1 0;
+            min-width: max-content;
+            min-height: var(--CrmMobileQuickCreate-touchTarget);
+        }
+    }
+}

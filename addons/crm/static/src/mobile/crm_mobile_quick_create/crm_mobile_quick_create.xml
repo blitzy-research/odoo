@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+    <!--
+        Component validation replaces native bubbles; submit through onSubmit. The
+        sheet body already pads the form; the title takes the focus on open.
+    -->
+    <t t-name="crm.CrmMobileQuickCreate">
+        <form class="o_crm_mobile_quick_create d-flex flex-column gap-2"
+            tabindex="-1"
+            t-att-aria-labelledby="this.fieldId('title')"
+            t-ref="this.rootRef"
+            t-on-focusin="this.onFocusIn"
+            t-on-submit.prevent="this.onSubmit"
+            novalidate="">
+            <h4 class="o_crm_mobile_quick_create_title mb-1" tabindex="-1" t-att-id="this.fieldId('title')" t-ref="this.headingRef">New Lead</h4>
+
+            <div class="o_crm_mobile_quick_create_row">
+                <label class="form-label" t-att-for="this.fieldId('name')">Lead name</label>
+                <input type="text"
+                    class="form-control o_crm_mobile_quick_create_field"
+                    t-att-class="{ 'is-invalid o_field_invalid': this.state.invalidName }"
+                    t-att-id="this.fieldId('name')"
+                    name="name"
+                    required=""
+                    autocomplete="off"
+                    placeholder="e.g. Product Pricing"
+                    t-ref="this.nameRef"
+                    t-model.proxy="this.state.name"
+                    t-on-input="this.onNameInput"
+                    t-att-aria-invalid="this.state.invalidName ? 'true' : false"
+                    t-att-aria-describedby="this.state.invalidName ? this.fieldId('name_feedback') : false"
+                    data-available-offline="1"/>
+                <div t-if="this.state.invalidName"
+                    class="invalid-feedback d-block"
+                    role="alert"
+                    t-att-id="this.fieldId('name_feedback')">A lead name is required.</div>
+            </div>
+
+            <div class="o_crm_mobile_quick_create_row">
+                <label class="form-label" t-att-for="this.fieldId('contact_name')">Contact name</label>
+                <input type="text"
+                    class="form-control o_crm_mobile_quick_create_field"
+                    t-att-id="this.fieldId('contact_name')"
+                    name="contact_name"
+                    autocomplete="name"
+                    t-model.proxy="this.state.contact_name"
+                    data-available-offline="1"/>
+            </div>
+
+            <div class="o_crm_mobile_quick_create_row">
+                <label class="form-label" t-att-for="this.fieldId('phone')">Phone</label>
+                <input type="tel"
+                    class="form-control o_crm_mobile_quick_create_field"
+                    t-att-id="this.fieldId('phone')"
+                    name="phone"
+                    inputmode="tel"
+                    autocomplete="tel"
+                    t-model.proxy="this.state.phone"
+                    data-available-offline="1"/>
+            </div>
+
+            <div class="o_crm_mobile_quick_create_row">
+                <label class="form-label" t-att-for="this.fieldId('email_from')">Email</label>
+                <!-- Text with the email keyboard: the lead's email accepts any text, a display name and address included, so no browser email rule applies. -->
+                <input type="text"
+                    class="form-control o_crm_mobile_quick_create_field"
+                    t-att-id="this.fieldId('email_from')"
+                    name="email_from"
+                    inputmode="email"
+                    autocomplete="email"
+                    autocapitalize="off"
+                    spellcheck="false"
+                    t-model.proxy="this.state.email_from"
+                    data-available-offline="1"/>
+            </div>
+
+            <div class="o_crm_mobile_quick_create_row">
+                <label class="form-label" t-att-for="this.fieldId('expected_revenue')">Expected revenue</label>
+                <!-- Negative amounts are valid, as in the lead form. -->
+                <input type="number"
+                    class="form-control o_crm_mobile_quick_create_field"
+                    t-att-class="{ 'is-invalid o_field_invalid': this.state.invalidRevenue }"
+                    t-att-id="this.fieldId('expected_revenue')"
+                    name="expected_revenue"
+                    inputmode="decimal"
+                    t-att-min="-this.revenueLimit"
+                    t-att-max="this.revenueLimit"
+                    step="any"
+                    t-ref="this.revenueRef"
+                    t-model.proxy="this.state.expected_revenue"
+                    t-on-input="this.onRevenueInput"
+                    t-att-aria-invalid="this.state.invalidRevenue ? 'true' : false"
+                    t-att-aria-describedby="this.state.invalidRevenue ? this.fieldId('expected_revenue_feedback') : false"
+                    data-available-offline="1"/>
+                <div t-if="this.state.invalidRevenue"
+                    class="invalid-feedback d-block"
+                    role="alert"
+                    t-att-id="this.fieldId('expected_revenue_feedback')"
+                    t-out="this.revenueFeedback"/>
+            </div>
+
+            <div class="o_crm_mobile_quick_create_row">
+                <label class="form-label" t-att-for="this.fieldId('stage_id')">Stage</label>
+                <!-- .number keeps state.stage_id a number: options are selected by strict equality with stage.id -->
+                <select class="form-select o_crm_mobile_quick_create_field"
+                    t-att-class="{ 'is-invalid o_field_invalid': this.state.invalidStage }"
+                    t-att-id="this.fieldId('stage_id')"
+                    name="stage_id"
+                    t-ref="this.stageRef"
+                    t-model.proxy.number="this.state.stage_id"
+                    t-on-change="this.onStageChange"
+                    t-att-aria-invalid="this.state.invalidStage ? 'true' : false"
+                    t-att-aria-describedby="this.state.invalidStage ? this.fieldId('stage_id_feedback') : false"
+                    data-available-offline="1">
+                    <option t-foreach="this.props.stages" t-as="stage" t-key="stage.id"
+                        t-att-value="stage.id"
+                        t-out="stage.display_name"/>
+                </select>
+                <div t-if="this.state.invalidStage"
+                    class="invalid-feedback d-block"
+                    role="alert"
+                    t-att-id="this.fieldId('stage_id_feedback')">Select a stage from the list.</div>
+            </div>
+
+            <div class="o_crm_mobile_quick_create_buttons d-flex gap-2">
+                <!-- Offline where the queue cannot hold the create (non-secure origin), the framework disables Save, and Enter with it. -->
+                <button type="submit"
+                    class="btn btn-primary flex-grow-1 o_crm_mobile_quick_create_save"
+                    t-att-disabled="this.state.isSaving"
+                    t-att-aria-busy="this.state.isSaving ? 'true' : false"
+                    t-att-data-available-offline="this.crmOffline.isOfflineQueueBlocked() ? false : '1'">Save</button>
+                <button type="button"
+                    class="btn btn-secondary flex-grow-1 o_crm_mobile_quick_create_cancel"
+                    t-on-click="this.onCancel"
+                    data-available-offline="1">Cancel</button>
+            </div>
+        </form>
+    </t>
+
+</templates>

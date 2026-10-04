@@ -332,6 +332,16 @@
                             </a>
                         </div>
                     </xpath>
+                    <xpath expr="//div[hasclass('o_kanban_card_manage_settings')]//a[@type='open']" position="attributes">
+                        <attribute name="t-att-class">widget.crm_offline ? 'o_disabled_offline pe-none' : ''</attribute>
+                        <attribute name="t-att-aria-disabled">widget.crm_offline ? 'true' : false</attribute>
+                        <attribute name="t-att-tabindex">widget.crm_offline ? -1 : false</attribute>
+                        <!-- t-key re-creates the link on each connectivity change, so an open
+                             menu's dropdown refreshes its keyboard-navigable items; inert keeps
+                             the link from taking any focus while offline. -->
+                        <attribute name="t-key">widget.crm_offline ? 'crm_offline' : 'crm_online'</attribute>
+                        <attribute name="t-att-inert">widget.crm_offline ? '' : false</attribute>
+                    </xpath>
                 </data>
             </field>
         </record>

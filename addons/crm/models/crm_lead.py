@@ -12,7 +12,7 @@ from markupsafe import Markup
 from odoo import api, fields, models, modules, tools
 from odoo.addons.iap.tools import iap_tools
 from odoo.addons.phone_validation.tools import phone_validation
-from odoo.exceptions import UserError, AccessError, ValidationError
+from odoo.exceptions import UserError, AccessError, ConcurrencyError, ValidationError
 from odoo.fields import Domain
 from odoo.tools.translate import _
 from odoo.tools import email_normalize_all, is_html_empty, groupby, parse_contact_from_email, SQL
@@ -79,6 +79,29 @@ PARTNER_ADDRESS_FIELDS_TO_SYNC = [
 # computation time, number of transaction and transaction time.
 PLS_COMPUTE_BATCH_STEP = 50000  # PREFETCH_MAX = 1000 but larger cluster can speed up global computation
 PLS_UPDATE_BATCH_STEP = 5000
+
+# Delivery key of a lead create sent by the mobile quick create, online or replayed
+# from the offline queue (context key, see `web_save`), and the external identifier
+# module under which it is registered with the lead it created.
+CRM_OFFLINE_CREATE_KEY = 'crm_offline_create_key'
+CRM_OFFLINE_CREATE_MODULE = '__crm_offline__'
+CRM_OFFLINE_CREATE_KEY_RE = re.compile(r'[0-9a-f]{32}')
+# Context key of the id of the user who queued a call in the web client's offline
+# queue, see `_check_offline_queue_origin`.
+CRM_OFFLINE_UID_KEY = 'crm_offline_uid'
+
+
+class CrmOfflineOriginError(AccessError):
+    """ A call queued in the web client's offline queue, sent in the session of
+    another user than the one who queued it, and refused before anything was
+    read or written (``_check_offline_queue_origin``, keyed ``web_save``).
+
+    The web client parks a refused replay under the JSON-RPC error name, this
+    class's full path ``odoo.addons.crm.models.crm_lead.CrmOfflineOriginError``,
+    and its message. Nothing was applied; the call stays parked like any other
+    refusal, and the user who queued it sees the error in the offline systray
+    of their own session, where they discard it or save the change again.
+    """
 
 
 class CrmLead(models.Model):
@@ -970,7 +993,9 @@ class CrmLead(models.Model):
 
     def unlink(self):
         """ Update meetings when removing opportunities, otherwise you have
-        a link to a record that does not lead anywhere. """
+        a link to a record that does not lead anywhere. A deletion queued
+        offline by another user is refused (``_check_offline_queue_origin``). """
+        self._check_offline_queue_origin()
         meetings = self.env['calendar.event'].search([
             ('res_id', 'in', self.ids),
             ('res_model', '=', self._name),
@@ -981,6 +1006,118 @@ class CrmLead(models.Model):
                 'res_model_id': False,
             })
         return super().unlink()
+
+    def web_save(self, vals, specification, next_id=None):
+        """ Create a lead at most once per delivery key of the mobile quick create.
+
+        The web client replays its offline queue at least once: a create whose
+        answer was lost (the server committed it, then the connection dropped)
+        stays queued and is sent again verbatim, possibly from another tab or
+        after a reload. The quick create therefore sends a delivery key of 32
+        lowercase hexadecimal digits in the ``CRM_OFFLINE_CREATE_KEY`` context
+        key, the same for every delivery of one create. The first delivery
+        creates the lead and registers the key as its external identifier
+        ``__crm_offline__.<key>``: an ``ir.model.data`` row, so the lead model
+        gains no field. A later delivery of that key by the lead's creator
+        creates and writes nothing and answers as the first one did; a key
+        registered by another user is refused. Of two concurrent deliveries of
+        one key, only the first registers it: the unique ``(module, name)``
+        index fails the later one's registration with a serialization failure,
+        so the RPC layer rolls that delivery back with the lead it created and
+        retries it, and the retry answers with the lead the first one created.
+
+        A delivery is bound to the user who queued it: the web client sends that
+        user's id as ``uid`` in the context of every call, its queued ones
+        included, and a browser shared by several users must not deliver one
+        user's create in the session of the next one. A keyed create whose
+        context ``uid`` names another user than the caller is refused
+        (``CrmOfflineOriginError``) before anything is looked up, created or
+        registered, so the queued call is parked with that error and nothing is
+        delivered. A context without an integer ``uid`` (Python callers) is not
+        checked.
+
+        Everything runs under the caller's rights except the ``ir.model.data``
+        lookup and registration, made as superuser on that fixed module with a
+        validated key. Deleting a lead deletes its external identifiers (base
+        ``unlink``), so a delivery after the deletion creates the lead again.
+        Writes, and creates without a valid key (desktop, lead forms, any other
+        caller), keep the base behaviour.
+
+        Any save, keyed or not, queued offline by another user than the caller
+        is refused first (``_check_offline_queue_origin``).
+        """
+        self._check_offline_queue_origin()
+        key = self.env.context.get(CRM_OFFLINE_CREATE_KEY)
+        if self or not isinstance(key, str) or not CRM_OFFLINE_CREATE_KEY_RE.fullmatch(key):
+            return super().web_save(vals, specification, next_id=next_id)
+
+        origin_uid = self.env.context.get('uid')
+        if isinstance(origin_uid, int) and not isinstance(origin_uid, bool) and origin_uid != self.env.uid:
+            raise CrmOfflineOriginError(_("This offline change was sent in another user's session and was not applied."))
+
+        # the key only selects the delivery: the save itself sees the caller's context
+        leads = self.with_context({k: v for k, v in self.env.context.items() if k != CRM_OFFLINE_CREATE_KEY})
+        IrModelData = self.env['ir.model.data'].sudo()
+        data = IrModelData.search([('module', '=', CRM_OFFLINE_CREATE_MODULE), ('name', '=', key)], limit=1)
+        if data:
+            delivered = self.sudo().browse(data.res_id).exists() if data.model == self._name else None
+            if delivered is None or (delivered and delivered.create_uid.id != self.env.uid):
+                raise AccessError(_("This lead was already created by another user."))
+            if delivered:
+                return leads.browse(next_id or delivered.id).with_context(bin_size=True).web_read(specification)
+
+        # with a next_id, base web_save would answer that record: keep the created id
+        result = super(CrmLead, leads).web_save(vals, {} if next_id else specification)
+        if data:
+            # an external identifier left by a lead deleted without the ORM
+            data.res_id = result[0]['id']
+        else:
+            # Registered in SQL rather than through the ORM. Under the cursor's
+            # repeatable read snapshot, a registration of this key committed by a
+            # concurrent delivery after the lookup above makes the insert raise a
+            # serialization failure, which the RPC layer retries; the ORM create
+            # would raise a unique violation, which it answers as a validation
+            # error. The expected failure is not logged as a bad query.
+            now = self.env.cr.now()
+            self.env.cr.execute(SQL(
+                """ INSERT INTO ir_model_data
+                        (module, name, model, res_id, noupdate, create_uid, create_date, write_uid, write_date)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (module, name) DO NOTHING
+                    RETURNING id """,
+                CRM_OFFLINE_CREATE_MODULE, key, self._name, result[0]['id'], True,
+                self.env.uid, now, self.env.uid, now,
+            ), log_exceptions=False)
+            if not self.env.cr.fetchone():
+                # registered by a delivery the lookup above should have found:
+                # never answer without the key registered, have the call retried
+                raise ConcurrencyError(f"Delivery key {key} of a {self._name} create was registered concurrently")
+        if next_id:
+            return leads.browse(next_id).with_context(bin_size=True).web_read(specification)
+        return result
+
+    @api.model
+    def _check_offline_queue_origin(self):
+        """ Refuse a call queued offline by another user than the caller.
+
+        The web client keeps one offline queue per browser, shared by every
+        session of that browser, and pages that do not load the CRM client code
+        (website, portal) replay it in whatever session they have. The CRM web
+        client therefore queues each call of ``crm.lead``, ``crm.stage``,
+        ``crm.team`` and ``mail.activity`` with the id of the user queuing it in
+        the ``CRM_OFFLINE_UID_KEY`` context key. A call whose key names another
+        user than the caller is refused (``CrmOfflineOriginError``) before
+        anything is read or written, so the web client parks it with that error
+        and nothing is applied. Calls without that integer key (online calls,
+        server code) are not checked. Every method the CRM offline queue
+        replays calls this check, of this model and of the other ones.
+
+        :raise CrmOfflineOriginError: (an ``AccessError``) when the call was
+            queued by another user
+        """
+        origin_uid = self.env.context.get(CRM_OFFLINE_UID_KEY)
+        if isinstance(origin_uid, int) and not isinstance(origin_uid, bool) and origin_uid != self.env.uid:
+            raise CrmOfflineOriginError(_("This offline change was sent in another user's session and was not applied."))
 
     @api.model
     def _read_group_stage_ids(self, stages, domain):
@@ -1029,10 +1166,18 @@ class CrmLead(models.Model):
     # ACTIONS
     # ------------------------------------------------------------
 
+    def action_archive(self):
+        """ Refuse an archiving queued offline by another user
+        (``_check_offline_queue_origin``); archiving itself is unchanged. """
+        self._check_offline_queue_origin()
+        return super().action_archive()
+
     def action_unarchive(self):
         """ When re-activating, force update probability for both leads and
         opportunities. Note that archiving triggers nothing more, as a lead
-        can be archived and not lost. """
+        can be archived and not lost. A re-activation queued offline by
+        another user is refused (``_check_offline_queue_origin``). """
+        self._check_offline_queue_origin()
         activated = self.filtered(lambda rec: not rec.active)
         res = super().action_unarchive()
         if activated:
@@ -1056,7 +1201,9 @@ class CrmLead(models.Model):
         return res
 
     def action_set_won(self):
-        """ Won semantic: stage.is_won (AND probability = 100 but implied) """
+        """ Won semantic: stage.is_won (AND probability = 100 but implied).
+        Won queued offline by another user is refused (``_check_offline_queue_origin``). """
+        self._check_offline_queue_origin()
         self.action_unarchive()
         # group the leads by team_id, in order to write once by values couple (each write leads to frequency increment)
         leads_by_won_stage = {}
