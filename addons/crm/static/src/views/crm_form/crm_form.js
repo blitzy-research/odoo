@@ -42,6 +42,7 @@ import {
     crmReportError,
     crmReturnFocusFromSheet,
     getCrmActivitySubfields,
+    isCrmOfflineQueueBlocked,
     isFieldMapping,
     useCrmOffline,
 } from "@crm/mobile/crm_offline_hooks";
@@ -127,6 +128,12 @@ class CrmFormRecord extends formView.Model.Record {
         if (this.resModel !== "crm.lead") {
             return super._save(...arguments);
         }
+        // Online, while the running replay has still to send a queued write of the lead,
+        // the save is sent after it (`_crmAwaitLeadReplay`); any other save starts at once.
+        const leadReplay = this._crmAwaitLeadReplay();
+        if (leadReplay) {
+            await leadReplay;
+        }
         // Runs before the force-save statements below, which stay as they are: after a
         // partner change whose onchange was lost, the email and phone it superseded
         // are not written, online or offline (`_crmDropStaleForcedContacts`), nor
@@ -164,6 +171,80 @@ class CrmFormRecord extends formView.Model.Record {
             await checkRainbowmanMessage(this.model.orm, this.model.effect, this.resId);
         }
         return res;
+    }
+
+    /**
+     * Holds an online save of the lead until the running replay has sent the lead's
+     * queued writes. The replay sends each queued call with the values it held when
+     * it was queued, in queue order and one call a second, so a save sent while a
+     * write of the lead is still to be replayed reaches the server first and is then
+     * overwritten by it, although the user made it last.
+     *
+     * The save is released once no pending (not parked) queued `crm.lead` call
+     * writing a field of the lead remains (`crmWrittenLeadFields`), once the replay
+     * ends, or once the connection is lost (the save is then queued, merged into the
+     * record's still-queued save). It waits in the model mutex, as any save does:
+     * edits made meanwhile apply after it, and the form's buttons stay disabled. The
+     * queue is left as it is.
+     *
+     * Nothing is held for a record without an id (no queued write targets it), for an
+     * urgent save (the page is being left, and its beacon cannot wait), offline, when
+     * no replay runs, or for a save without an edit of the user (`_crmHasOwnEdits`).
+     *
+     * @returns {Promise<void>|undefined} resolved once the save may be sent;
+     *   `undefined` when it may be sent at once
+     */
+    _crmAwaitLeadReplay() {
+        if (!untrack(() => this._crmIsLeadReplayPending() && this._crmHasOwnEdits())) {
+            return undefined;
+        }
+        let stop;
+        const released = new Promise((resolve) => {
+            // Created outside any computation, so that only `stop` disposes of it. Its
+            // first run is synchronous, and it runs again on every change of the
+            // connection, sync or queue signals it reads.
+            stop = untrack(() =>
+                effect(() => {
+                    if (!this._crmIsLeadReplayPending()) {
+                        resolve();
+                    }
+                })
+            );
+        });
+        return released.then(() => stop());
+    }
+
+    /**
+     * Whether the save writes an edit of the user: a change other than a value
+     * restored from the record's queued save and unmodified since
+     * (`crmRestoredUnmodifiedFields`). Such a value is the one its queued save sends,
+     * so writing it before that save's replay overwrites nothing (a form left during
+     * the replay saves it at once).
+     *
+     * @returns {boolean}
+     */
+    _crmHasOwnEdits() {
+        const restored = this.crmRestoredUnmodifiedFields();
+        return Object.keys(this._getChanges()).some(
+            (fieldName) => fieldName !== "id" && !restored.includes(fieldName)
+        );
+    }
+
+    /**
+     * Whether an online save of the lead waits for the running replay
+     * (`_crmAwaitLeadReplay`). It reads the plugin's connection, sync and queue
+     * signals, so that an effect calling it follows them.
+     *
+     * @returns {boolean}
+     */
+    _crmIsLeadReplayPending() {
+        const plugin = this.model.offlinePlugin;
+        if (!this.resId || this.model._urgentSave || plugin.isOffline() || !plugin.syncingORM()) {
+            return false;
+        }
+        return this._crmLeadQueuedCalls().some(
+            ({ value }) => !value.extras?.error && crmWrittenLeadFields(value).length > 0
+        );
     }
 
     /**
@@ -1857,6 +1938,10 @@ export class CrmFormController extends formView.Controller {
      * `action_set_won` (the server picks the won stage at replay; no rainbowman
      * lookup) and shows the lead as won. Returns `false` so the button stops here.
      *
+     * A lead has one queued won: while its won call is pending, a repeated click (such
+     * as the second click of a double-click, landing before the render that hides the
+     * button) queues nothing more. A parked won is not pending, so a new click queues.
+     *
      * @returns {Promise<false>}
      */
     async crmQueueMarkWon() {
@@ -1865,6 +1950,12 @@ export class CrmFormController extends formView.Controller {
             return false;
         }
         if (!root.resId) {
+            return false;
+        }
+        const pendingWon = this.crmFindPending(root.resId, ["action_set_won"]);
+        if (pendingWon) {
+            this.crmCurrentOwnKeys().add(pendingWon.key);
+            root.applyOfflineWon();
             return false;
         }
         const extras = getScheduleORMExtras(this.model, [root]);
@@ -1957,6 +2048,23 @@ export class CrmFormController extends formView.Controller {
         }
         await super.onRootLoaded(...arguments);
         this.crmApplyQueuedState();
+    }
+
+    /**
+     * @override
+     * A root first shown from the cache is updated with the server's read when that
+     * read differs: the read replaces the loaded values while keeping the changes,
+     * which drops the local state `onRootLoaded` applied for the lead's queued calls
+     * (won, archived, the values of its other queued saves). That state is applied
+     * again (`crmApplyQueuedState`), so it survives reopening the lead while the
+     * calls wait, parked ones included. Nothing is applied once the controller is
+     * destroyed.
+     */
+    onRootUpdated() {
+        super.onRootUpdated(...arguments);
+        if (status(this) !== "destroyed") {
+            this.crmApplyQueuedState();
+        }
     }
 
     /**
@@ -2287,10 +2395,55 @@ registry.category("views").add("crm_form", {
  * before `rotting_statusbar_duration` for this `js_class` only). Its template adds
  * `data-available-offline` to every statusbar button and dropdown stage item, so a
  * stage can be chosen offline (the change is queued by the record's offline save).
- * The attribute has no effect online.
+ * The attribute has no effect online. Offline where the framework queue cannot hold
+ * that save (`isCrmOfflineQueueBlocked`), the attribute is dropped, the buttons get
+ * the framework's disabled offline state, and no stage can be chosen.
  */
 export class CrmStatusBarField extends RottingStatusBarDurationField {
     static template = "crm.RottingStatusBarDurationField";
+
+    setup() {
+        super.setup();
+        this.offlinePlugin = usePlugin(OfflinePlugin);
+    }
+
+    /** Whether the statusbar controls carry `data-available-offline`, read on every render. */
+    get crmAvailableOffline() {
+        return !isCrmOfflineQueueBlocked(this.offlinePlugin);
+    }
+
+    /**
+     * The framework's offline class of a statusbar button its template disables while
+     * the stage save cannot be queued, given only to a button not disabled otherwise,
+     * as the framework gives it.
+     *
+     * @param {boolean} [disabled] whether the button is disabled otherwise
+     * @returns {string}
+     */
+    crmOfflineDisabledClass(disabled) {
+        return disabled || this.crmAvailableOffline ? "" : "o_disabled_offline";
+    }
+
+    /**
+     * Stage items of a menu opened before such a disconnection are spans, which the
+     * framework does not disable: they get its disabled style instead.
+     */
+    getDropdownItemClassNames(item) {
+        const classNames = super.getDropdownItemClassNames(item);
+        return this.crmAvailableOffline ? classNames : `${classNames} o_disabled_offline`.trim();
+    }
+
+    /**
+     * Inert where the stage save cannot be queued (a stage item of a menu opened
+     * before the disconnection, a command-palette shortcut), so no unsaved stage is
+     * left on the lead.
+     */
+    async selectItem(item) {
+        if (!this.crmAvailableOffline) {
+            return;
+        }
+        return super.selectItem(...arguments);
+    }
 }
 
 registry.category("fields").add("crm_form.rotting_statusbar_duration", {

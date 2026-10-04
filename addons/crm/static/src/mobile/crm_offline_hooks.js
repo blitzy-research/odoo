@@ -18,11 +18,15 @@ import {
 } from "@odoo/owl";
 import { MailComposerFormRenderer } from "@mail/chatter/web/mail_composer_form";
 import { ActivityButton } from "@mail/core/web/activity_button";
+import { Avatar } from "@mail/views/web/fields/avatar/avatar";
+import { MailActivityMixinListRescheduleDropdown } from "@mail/views/web/list/mail_activity_list_reschedule";
 import { AutoComplete } from "@web/core/autocomplete/autocomplete";
 import { browser } from "@web/core/browser/browser";
 // The `loadState()` guard must inspect the state the action service itself falls
 // back to when called without arguments (the web client's boot): `router.current`.
 import { router } from "@web/core/browser/router";
+import { datetimePickerService } from "@web/core/datetime/datetimepicker_service";
+import { useDropdownState } from "@web/core/dropdown/dropdown_hooks";
 import { getActiveHotkey } from "@web/core/hotkeys/hotkey_service";
 import { ConnectionLostError, rpcBus } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
@@ -36,11 +40,13 @@ import { patch } from "@web/core/utils/patch";
 import { getTabableElements } from "@web/core/utils/ui";
 import { Record } from "@web/model/relational_model/record";
 import { getScheduleORMExtras } from "@web/model/relational_model/utils";
-import { useEnv } from "@web/owl2/utils";
+import { useEnv, useSubEnv } from "@web/owl2/utils";
 import { ActionMenus } from "@web/search/action_menus/action_menus";
 import { session } from "@web/session";
 import { CardRenderer } from "@web/views/card/card_renderer";
+import { kanbanColorPickerField } from "@web/views/fields/kanban_color_picker/kanban_color_picker_field";
 import { Many2ManyTagsField } from "@web/views/fields/many2many_tags/many2many_tags_field";
+import { KanbanMany2One } from "@web/views/fields/many2one/many2one";
 import { Many2XAutocomplete } from "@web/views/fields/relational_utils";
 import { FormController } from "@web/views/form/form_controller";
 import { KanbanDropdownMenuWrapper } from "@web/views/kanban/kanban_dropdown_menu_wrapper";
@@ -318,6 +324,20 @@ export function isCrmOfflineButtonCall(params) {
  */
 export function isCrmOfflineQueueUsable() {
     return Boolean(window.isSecureContext);
+}
+
+/**
+ * Offline where the framework queue cannot hold a call (`isCrmOfflineQueueUsable`):
+ * a CRM control whose offline action queues one then drops `data-available-offline`,
+ * so the framework disables it with its `o_disabled_offline` state, and its action
+ * does nothing. The connection signal of `plugin` is read first, so a render calling
+ * it follows the connection. Always `false` online and in a secure context.
+ *
+ * @param {OfflinePlugin} [plugin]
+ * @returns {boolean}
+ */
+export function isCrmOfflineQueueBlocked(plugin) {
+    return Boolean(plugin?.isOffline()) && !isCrmOfflineQueueUsable();
 }
 
 /**
@@ -1556,7 +1576,7 @@ export function useCrmOffline() {
          * online and in a secure context, where those controls are unchanged.
          */
         isOfflineQueueBlocked() {
-            return isOffline() && !isCrmOfflineQueueUsable();
+            return isCrmOfflineQueueBlocked(plugin);
         },
 
         /** Small-screen (mobile) layout, read live on every access. */
@@ -2989,15 +3009,78 @@ patch(ActionMenus.prototype, {
 });
 
 // -----------------------------------------------------------------------------
-// Guard: Sales Teams dashboard cards
+// Guard: Sales Teams dashboard cards and lead cards
 // -----------------------------------------------------------------------------
 
+/**
+ * Whether a card is a lead whose form cannot open offline: offline, not sample data,
+ * and its form not visited for the current action, the test by which the framework
+ * dims the card (`KanbanRecord.getCardClasses`). Scope tested first; the signals are
+ * read on each call, so a menu or card rendered online follows the connection.
+ *
+ * @param {CardRenderer} card
+ * @returns {boolean}
+ */
+function isCrmLeadFormUnavailableOffline(card) {
+    const { record } = card.props;
+    return (
+        record.resModel === "crm.lead" &&
+        card.offlinePlugin.isOffline() &&
+        !record.model.useSampleModel &&
+        !card.offlinePlugin.isAvailableOffline(card.env.config?.actionId, "form", record.resId)
+    );
+}
+
 patch(KanbanRecord.prototype, {
+    /**
+     * Whether the card-menu toggle carries `data-available-offline` (`web.KanbanMenu`
+     * extension): on lead cards, whose menu items are queued or available offline,
+     * except where the framework queue cannot hold their calls
+     * (`isCrmOfflineQueueBlocked`), so the framework disables the toggle there.
+     */
+    get crmMenuAvailableOffline() {
+        return (
+            this.props.record.resModel === "crm.lead" &&
+            !isCrmOfflineQueueBlocked(this.offlinePlugin)
+        );
+    },
+
+    /**
+     * Offline, a team card whose click goes nowhere is dimmed, also when its team
+     * form was visited online (the framework dims a card only by the offline
+     * availability of its form): the dashboard card action is stopped by the
+     * button-execution guard, and the team form a card opens by the view-mount
+     * guard. A selection dialog's card (`forceGlobalClick`) selects its team
+     * offline, and sample cards are inert.
+     */
+    getCardClasses() {
+        const classes = super.getCardClasses(...arguments);
+        const { canOpenRecords, forceGlobalClick, openAction, record } = this.props;
+        if (
+            record.resModel !== "crm.team" ||
+            forceGlobalClick ||
+            !(openAction || canOpenRecords) ||
+            record.model.useSampleModel ||
+            !this.offlinePlugin.isOffline()
+        ) {
+            return classes;
+        }
+        const classList = classes.split(" ");
+        return classList.includes("o_disabled_offline")
+            ? classes
+            : [...classList, "o_disabled_offline"].join(" ");
+    },
+
+    /**
+     * Offline, opening a team card (its "Configuration" link) or a lead card whose
+     * form cannot open offline (`isCrmLeadFormUnavailableOffline`, the lead menu's
+     * "Edit") does nothing: no form load is requested.
+     */
     triggerAction(params) {
         if (
             (params?.type === "open" || params?.type === "edit") &&
-            this.props.record.resModel === "crm.team" &&
-            this.offlinePlugin.isOffline()
+            ((this.props.record.resModel === "crm.team" && this.offlinePlugin.isOffline()) ||
+                isCrmLeadFormUnavailableOffline(this))
         ) {
             return;
         }
@@ -3013,6 +3096,15 @@ patch(CardRenderer.prototype, {
         this.dataState.widget = {
             ...widget,
             /**
+             * `widget.editable`, read by the lead card menu's "Edit": its original
+             * value, except `false` for a lead whose form cannot open offline
+             * (`isCrmLeadFormUnavailableOffline`), so the menu offers no Edit that
+             * cannot open. Evaluated lazily, so an open menu follows the connection.
+             */
+            get editable() {
+                return widget.editable && !isCrmLeadFormUnavailableOffline(renderer);
+            },
+            /**
              * `widget.crm_offline`, read by the team card "Configuration" link: the
              * team scope is tested first and evaluated lazily, so it follows props.
              */
@@ -3026,11 +3118,73 @@ patch(CardRenderer.prototype, {
     },
 });
 
+/** Models whose card colour write is queued offline (`web.KanbanColorPickerField` extension). */
+const CRM_QUEUED_COLOR_MODELS = freezeSet(["crm.lead", "crm.team"]);
+
+/**
+ * @param {Object} field a `kanban_color_picker` field component
+ * @returns {boolean} whether its record is a CRM one whose colour write cannot be
+ *  queued now (`isCrmOfflineQueueBlocked`); scope tested first
+ */
+function isCrmColorWriteBlocked(field) {
+    const { record } = field.props;
+    return (
+        CRM_QUEUED_COLOR_MODELS.has(record.resModel) &&
+        isCrmOfflineQueueBlocked(record.model?.offlinePlugin)
+    );
+}
+
+patch(kanbanColorPickerField.component.prototype, {
+    /**
+     * Whether the colour buttons carry `data-available-offline`: on lead and
+     * sales-team records, whose colour write is queued offline, except where the
+     * queue cannot hold it, so the framework disables them there.
+     */
+    get crmColorAvailableOffline() {
+        const { record } = this.props;
+        return (
+            CRM_QUEUED_COLOR_MODELS.has(record.resModel) &&
+            !isCrmOfflineQueueBlocked(record.model?.offlinePlugin)
+        );
+    },
+
+    /**
+     * Inert where the colour write cannot be queued, so no unsaved colour is left on
+     * the card (a click racing the framework's disabling, or a direct call).
+     */
+    selectColor() {
+        if (isCrmColorWriteBlocked(this)) {
+            return;
+        }
+        return super.selectColor(...arguments);
+    },
+});
+
 /**
  * Menu items a CRM guard disables offline: the team card "Configuration" link
  * (`widget.crm_offline`) is the only `.dropdown-item` that gets this state.
  */
 const CRM_OFFLINE_DISABLED_MENU_ITEM = ".dropdown-item.o_disabled_offline[aria-disabled='true']";
+
+/**
+ * Whether a click inside a card menu was aimed at an offline-disabled item: on the
+ * item itself (a script's click), or on the `[role=menuitem]` cell holding it,
+ * which is where a pointer click lands, since the inert `pe-none` item takes none.
+ *
+ * @param {EventTarget|null} target
+ */
+function isCrmOfflineDisabledMenuClick(target) {
+    if (!(target instanceof Element)) {
+        return false;
+    }
+    if (target.closest(CRM_OFFLINE_DISABLED_MENU_ITEM)) {
+        return true;
+    }
+    return (
+        target.matches("[role='menuitem']") &&
+        Boolean(target.querySelector(CRM_OFFLINE_DISABLED_MENU_ITEM))
+    );
+}
 
 patch(KanbanDropdownMenuWrapper.prototype, {
     /**
@@ -3051,6 +3205,84 @@ patch(KanbanDropdownMenuWrapper.prototype, {
         };
         onMounted(excludeOfflineDisabledItems);
         onPatched(excludeOfflineDisabledItems);
+    },
+
+    /**
+     * A click on an offline-disabled item does nothing, so it keeps the menu open:
+     * a team menu opened online cannot be reopened offline (its toggle is
+     * disabled), and closing it would make its queued colour picker unreachable.
+     * The item's `href="#"` is not followed either, as that navigation closes the
+     * menu too.
+     */
+    onClick(ev) {
+        if (isCrmOfflineDisabledMenuClick(ev?.target ?? null)) {
+            ev.preventDefault();
+            return;
+        }
+        return super.onClick(...arguments);
+    },
+});
+
+/**
+ * The team leader of a dashboard card (`many2one_avatar_user` on `user_id`) is a
+ * `KanbanMany2One`, whose quick-assign (no leader set) saves the record: a
+ * `crm.team` `web_save` of the leader. Offline that is team management, as on the
+ * team form, so it is disabled; the card colour stays the only team write
+ * reachable offline. The field's props hold no record, so the view's model
+ * (`env.model`, whose root is `crm.team` on the dashboard) scopes it; lead cards
+ * and every other model are left as they are.
+ */
+patch(KanbanMany2One.prototype, {
+    /** Closes an assign popover opened online as soon as the connection drops. */
+    setup() {
+        super.setup(...arguments);
+        this.crmOfflinePlugin = usePlugin(OfflinePlugin);
+        useEffect(() => {
+            if (this.crmOfflineAssignGuarded) {
+                untrack(() => this.assignPopover.isOpen && this.assignPopover.close());
+            }
+        });
+    },
+
+    /**
+     * True for a Sales Teams card's quick-assign while offline (scope tested
+     * first). Read by the `web.KanbanMany2One` extension, so the link renders
+     * disabled and follows the connection.
+     */
+    get crmOfflineAssignGuarded() {
+        return this.env.model?.root?.resModel === "crm.team" && this.crmOfflinePlugin.isOffline();
+    },
+
+    /** Offline, a team card opens no assign popover, which also stops a direct call. */
+    openAssignPopover() {
+        if (this.crmOfflineAssignGuarded) {
+            return;
+        }
+        return super.openAssignPopover(...arguments);
+    },
+});
+
+/**
+ * A dashboard card's leader avatar opens mail's avatar card, whose contact read
+ * (`/mail/store`) fails offline with an uncaught `ConnectionLostError`. Offline, a
+ * team's avatar opens no card, so that decorative read is skipped. Scoped by the
+ * view's model as the quick-assign above; an avatar card opened online stays open
+ * with what it has loaded.
+ */
+patch(Avatar.prototype, {
+    setup() {
+        super.setup(...arguments);
+        this.crmOfflinePlugin = usePlugin(OfflinePlugin);
+    },
+
+    get canOpenPopover() {
+        const canOpen = super.canOpenPopover;
+        if (!canOpen) {
+            return canOpen;
+        }
+        return !(
+            this.env.model?.root?.resModel === "crm.team" && this.crmOfflinePlugin.isOffline()
+        );
     },
 });
 
@@ -3138,6 +3370,72 @@ patch(ActivityButton.prototype, {
             return Promise.resolve();
         }
         return super.onClick(...arguments);
+    },
+});
+
+// -----------------------------------------------------------------------------
+// Guard: lead activity reschedule dropdown (mail_activity_mixin_list_reschedule_dropdown)
+// -----------------------------------------------------------------------------
+
+/**
+ * @param {MailActivityMixinListRescheduleDropdown} dropdown
+ * @returns {boolean} whether a lead's reschedule dropdown is offline (scope tested first)
+ */
+function isLeadRescheduleOffline(dropdown) {
+    const { record } = dropdown.props;
+    return record.resModel === "crm.lead" && Boolean(record.model?.offlinePlugin?.isOffline());
+}
+
+/** Env key under which a reschedule dropdown collects the date pickers of its menu. */
+const CRM_RESCHEDULE_PICKERS = Symbol("crmReschedulePickers");
+
+/**
+ * Collects the date pickers created under a reschedule dropdown (its custom-date
+ * item). A picker closes on click-away, or when its input leaves its parent, but not
+ * when the menu holding that input closes, so the dropdown closes them itself.
+ * Pickers created anywhere else are untouched.
+ */
+patch(datetimePickerService, {
+    start() {
+        const service = super.start(...arguments);
+        const { create } = service;
+        service.create = function crmRescheduleCreate(params, options) {
+            const manager = create.call(this, params, options);
+            const pickers = options?.useOwlHooks && useEnv()[CRM_RESCHEDULE_PICKERS];
+            if (pickers) {
+                pickers.add(manager);
+                onWillDestroy(() => pickers.delete(manager));
+            }
+            return manager;
+        };
+        return service;
+    },
+});
+
+/**
+ * The "Reschedule" dropdown of the Opportunities list. Its items reschedule through
+ * `doActionButton`, whose CRM guard stops the call offline, and the framework
+ * disables its toggle `<button>`. The `mail.MailActivityMixinListRescheduleDropdown`
+ * extension hands this state to its `Dropdown`, so a lead's menu opened online, and
+ * the date picker opened from it, close as soon as the connection drops, as does a
+ * menu opened by any other path while offline.
+ */
+patch(MailActivityMixinListRescheduleDropdown.prototype, {
+    setup() {
+        super.setup(...arguments);
+        this.crmRescheduleState = useDropdownState();
+        const pickers = new Set();
+        useSubEnv({ [CRM_RESCHEDULE_PICKERS]: pickers });
+        useEffect(() => {
+            if (isLeadRescheduleOffline(this) && this.crmRescheduleState.isOpen) {
+                untrack(() => {
+                    for (const picker of pickers) {
+                        picker.close();
+                    }
+                    this.crmRescheduleState.close();
+                });
+            }
+        });
     },
 });
 

@@ -176,32 +176,47 @@
 
     <!--
         Mail retargets only the after dropdown; before/all-stages need the plain
-        variant. Both variants mark stage choices available offline.
+        variant. Both variants mark stage choices available offline, except where the
+        queue cannot hold the stage save (crmAvailableOffline, CrmStatusBarField),
+        where they are announced disabled instead.
     -->
     <t t-name="crm.StatusBarDurationField.Dropdown" t-inherit="mail.StatusBarDurationField.Dropdown" t-inherit-mode="primary">
         <xpath expr="//DropdownItem" position="attributes">
-            <attribute name="attrs">{'data-available-offline': '1'}</attribute>
+            <attribute name="attrs">this.crmAvailableOffline ? {'data-available-offline': '1'} : {'aria-disabled': 'true'}</attribute>
         </xpath>
     </t>
 
     <t t-name="crm.StatusBarField.Dropdown" t-inherit="web.StatusBarField.Dropdown" t-inherit-mode="primary">
         <xpath expr="//DropdownItem" position="attributes">
-            <attribute name="attrs">{'data-available-offline': '1'}</attribute>
+            <attribute name="attrs">this.crmAvailableOffline ? {'data-available-offline': '1'} : {'aria-disabled': 'true'}</attribute>
         </xpath>
     </t>
 
+    <!--
+        Where the queue cannot hold the stage save, the buttons lose the attribute and
+        are disabled with the framework's offline state by this template itself: Owl
+        re-applies t-att-disabled on every render, which would undo the framework's.
+    -->
     <t t-name="crm.RottingStatusBarDurationField" t-inherit="mail.RottingStatusBarDurationField" t-inherit-mode="primary">
         <xpath expr="//button[@t-ref='this.afterRef']" position="attributes">
-            <attribute name="data-available-offline">1</attribute>
+            <attribute name="t-att-data-available-offline">this.crmAvailableOffline ? '1' : false</attribute>
+            <attribute name="t-att-disabled" add="!this.crmAvailableOffline" separator=" || "/>
+            <attribute name="t-attf-class">{{ this.crmOfflineDisabledClass(this.props.isDisabled) }}</attribute>
         </xpath>
         <xpath expr="//button[@role='radio']" position="attributes">
-            <attribute name="data-available-offline">1</attribute>
+            <attribute name="t-att-data-available-offline">this.crmAvailableOffline ? '1' : false</attribute>
+            <attribute name="t-att-disabled" add="!this.crmAvailableOffline" separator=" || "/>
+            <attribute name="t-attf-class">{{ this.crmOfflineDisabledClass(this.props.isDisabled || item.isSelected) }}</attribute>
         </xpath>
         <xpath expr="//button[@t-ref='this.beforeRef']" position="attributes">
-            <attribute name="data-available-offline">1</attribute>
+            <attribute name="t-att-data-available-offline">this.crmAvailableOffline ? '1' : false</attribute>
+            <attribute name="t-att-disabled" add="!this.crmAvailableOffline" separator=" || "/>
+            <attribute name="t-attf-class">{{ this.crmOfflineDisabledClass(this.props.isDisabled) }}</attribute>
         </xpath>
         <xpath expr="//button[@t-ref='this.dropdownRef']" position="attributes">
-            <attribute name="data-available-offline">1</attribute>
+            <attribute name="t-att-data-available-offline">this.crmAvailableOffline ? '1' : false</attribute>
+            <attribute name="t-att-disabled" add="!this.crmAvailableOffline" separator=" || "/>
+            <attribute name="t-attf-class">{{ this.crmOfflineDisabledClass(this.props.isDisabled) }}</attribute>
         </xpath>
         <xpath expr="//t[@t-call='mail.StatusBarDurationField.Dropdown']" position="attributes">
             <attribute name="t-call">crm.StatusBarDurationField.Dropdown</attribute>
@@ -257,17 +272,40 @@
         </xpath>
     </t>
 
-    <!-- Card-menu toggle of lead cards: every item of the menu is queued or available offline. -->
-    <t t-inherit="web.KanbanMenu" t-inherit-mode="extension">
-        <xpath expr="//button[@title='Dropdown menu']" position="attributes">
-            <attribute name="t-att-data-available-offline">this.props.record.resModel === 'crm.lead' ? '1' : false</attribute>
+    <!-- Reschedule dropdown of activity-mixin lists: a state the CRM guard closes when a lead's connection drops (crmRescheduleState, crm_offline_hooks.js). -->
+    <t t-inherit="mail.MailActivityMixinListRescheduleDropdown" t-inherit-mode="extension">
+        <xpath expr="//Dropdown" position="attributes">
+            <attribute name="state">this.crmRescheduleState</attribute>
         </xpath>
     </t>
 
-    <!-- Colour buttons of lead and sales-team cards: their colour write is queued offline. -->
+    <!--
+        Card-menu toggle of lead cards: every item of the menu is queued or available
+        offline, except where the queue cannot hold a call (crmMenuAvailableOffline,
+        crm_offline_hooks.js).
+    -->
+    <t t-inherit="web.KanbanMenu" t-inherit-mode="extension">
+        <xpath expr="//button[@title='Dropdown menu']" position="attributes">
+            <attribute name="t-att-data-available-offline">this.crmMenuAvailableOffline ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <!--
+        Colour buttons of lead and sales-team cards: their colour write is queued
+        offline, except where the queue cannot hold it (crmColorAvailableOffline,
+        crm_offline_hooks.js).
+    -->
     <t t-inherit="web.KanbanColorPickerField" t-inherit-mode="extension">
         <xpath expr="//button[@role='menuitem']" position="attributes">
-            <attribute name="t-att-data-available-offline">['crm.lead', 'crm.team'].includes(this.props.record.resModel) ? '1' : false</attribute>
+            <attribute name="t-att-data-available-offline">this.crmColorAvailableOffline ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <!-- Team-leader quick-assign of sales-team cards is not a button: disabled while offline (crmOfflineAssignGuarded, crm_offline_hooks.js); it keeps its tabindex of -1. -->
+    <t t-inherit="web.KanbanMany2One" t-inherit-mode="extension">
+        <xpath expr="//a[hasclass('o_quick_assign')]" position="attributes">
+            <attribute name="t-att-class">this.crmOfflineAssignGuarded ? 'o_disabled_offline pe-none' : ''</attribute>
+            <attribute name="t-att-aria-disabled">this.crmOfflineAssignGuarded ? 'true' : false</attribute>
         </xpath>
     </t>
 

@@ -12,7 +12,7 @@ from markupsafe import Markup
 from odoo import api, fields, models, modules, tools
 from odoo.addons.iap.tools import iap_tools
 from odoo.addons.phone_validation.tools import phone_validation
-from odoo.exceptions import UserError, AccessError, ValidationError
+from odoo.exceptions import UserError, AccessError, ConcurrencyError, ValidationError
 from odoo.fields import Domain
 from odoo.tools.translate import _
 from odoo.tools import email_normalize_all, is_html_empty, groupby, parse_contact_from_email, SQL
@@ -1020,9 +1020,11 @@ class CrmLead(models.Model):
         ``__crm_offline__.<key>``: an ``ir.model.data`` row, so the lead model
         gains no field. A later delivery of that key by the lead's creator
         creates and writes nothing and answers as the first one did; a key
-        registered by another user is refused. The unique ``(module, name)``
-        index makes two concurrent deliveries of one key fail rather than
-        create two leads.
+        registered by another user is refused. Of two concurrent deliveries of
+        one key, only the first registers it: the unique ``(module, name)``
+        index fails the later one's registration with a serialization failure,
+        so the RPC layer rolls that delivery back with the lead it created and
+        retries it, and the retry answers with the lead the first one created.
 
         A delivery is bound to the user who queued it: the web client sends that
         user's id as ``uid`` in the context of every call, its queued ones
@@ -1070,13 +1072,26 @@ class CrmLead(models.Model):
             # an external identifier left by a lead deleted without the ORM
             data.res_id = result[0]['id']
         else:
-            IrModelData.create({
-                'module': CRM_OFFLINE_CREATE_MODULE,
-                'name': key,
-                'model': self._name,
-                'res_id': result[0]['id'],
-                'noupdate': True,
-            })
+            # Registered in SQL rather than through the ORM. Under the cursor's
+            # repeatable read snapshot, a registration of this key committed by a
+            # concurrent delivery after the lookup above makes the insert raise a
+            # serialization failure, which the RPC layer retries; the ORM create
+            # would raise a unique violation, which it answers as a validation
+            # error. The expected failure is not logged as a bad query.
+            now = self.env.cr.now()
+            self.env.cr.execute(SQL(
+                """ INSERT INTO ir_model_data
+                        (module, name, model, res_id, noupdate, create_uid, create_date, write_uid, write_date)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (module, name) DO NOTHING
+                    RETURNING id """,
+                CRM_OFFLINE_CREATE_MODULE, key, self._name, result[0]['id'], True,
+                self.env.uid, now, self.env.uid, now,
+            ), log_exceptions=False)
+            if not self.env.cr.fetchone():
+                # registered by a delivery the lookup above should have found:
+                # never answer without the key registered, have the call retried
+                raise ConcurrencyError(f"Delivery key {key} of a {self._name} create was registered concurrently")
         if next_id:
             return leads.browse(next_id).with_context(bin_size=True).web_read(specification)
         return result

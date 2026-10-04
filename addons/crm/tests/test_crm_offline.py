@@ -13,7 +13,7 @@ from odoo import fields
 from odoo.exceptions import AccessError
 from odoo.tests import HttpCase
 from odoo.tests.common import JsonRpcException, tagged
-from odoo.tools import file_open
+from odoo.tools import file_open, mute_logger
 
 from odoo.addons.crm.models.crm_lead import CrmOfflineOriginError
 from odoo.addons.crm.tests.common import TestCrmCommon
@@ -759,6 +759,60 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self.assertEqual(self._quick_create(salesman, vals, first_key), first)
         self.assertEqual(self.env['crm.lead'].search_count([('name', '=', 'Twin Lead')]), 2)
 
+    def test_offline_quick_create_replay_concurrent_delivery(self):
+        """ A delivery whose lookup does not see the key a concurrent delivery
+        registered (a registration committed after its snapshot) creates a lead
+        it cannot register the key for. It is rolled back with that lead and
+        retried by the RPC layer, and the retry answers with the lead the first
+        delivery created: no error reaches the web client, which would park a
+        create that succeeded, and none is logged. The lookup of the first
+        attempt is made blind to the registration, which happens in the same
+        transaction, so the retry is deterministic. """
+        salesman = self.user_sales_salesman
+        key = secrets.token_hex(16)
+        vals = {
+            'name': 'Concurrent Delivery Lead',
+            'contact_name': '',
+            'phone': '',
+            'email_from': '',
+            'expected_revenue': 20.0,
+            'stage_id': self.stage_gen_1.id,
+        }
+        first = self._quick_create(salesman, vals, key)
+        lead = self.env['crm.lead'].browse(first[0]['id'])
+        self.assertEqual(self._quick_create_xmlids(key).res_id, lead.id)
+
+        IrModelData = self.registry['ir.model.data']
+        search = IrModelData.search
+        key_domain = [('module', '=', '__crm_offline__'), ('name', '=', key)]
+        blind_lookups = []
+
+        def search_blind_once(records, domain, *args, **kwargs):
+            if domain == key_domain and not blind_lookups:
+                blind_lookups.append(domain)
+                return records.browse()
+            return search(records, domain, *args, **kwargs)
+
+        self.authenticate(salesman.login, salesman.login)
+        call = {
+            'model': 'crm.lead',
+            'method': 'web_save',
+            'args': [[], vals],
+            'kwargs': {
+                'context': dict(self.pipeline_context, crm_offline_create_key=key, uid=salesman.id),
+                'specification': {},
+            },
+        }
+        with patch.object(IrModelData, 'search', search_blind_once):
+            redelivered = self.make_jsonrpc_request('/web/dataset/call_kw/crm.lead/web_save', call)
+        self.assertEqual(blind_lookups, [key_domain], 'The first attempt did not see the registration')
+        self.assertEqual(redelivered, first, 'The retry answers with the lead the first delivery created')
+        self.assertEqual(
+            self.env['crm.lead'].with_context(active_test=False).search([('name', '=', vals['name'])]), lead,
+            'The lead of the attempt that could not register the key was rolled back',
+        )
+        self.assertEqual(self._quick_create_xmlids(key).res_id, lead.id)
+
     def test_offline_quick_create_replay_key_of_another_user(self):
         """ A delivery key registered by another user's create is refused: the
         lead is neither returned nor created again. """
@@ -826,7 +880,7 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
                 'specification': {},
             },
         }
-        with self.assertRaises(JsonRpcException) as refused:
+        with self.assertRaises(JsonRpcException) as refused, mute_logger('odoo.http'):
             self.make_jsonrpc_request('/web/dataset/call_kw/crm.lead/web_save', call)
         # the JSON-RPC error's data.name
         self.assertEqual(refused.exception.args[0], 'odoo.addons.crm.models.crm_lead.CrmOfflineOriginError')
@@ -1128,7 +1182,7 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
                 'specification': {},
             },
         }
-        with self.assertRaises(JsonRpcException) as refused:
+        with self.assertRaises(JsonRpcException) as refused, mute_logger('odoo.http'):
             self.make_jsonrpc_request('/web/dataset/call_kw/crm.lead/web_save', call)
         # the JSON-RPC error's data.name
         self.assertEqual(refused.exception.args[0], 'odoo.addons.crm.models.crm_lead.CrmOfflineOriginError')

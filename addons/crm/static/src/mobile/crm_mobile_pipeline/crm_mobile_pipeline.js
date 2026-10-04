@@ -675,7 +675,8 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         /**
          * Text of the pipeline's sync status region: the outcome of the last replay
          * that had CRM entries to replay. It is cleared when entries are queued
-         * again, so that the next outcome is announced even when it reads the same.
+         * again, so that the next outcome is announced even when it reads the same,
+         * and once a discard leaves no parked entry to report as failed.
          */
         this.crmSyncStatus = signal("");
         let hasQueuedEntries = false;
@@ -705,6 +706,11 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         const disarmAfterDiscard = () => {
             if (!this.isMobile || !hasEntriesToReplay()) {
                 hasQueuedEntries = false;
+            }
+            // The discarded changes were never synced: the region is emptied, not
+            // set to "synced", once no parked entry is left to report as failed.
+            if (!hasParkedEntries()) {
+                this.crmSyncStatus.set("");
             }
         };
         this.crmOffline.onEntriesDiscarded("crm.lead", () => {

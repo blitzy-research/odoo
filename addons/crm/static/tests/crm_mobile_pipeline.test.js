@@ -6657,6 +6657,61 @@ test("mobile pipeline announces the outcome of a replay of offline changes", asy
 });
 
 test.tags("mobile");
+test("mobile pipeline clears the replay failure announcement once no parked change remains", async () => {
+    // The server rejects every replayed write: each queued stage change is parked.
+    onRpc("crm.lead", "web_save", () => {
+        throw makeServerError({ message: "Stage is locked" });
+    });
+    const setOffline = mockOffline();
+    await mountWithCleanup(WebClient);
+    await openAction(ACTION_ID);
+    const badge = (name) => `${card(name)} .o_crm_mobile_pending_sync`;
+    expect(PIPELINE_SYNC_STATUS).toHaveText("");
+
+    // Offline, two cards move their lead to "Qualified": both replays are rejected,
+    // and the failure is announced.
+    await setOffline(true);
+    await contains(`${card("Desk Upgrade")} .o_crm_mobile_lead_stage`).select(String(QUALIFIED));
+    await contains(`${card("Quote for Chairs")} .o_crm_mobile_lead_stage`).select(
+        String(QUALIFIED)
+    );
+    await reconnect(setOffline);
+    const parked = queued("crm.lead");
+    expect(parked.map(({ args }) => args)).toEqual([
+        [[3], { stage_id: QUALIFIED }],
+        [[2], { stage_id: QUALIFIED }],
+    ]);
+    expect(parked.every(({ extras }) => extras.error.includes("Stage is locked"))).toBe(true);
+    expect(PIPELINE_SYNC_STATUS).toHaveText("Some offline changes failed to sync");
+    await contains(".o_crm_mobile_pipeline_next").click();
+    expect(cardNames()).toEqual([
+        "Conference Room",
+        "Lamps",
+        "Storage Racks",
+        "Quote for Chairs",
+        "Desk Upgrade",
+    ]);
+    expect(badge("Quote for Chairs")).toHaveText("Sync failed");
+    expect(badge("Desk Upgrade")).toHaveText("Sync failed");
+
+    // One discarded in the offline systray: the other stays parked, with "Sync
+    // failed", so the failure is still announced.
+    await discardFirstQueuedCall();
+    expect(queued("crm.lead").map(({ args }) => args)).toEqual([[[2], { stage_id: QUALIFIED }]]);
+    expect(cardNames()).toEqual(["Conference Room", "Lamps", "Storage Racks", "Quote for Chairs"]);
+    expect(badge("Quote for Chairs")).toHaveText("Sync failed");
+    expect(PIPELINE_SYNC_STATUS).toHaveText("Some offline changes failed to sync");
+
+    // The last one discarded: no failure is left to announce, and the region stays,
+    // empty, for the next outcome.
+    await discardFirstQueuedCall();
+    expect(queued("crm.lead")).toEqual([]);
+    expect(PIPELINE_SYNC_STATUS).toHaveCount(1);
+    expect(PIPELINE_SYNC_STATUS).toHaveAttribute("role", "status");
+    expect(PIPELINE_SYNC_STATUS).toHaveText("");
+});
+
+test.tags("mobile");
 test("mobile lead card open button is named after its lead and described by its partner, revenue and sync state", async () => {
     // The server rejects the replayed stage change of "Lamps" only.
     onRpc("crm.lead", "web_save", ({ args }) => {

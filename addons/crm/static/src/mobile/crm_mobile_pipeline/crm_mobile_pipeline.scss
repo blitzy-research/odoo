@@ -259,11 +259,20 @@
 // Both classes exist only while offline, so nothing changes online. It covers:
 // - the Late/Today/Future counters of the CRM activity-menu row (only CRM disables an
 //   activity group);
-// - CRM-guarded view buttons (`o_disabled_offline pe-none`) inside a kanban card the
-//   framework dims because its record's form was not visited: "Unassigned Leads" on
-//   the Sales Teams dashboard and the lead counter on campaign cards.
+// - CRM-disabled controls (`o_disabled_offline pe-none`) inside a dimmed kanban card:
+//   "Unassigned Leads" and the team-leader quick-assign on the Sales Teams dashboard,
+//   whose cards are all dimmed offline, and the lead counter on campaign cards, which
+//   the framework dims when their record's form was not visited.
 .o-mail-ActivityGroup.o_disabled_offline .o_disabled_offline,
 .o_crm_team_kanban .o_kanban_record.o_disabled_offline .o_disabled_offline.pe-none,
 .o_utm_kanban .o_kanban_record.o_disabled_offline .o_disabled_offline.pe-none {
     opacity: 1 !important;
+}
+
+// The framework's `.o_disabled_offline { pointer-events: auto !important }` cancels the
+// `pe-none` CRM gives the sales-team leader quick-assign offline, which would then
+// still take hover, focus and clicks. It is kept out of hit-testing, so the pointer
+// reaches its card, which is inert offline. Only CRM disables a quick-assign.
+a.o_quick_assign.o_disabled_offline.pe-none {
+    pointer-events: none !important;
 }
