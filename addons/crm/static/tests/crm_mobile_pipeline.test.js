@@ -7147,10 +7147,24 @@ function mockNonSecureContext() {
 }
 
 /**
+ * Waits until mail's start-up store fetch has completed, as `mockOffline` does
+ * before going offline: under CPU throttling or on a loaded host, that debounced
+ * `/mail/store` request may only leave once the connection is cut, and its
+ * unhandled failure would join the errors the test declares.
+ */
+async function waitForMailStartupFetch() {
+    const store = getService("mail.store");
+    if (store.initialized) {
+        await store.isReadyPromise;
+    }
+}
+
+/**
  * Cuts the connection as the offline tour does, every request failing with an
  * `error` event, but dispatched from its `send`: the failure then comes before
  * the next rendering, as a network failure faster than a frame does. The
- * returned function restores the connection.
+ * returned function restores the connection. Await `waitForMailStartupFetch`
+ * first.
  *
  * @returns {() => void}
  */
@@ -7269,6 +7283,7 @@ test("mobile lead card stage move refused by the queue outside a secure context 
     // The connection drops on the move's save, and the framework cannot queue it:
     // its notification says so, and the lead is not shown as moved, its selector
     // included.
+    await waitForMailStartupFetch();
     const reconnectAtSend = cutConnectionAtSend();
     await contains(`${card("Desk Upgrade")} .o_crm_mobile_lead_stage`).select(String(QUALIFIED));
     await waitFor(`.o_notification:contains(${NON_SECURE_CONTEXT_MESSAGE})`);
@@ -7311,6 +7326,7 @@ test("mobile lead card of an ungrouped list keeps its stage when the move is nei
 
     // The connection drops on the save, and the framework cannot queue it: its
     // notification says so, and the card's selector returns to the lead's stage.
+    await waitForMailStartupFetch();
     const reconnectAtSend = cutConnectionAtSend();
     await contains(lamps).select(String(NEW));
     await waitFor(`.o_notification:contains(${NON_SECURE_CONTEXT_MESSAGE})`);

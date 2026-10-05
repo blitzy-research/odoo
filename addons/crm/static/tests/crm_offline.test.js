@@ -5629,6 +5629,13 @@ async function cancelDialog() {
     await contains(".modal footer button[special=cancel], .modal .o_form_button_cancel").click();
 }
 
+// This test activates every wizard, mail and meeting entry point of the lead form and
+// list offline, then opens each of their dialogs online. Under 3× CPU throttling on
+// the mobile preset it lasts 4 to 4.4 s on an idle host, close to Hoot's 5 s default
+// timeout, and 5.2 to 9 s on a loaded one (11 s on desktop), beyond it (a timed-out
+// test keeps running into the next tests). Its own timeout replaces the runner's, so
+// it stays above the 15 s the suite runners pass.
+test.timeout(30_000);
 test("[Offline] CRM wizards and bound actions unreachable", async () => {
     // Bound actions of `crm.lead` as `get_views` returns them (the mock server sends
     // one toolbar to every view type).
@@ -7377,6 +7384,33 @@ function isMeetingWriteRoute(route) {
     );
 }
 
+/**
+ * Virtual time after which the timers started by the steps of the meeting calendar
+ * tests have all run: the offline plugin's start-up sync (3 s after it starts), its
+ * first connection check (2 s after going offline), its 1 s pause between replayed
+ * calls, and the debounces of views and dialogs.
+ *
+ * Those tests cannot settle with `runAllTimers`: a displayed calendar (FullCalendar)
+ * keeps a "today" timer that waits until the next day, up to 24 h, so `runAllTimers`
+ * would advance a whole day of virtual time and run every short framework interval,
+ * such as the bus election worker's 3 s check, tens of thousands of times. Under 3×
+ * CPU throttling on the mobile preset, that made the lead meeting views test last
+ * 6.7 s, above Hoot's 5 s default timeout; settled this way it lasts 3.2 s.
+ */
+const CALENDAR_SETTLE_MS = 60_000;
+
+/** `settle` (and `flushStartupSync`) of the meeting calendar tests: see `CALENDAR_SETTLE_MS`. */
+async function settleCalendar() {
+    await advanceTime(CALENDAR_SETTLE_MS);
+    await animationFrame();
+}
+
+/** `reconnect` of the meeting calendar tests: see `CALENDAR_SETTLE_MS`. */
+async function reconnectCalendar(setOffline) {
+    await setOffline(false);
+    await settleCalendar();
+}
+
 test("[Offline] lead meeting form opened online saves, sends and queues nothing", async () => {
     const controllers = captureFormControllers();
     let actionMenus = null;
@@ -7566,7 +7600,7 @@ test("[Offline] lead meeting views opened online give way to the offline helper"
                 viewType,
             });
             await waitFor(selector);
-            await flushStartupSync();
+            await settleCalendar();
             await setOffline(true);
             stepping.active = true;
             await animationFrame();
@@ -7575,7 +7609,7 @@ test("[Offline] lead meeting views opened online give way to the offline helper"
             expect.verifySteps([]);
             stepping.active = false;
             // Online, the view loads again.
-            await reconnect(setOffline);
+            await reconnectCalendar(setOffline);
             await waitFor(selector);
             expect(helper).toHaveCount(0);
         }
@@ -7592,7 +7626,7 @@ test("[Offline] lead meeting views opened online give way to the offline helper"
         await animationFrame();
         expect(selector).toHaveCount(1);
         expect(helper).toHaveCount(0);
-        await reconnect(setOffline);
+        await reconnectCalendar(setOffline);
     }
 });
 
@@ -7607,7 +7641,7 @@ test("[Offline] lead meeting quick create opened online keeps its entry and save
         viewType: "calendar",
     });
     await waitFor(".o_calendar_view");
-    await flushStartupSync();
+    await settleCalendar();
     const helper = ".o_action_manager .o_view_nocontent .fa-chain-broken";
     const quickCreateName = ".modal .o_field_widget[name=name] input";
     const name = "Quick proposal call";
@@ -7628,7 +7662,7 @@ test("[Offline] lead meeting quick create opened online keeps its entry and save
     expect(helper).toHaveCount(0);
     expect(".modal .o_form_button_save").not.toBeEnabled();
     forceClick(".modal .o_form_button_save");
-    await settle();
+    await settleCalendar();
     expect(await root.save()).toBe(false);
     expect(root._offlineSave()).toBe(false);
     expect(".modal .o_form_view").toHaveCount(1);
@@ -7647,7 +7681,7 @@ test("[Offline] lead meeting quick create opened online keeps its entry and save
     expect.verifySteps([]);
 
     // Back online, nothing is replayed, and the quick create saves the lead's meeting.
-    await reconnect(setOffline);
+    await reconnectCalendar(setOffline);
     await waitFor(".o_calendar_view");
     expect(queued("calendar.event")).toEqual([]);
     expect.verifySteps([]);
@@ -12194,6 +12228,13 @@ test("[Offline] lead chatter scrolled to its older messages loads none", async (
     expect(thread.hasLoadingFailed).toBe(false);
 });
 
+// This test renders the chatters of a lead and of a partner, 35 messages each, and
+// loads the lead's older messages. Under 3× CPU throttling on the mobile preset it
+// lasts 3.6 to 5.5 s on an idle host, around Hoot's 5 s default timeout, and 4 to
+// 12 s on a loaded one, beyond it (a timed-out test keeps running into the next
+// tests). Its own timeout replaces the runner's, so it stays above the 15 s the suite
+// runners pass.
+test.timeout(30_000);
 test("[Offline] lead chatter load-older handlers called directly fetch nothing", async () => {
     const threadComponents = [];
     patchWithCleanup(Thread.prototype, {
