@@ -357,6 +357,52 @@
         </xpath>
     </t>
 
+    <!--
+        Desktop navbar entries of the blocked CRM menus (crmOfflineMenuAttrs,
+        crm_offline_hooks.js) also carry aria-disabled offline, where the framework
+        dims them. Each attrs object is the framework's, passed through unchanged
+        online and for every other menu.
+    -->
+    <t t-inherit="web.NavBar.SectionsMenu" t-inherit-mode="extension">
+        <xpath expr="//t[@t-if='!section.childrenTree.length']/DropdownItem" position="attributes">
+            <attribute name="attrs">this.crmOfflineMenuAttrs(section, {
+                href: this.getMenuItemHref(section),
+                'data-hotkey': hotkey,
+                'data-menu-xmlid': section.xmlid,
+                'data-section': section.id,
+            })</attribute>
+        </xpath>
+    </t>
+    <t t-inherit="web.NavBar.SectionsMenu.Dropdown.MenuSlot" t-inherit-mode="extension">
+        <xpath expr="//DropdownItem" position="attributes">
+            <attribute name="attrs">this.crmOfflineMenuAttrs(item, { style: style, href: this.getMenuItemHref(item), 'data-menu-xmlid': item.xmlid, 'data-section': item.id })</attribute>
+        </xpath>
+    </t>
+    <t t-inherit="web.NavBar.SectionsMenu.MoreDropdown" t-inherit-mode="extension">
+        <xpath expr="//DropdownItem" position="attributes">
+            <attribute name="attrs">this.crmOfflineMenuAttrs(section, { href: this.getMenuItemHref(section), 'data-menu-xmlid': section.xmlid, 'data-section': section.id })</attribute>
+        </xpath>
+    </t>
+
+    <!--
+        Command palette results of the same menus (crmOfflineCommandDisabled,
+        crm_offline_hooks.js) are dimmed and aria-disabled offline, and their "new tab"
+        hint is hidden, as Ctrl+Enter opens nothing. Online, and for every other
+        command, the link keeps the framework's class, aria-disabled is absent and the
+        hint is the framework's.
+    -->
+    <t t-inherit="web.CommandPalette" t-inherit-mode="extension">
+        <xpath expr="//div[hasclass('o_command')]" position="attributes">
+            <attribute name="t-att-aria-disabled">this.crmOfflineCommandDisabled(command) ? 'true' : false</attribute>
+        </xpath>
+        <xpath expr="//div[hasclass('o_command')]/a" position="attributes">
+            <attribute name="t-att-class">this.crmOfflineCommandClass(command)</attribute>
+        </xpath>
+        <xpath expr="//small[hasclass('o_command_focus')]" position="attributes">
+            <attribute name="t-if" add="!this.crmOfflineCommandDisabled(command)" separator=" and "/>
+        </xpath>
+    </t>
+
     <!-- Offline lead fields use cached inline autocomplete; the phone dialog requires the server. -->
     <t t-inherit="web.Many2XAutocomplete" t-inherit-mode="extension">
         <xpath expr="//input[@t-on-click='this.onSearchMore']" position="attributes">

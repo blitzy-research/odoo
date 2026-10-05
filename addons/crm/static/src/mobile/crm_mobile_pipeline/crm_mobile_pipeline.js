@@ -5,6 +5,7 @@ import {
     onMounted,
     onPatched,
     onWillPatch,
+    onWillUpdateProps,
     proxy,
     signal,
     status,
@@ -36,6 +37,7 @@ import { crmKanbanView } from "@crm/views/crm_kanban/crm_kanban_view";
 import { CrmKanbanRenderer } from "@crm/views/crm_kanban/crm_kanban_renderer";
 import {
     CRM_MOBILE_ACTIVITY_LIMIT,
+    CrmLeadCardCompiler,
     consumeQuickCreateDeepLink,
     crmFocusFirst,
     crmOwnEffectPromise,
@@ -715,7 +717,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         };
         this.crmOffline.onEntriesDiscarded("crm.lead", () => {
             disarmAfterDiscard();
-            return this.crmReloadIfMobile();
+            return this.crmReloadAfterDiscard();
         });
         // No reload for a discarded activity: the cards show no activity, and the
         // activity sheet follows its own discards.
@@ -731,6 +733,17 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
          * @type {Object[]|null}
          */
         this.crmCheckedGroups = null;
+
+        /**
+         * Stage shown when a discard reload of the stage pipeline started
+         * (`crmReloadAfterDiscard`): the raw root it reloads, and the value and index
+         * of that stage; `null` once another root is given (`crmKeepShownStage`) or
+         * when the reload fails.
+         *
+         * @type {{root: Object, value: number|false, index: number}|null}
+         */
+        this.crmDiscardShownStage = null;
+        onWillUpdateProps(({ list }) => this.crmKeepShownStage(list));
 
         /** Stage choices of the ungrouped list, in server order (`crmLoadStageChoices`). */
         this.crmStageChoices = signal([]);
@@ -1037,7 +1050,8 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
 
     /**
      * Mobile-only load of the ungrouped list's stage choices, when mounted, once
-     * per search (domain and context): a wide screen and a grouped list issue no
+     * per search (domain and context), and again at an online discard reload
+     * (`crmReloadAfterDiscard`): a wide screen and a grouped list issue no
      * request. Errors other than a lost connection are reported once.
      */
     crmMaybeLoadStageChoices() {
@@ -1100,6 +1114,88 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             return;
         }
         return this.props.list.model.load().catch(ignoreConnectionLost);
+    }
+
+    /**
+     * Reconciliation reload after a discard (`crmReloadIfMobile`). Online, on a
+     * small screen, the reloaded root lists the stages the server lists, so that a
+     * stage deleted on the server since leaves the stage navigation, the card stage
+     * selectors and the quick create (`stages`):
+     * - the stage pipeline's load drops the groups the framework would list again,
+     *   emptied, on a reload of the same search (`crmServerGroups`, see
+     *   `CrmKanbanModel._getNextConfig`), and the stage shown stays shown
+     *   (`crmKeepShownStage`);
+     * - an ungrouped list reads its stage choices again, alongside its root.
+     * A list grouped by another field reloads as the framework reloads it. Offline,
+     * the root is served from the cache as the framework serves it, its stages
+     * included.
+     *
+     * @returns {Promise<void>|undefined}
+     */
+    crmReloadAfterDiscard() {
+        const { list } = this.props;
+        if (
+            !this.isMobile ||
+            this.crmOffline.isOffline() ||
+            (list.isGrouped && !this.isStagePipeline)
+        ) {
+            return this.crmReloadIfMobile();
+        }
+        if (!list.isGrouped) {
+            this.crmStageChoicesLoad.request = null;
+            this.crmMaybeLoadStageChoices();
+            return this.crmReloadIfMobile();
+        }
+        const group = this.activeGroup;
+        const shown = group
+            ? { root: toRaw(list), value: group.value, index: this.activeIndex }
+            : null;
+        this.crmDiscardShownStage = shown;
+        return list.model.load({ crmServerGroups: true }).catch((error) => {
+            if (this.crmDiscardShownStage === shown) {
+                this.crmDiscardShownStage = null;
+            }
+            ignoreConnectionLost(error);
+        });
+    }
+
+    /**
+     * Keeps the stage shown across a discard reload of the stage pipeline
+     * (`crmDiscardShownStage`) when the renderer is given the first root after the
+     * reload started (the reload's own, or that of a load superseding it), before
+     * it renders it: the stage stays shown when stages before it are no longer
+     * listed. When it is no longer listed itself, the stage now at its place (the
+     * last one when it was the last) is shown, from its first card, as a stage
+     * change shows it (`crmShowStage`). The roots of other loads keep the index.
+     *
+     * @param {Object} list the root list the renderer is given
+     */
+    crmKeepShownStage(list) {
+        const shown = this.crmDiscardShownStage;
+        if (!shown || toRaw(list) === shown.root) {
+            return;
+        }
+        this.crmDiscardShownStage = null;
+        if (!list.isGrouped || list.groupByField?.name !== "stage_id") {
+            return;
+        }
+        // The display order of the kanban renderer (`getGroupsOrRecords`): the group
+        // without stage first, then the others in server order.
+        const values = [
+            ...list.groups.filter((group) => !group.value),
+            ...list.groups.filter((group) => group.value),
+        ].map((group) => group.value);
+        const index = values.indexOf(shown.value);
+        if (index >= 0) {
+            this.mobile.activeIndex = index;
+            return;
+        }
+        this.crmPendingScrollTop = null;
+        const scroller = this.crmScroller();
+        if (scroller) {
+            scroller.scrollTop = 0;
+        }
+        this.mobile.activeIndex = Math.max(Math.min(shown.index, values.length - 1), 0);
     }
 
     /**
@@ -2214,18 +2310,15 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * every queued lead write. Its extras carry, as the framework's record saves
      * do, the display values of the change (`changes`, which `projectLead` reads)
      * and of the stage the lead showed before it (`originalValues`, which the
-     * offline systray reads with `changes` for an edit).
+     * offline systray reads with `changes` for an edit). Online, during a replay
+     * that has still to send queued stage writes of the lead, the write is sent
+     * after them (`crmWriteInTurn`, as a card's save is); its time stamp is then
+     * read when it is sent.
      *
      * @param {Object} record
      * @param {{id: number, display_name: string}} stageValue
      */
     async crmWriteStage(record, stageValue) {
-        const extras = getScheduleORMExtras(record.model, [record]);
-        // Replay follows `extras.timeStamp`: after the writes it overrides, even when
-        // the clock has not moved since they were queued.
-        for (const { value } of this.crmOffline.queuedEntries("crm.lead")) {
-            extras.timeStamp = Math.max(extras.timeStamp, (value.extras?.timeStamp || 0) + 1);
-        }
         // The stage shown before this write: the projected one (queued writes of the
         // lead applied), else the loaded one. Many2one display format, as `changes`.
         const shownStage = this.crmOffline.projectLead(record)?.stage_id ?? record.data.stage_id;
@@ -2237,17 +2330,25 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                 this.stages.find((stage) => stage.id === shownStageId)?.display_name ??
                 "",
         };
-        const result = await this.crmOffline.schedule(
-            "crm.lead",
-            "web_save",
-            [[record.resId], { stage_id: stageValue.id }],
-            { context: record.context, specification: {} },
-            {
-                ...extras,
-                changes: { stage_id: stageValue },
-                originalValues: { stage_id: originalStage },
+        const result = await record.model.crmWriteInTurn(record, ["stage_id"], () => {
+            const extras = getScheduleORMExtras(record.model, [record]);
+            // Replay follows `extras.timeStamp`: after the writes it overrides, even
+            // when the clock has not moved since they were queued.
+            for (const { value } of this.crmOffline.queuedEntries("crm.lead")) {
+                extras.timeStamp = Math.max(extras.timeStamp, (value.extras?.timeStamp || 0) + 1);
             }
-        );
+            return this.crmOffline.schedule(
+                "crm.lead",
+                "web_save",
+                [[record.resId], { stage_id: stageValue.id }],
+                { context: record.context, specification: {} },
+                {
+                    ...extras,
+                    changes: { stage_id: stageValue },
+                    originalValues: { stage_id: originalStage },
+                }
+            );
+        });
         if (!this.crmOffline.isQueued(result)) {
             await this.crmReloadIfMobile();
         }
@@ -2364,9 +2465,14 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
 // View
 // -----------------------------------------------------------------------------
 
-/** Reuses the CRM kanban model, arch parser and search model. */
+/**
+ * Reuses the CRM kanban model, arch parser and search model. Cards compile with
+ * `CrmLeadCardCompiler`, which disables a lead card menu's Delete where its
+ * `unlink` cannot be queued offline.
+ */
 export const crmMobilePipelineView = {
     ...crmKanbanView,
+    Compiler: CrmLeadCardCompiler,
     Controller: CrmMobilePipelineController,
     Renderer: CrmMobilePipeline,
 };

@@ -943,7 +943,9 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
     def test_offline_quick_create_replay_same_key_creates_once(self):
         """ A quick create whose answer was lost is sent again verbatim, with the
         same delivery key: the server answers with the lead the first delivery
-        created, and neither creates nor writes anything. """
+        created and creates nothing. A delivery of the key writes its values on
+        that lead, so the same values again change nothing, and other values (a
+        later save of the still-new lead) are written there. """
         salesman = self.user_sales_salesman
         key = secrets.token_hex(16)
         vals = {
@@ -962,21 +964,23 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self.assertEqual(lead.create_uid, salesman)
         messages = lead.message_ids
 
-        # the same call again (the replay), then with other values: the first
-        # delivery's lead answers both, unchanged
+        # the same call again (the replay): the first delivery's lead answers it,
+        # unchanged
         self.assertEqual(self._quick_create(salesman, dict(vals), key), first)
+        self.assertEqual(lead.message_ids, messages, 'A repeated delivery of the same values changes nothing')
+        # then with other values: the first delivery's lead answers it, with them
         self.assertEqual(self._quick_create(salesman, dict(vals, expected_revenue=999.0, name='Other'), key), first)
+        self.assertEqual((lead.name, lead.expected_revenue), ('Other', 999.0))
         self.assertEqual(
             self._quick_create(salesman, vals, key, specification={'name': {}, 'expected_revenue': {}}),
             [{'id': lead.id, 'name': 'Lost Answer Lead', 'expected_revenue': 300.0}],
-            'A delivery reading fields back reads them from the delivered lead',
+            'A delivery reading fields back reads them from the delivered lead, as it wrote them',
         )
         leads = self.env['crm.lead'].with_context(active_test=False).search([('name', 'in', ('Lost Answer Lead', 'Other'))])
         self.assertEqual(leads, lead, 'Every delivery of one key makes one lead')
         for fname, value in vals.items():
             with self.subTest(field=fname):
                 self.assertEqual(lead[fname].id if fname == 'stage_id' else lead[fname], value)
-        self.assertEqual(lead.message_ids, messages, 'A repeated delivery writes nothing')
 
         # an archived lead is still the delivered one
         lead.action_archive()
@@ -1246,6 +1250,115 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self.assertNotIn(taken_over['id'], (delivered['id'], recreated['id']))
         self.assertEqual(self._quick_create_xmlids(key).res_id, taken_over['id'])
         self.assertEqual(self._quick_create(salesman, vals, key), [taken_over])
+
+    # Refine D1.2 (R2): a lead created in the form offline, saved online while its
+    # own create replays, is created once and keeps the later values.
+
+    def _form_create(self, user, vals, key, specification=None, queued_by=None):
+        """ Deliver the create a lead form sends for its new lead, as ``user``:
+        ``web_save([], vals)`` with the form's context (the pipeline action's,
+        with the user's ``uid`` the web client adds) and the lead's delivery key.
+        ``queued_by`` adds the ``crm_offline_uid`` of a queued call: the form's
+        queued create, as its replay sends it; without it, the call is the form's
+        online save of the still-new lead.
+
+        :return: the ``web_save`` answer
+        """
+        context = dict(self.pipeline_context, uid=user.id, crm_offline_create_key=key)
+        if queued_by:
+            context['crm_offline_uid'] = queued_by.id
+        return self.env['crm.lead'].with_user(user).with_context(context).browse().web_save(
+            vals, specification={} if specification is None else specification,
+        )
+
+    def test_offline_form_create_replayed_then_saved_online_creates_once(self):
+        """ A lead created in the form offline queues its create with a delivery
+        key. Saved online while that create replays, the still-new lead sends a
+        create again, with the same key: the replay creates the lead, and the
+        online save, which the form sends after it, writes its values on that
+        lead under the caller's rights and reads it back, so the form shows its
+        id. One lead, with the values of the user's last save. """
+        salesman = self.user_sales_salesman
+        key = secrets.token_hex(16)
+        queued_vals = {
+            'name': 'Form Offline Lead',
+            'type': 'opportunity',
+            'user_id': salesman.id,
+            'stage_id': self.stage_gen_1.id,
+            'expected_revenue': 100.0,
+            'phone': '+32 494 10 10 10',
+        }
+        [replayed] = self._form_create(salesman, queued_vals, key, queued_by=salesman)
+        self.assertEqual(set(replayed), {'id'})
+        lead = self.env['crm.lead'].browse(replayed['id'])
+        self.assertEqual((lead.create_uid, lead.name, lead.expected_revenue), (salesman, 'Form Offline Lead', 100.0))
+        self.assertEqual(self._quick_create_xmlids(key).res_id, lead.id)
+
+        # the online save of the still-new lead: every value of the form, edited
+        online_vals = dict(queued_vals, name='Form Online Lead', expected_revenue=250.0, phone='+32 494 20 20 20')
+        CrmLead = self.registry['crm.lead']
+        write = CrmLead.write
+        writes = []
+
+        def record_write(records, vals):
+            writes.append((records.ids, records.env.uid, records.env.su))
+            return write(records, vals)
+
+        with patch.object(CrmLead, 'write', record_write):
+            answer = self._form_create(
+                salesman, online_vals, key, specification={'name': {}, 'expected_revenue': {}, 'phone': {}},
+            )
+        self.assertEqual(writes, [(lead.ids, salesman.id, False)], 'The online save is written as the caller, without sudo')
+        self.assertEqual(answer, [{
+            'id': lead.id,
+            'name': 'Form Online Lead',
+            'expected_revenue': 250.0,
+            'phone': '+32 494 20 20 20',
+        }], 'The online save is answered as a save of the replayed lead')
+        leads = self.env['crm.lead'].with_context(active_test=False).search(
+            [('name', 'in', ('Form Offline Lead', 'Form Online Lead'))],
+        )
+        self.assertEqual(leads, lead, 'The replay and the online save make one lead')
+        for fname, value in online_vals.items():
+            with self.subTest(field=fname):
+                self.assertEqual(lead[fname].id if fname in ('user_id', 'stage_id') else lead[fname], value)
+        self.assertEqual(len(self._quick_create_xmlids(key)), 1)
+
+        # an online save whose connection is lost is queued into the lead's queued
+        # create, with its key: that create, sent again, still makes one lead
+        self.assertEqual(self._form_create(salesman, online_vals, key, queued_by=salesman), [{'id': lead.id}])
+        leads = self.env['crm.lead'].with_context(active_test=False).search(
+            [('name', 'in', ('Form Offline Lead', 'Form Online Lead'))],
+        )
+        self.assertEqual(leads, lead)
+        self.assertEqual((lead.name, lead.expected_revenue), ('Form Online Lead', 250.0))
+
+    def test_offline_form_create_key_of_another_user(self):
+        """ The delivery key of a lead another user's form created is refused,
+        whoever may write the lead: neither the replayed create nor the online
+        save of another user creates or writes anything. """
+        salesman = self.user_sales_salesman
+        manager = self.user_sales_manager
+        key = secrets.token_hex(16)
+        vals = {
+            'name': 'Form Foreign Key Lead',
+            'type': 'opportunity',
+            'user_id': salesman.id,
+            'stage_id': self.stage_gen_1.id,
+            'expected_revenue': 40.0,
+        }
+        [delivered] = self._form_create(salesman, vals, key, queued_by=salesman)
+        lead = self.env['crm.lead'].browse(delivered['id'])
+        self.assertTrue(lead.with_user(manager).has_access('write'), 'The manager may write the lead itself')
+        for queued_by in (manager, None):
+            with self.subTest(queued=bool(queued_by)), self.assertRaises(AccessError) as refused:
+                self._form_create(manager, dict(vals, expected_revenue=999.0), key, queued_by=queued_by)
+            # sent by its own user: not an origin refusal
+            self.assertNotIsInstance(refused.exception, CrmOfflineOriginError)
+        leads = self.env['crm.lead'].with_context(active_test=False).search([('name', '=', 'Form Foreign Key Lead')])
+        self.assertEqual(leads, lead)
+        self.assertEqual(lead.expected_revenue, 40.0)
+        self.assertEqual(self._quick_create_xmlids(key).res_id, lead.id)
 
     # ------------------------------------------------------------
     # Queue identity

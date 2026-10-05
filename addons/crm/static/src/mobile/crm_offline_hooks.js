@@ -2,6 +2,7 @@
 
 import {
     computed,
+    effect,
     immediateEffect,
     onMounted,
     onPatched,
@@ -19,12 +20,15 @@ import {
 import { MailComposerFormRenderer } from "@mail/chatter/web/mail_composer_form";
 import { ActivityButton } from "@mail/core/web/activity_button";
 import { Avatar } from "@mail/views/web/fields/avatar/avatar";
+import { CardMany2OneAvatarUserField } from "@mail/views/web/fields/many2one_avatar_user_field/kanban_many2one_avatar_user_field";
+import { Many2OneAvatarUserField } from "@mail/views/web/fields/many2one_avatar_user_field/many2one_avatar_user_field";
 import { MailActivityMixinListRescheduleDropdown } from "@mail/views/web/list/mail_activity_list_reschedule";
 import { AutoComplete } from "@web/core/autocomplete/autocomplete";
 import { browser } from "@web/core/browser/browser";
 // The `loadState()` guard must inspect the state the action service itself falls
 // back to when called without arguments (the web client's boot): `router.current`.
 import { router } from "@web/core/browser/router";
+import { CommandPalette } from "@web/core/commands/command_palette";
 import { datetimePickerService } from "@web/core/datetime/datetimepicker_service";
 import { useDropdownState } from "@web/core/dropdown/dropdown_hooks";
 import { getActiveHotkey } from "@web/core/hotkeys/hotkey_service";
@@ -43,6 +47,7 @@ import { getScheduleORMExtras } from "@web/model/relational_model/utils";
 import { useEnv, useSubEnv } from "@web/owl2/utils";
 import { ActionMenus } from "@web/search/action_menus/action_menus";
 import { session } from "@web/session";
+import { CardCompiler } from "@web/views/card/card_compiler";
 import { CardRenderer } from "@web/views/card/card_renderer";
 import { kanbanColorPickerField } from "@web/views/fields/kanban_color_picker/kanban_color_picker_field";
 import { Many2ManyTagsField } from "@web/views/fields/many2many_tags/many2many_tags_field";
@@ -52,10 +57,14 @@ import { FormController } from "@web/views/form/form_controller";
 import { KanbanDropdownMenuWrapper } from "@web/views/kanban/kanban_dropdown_menu_wrapper";
 import { KanbanRecord } from "@web/views/kanban/kanban_record";
 import { OfflineActionHelper } from "@web/views/offline_action_helper";
+import { toStringExpression } from "@web/views/utils";
 import { View } from "@web/views/view";
 import { ViewButton } from "@web/views/view_button/view_button";
 import { viewService } from "@web/views/view_service";
 import { actionService } from "@web/webclient/actions/action_service";
+import { computeAppsAndMenuItems } from "@web/webclient/menus/menu_helpers";
+// Registers the command palette's menu provider, patched below.
+import "@web/webclient/menus/menu_providers";
 import { menuService } from "@web/webclient/menus/menu_service";
 import { NavBar } from "@web/webclient/navbar/navbar";
 import { SettingsFormController } from "@web/webclient/settings_form_view/settings_form_controller";
@@ -330,8 +339,10 @@ export function isCrmOfflineQueueUsable() {
  * Offline where the framework queue cannot hold a call (`isCrmOfflineQueueUsable`):
  * a CRM control whose offline action queues one then drops `data-available-offline`,
  * so the framework disables it with its `o_disabled_offline` state, and its action
- * does nothing. The connection signal of `plugin` is read first, so a render calling
- * it follows the connection. Always `false` online and in a secure context.
+ * does nothing. A control the framework does not disable, the Delete of a lead card
+ * menu opened online, takes that state from CRM (`KanbanRecord.crmDeleteBlocked`).
+ * The connection signal of `plugin` is read first, so a render calling it follows
+ * the connection. Always `false` online and in a secure context.
  *
  * @param {OfflinePlugin} [plugin]
  * @returns {boolean}
@@ -655,6 +666,128 @@ function readQueueIndex(plugin) {
     }
     return index();
 }
+
+// -----------------------------------------------------------------------------
+// Online lead writes made during a replay (sent after the queued writes ahead)
+// -----------------------------------------------------------------------------
+
+/**
+ * Lead fields a queued `crm.lead` call writes: the values of a `web_save`, the
+ * stage, probability and active state `action_set_won` sets, the active state of
+ * an archive or unarchive; none for any other call (an `unlink` writes none).
+ *
+ * @param {{method?: string, args?: any}} value
+ * @returns {string[]}
+ */
+function writtenLeadFields(value) {
+    switch (value?.method) {
+        case "web_save":
+            return isFieldMapping(value.args?.[1]) ? Object.keys(value.args[1]) : [];
+        case "action_set_won":
+            return ["stage_id", "probability", "active"];
+        case "action_archive":
+        case "action_unarchive":
+            return ["active"];
+        default:
+            return [];
+    }
+}
+
+/**
+ * The pending (not parked) queued writes of the lead of `record` (`leadWritesIn`:
+ * the record's own offline save, or a call targeting its id) whose replay would
+ * overwrite a write of `fieldNames` sent now: those writing one of those fields, or,
+ * for a delete (`fieldNames` is `null`), every pending one, which the delete would
+ * make fail. In replay order; none for a record that is not a saved lead. Reads the
+ * queue reactively.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {Object} record
+ * @param {string[]|null} fieldNames
+ * @returns {{key: string, value: Object}[]}
+ */
+export function crmPendingLeadWrites(plugin, record, fieldNames) {
+    if (record?.resModel !== "crm.lead" || !record.resId) {
+        return [];
+    }
+    return leadWritesIn(readQueueIndex(plugin), record).filter(
+        (entry) =>
+            !isParked(entry) &&
+            (fieldNames === null ||
+                writtenLeadFields(entry.value).some((fieldName) => fieldNames.includes(fieldName)))
+    );
+}
+
+/**
+ * Tells whether the replay running on `plugin` has still to send a queued write of
+ * the lead of `record` that an online write of `fieldNames` made now must follow
+ * (`crmPendingLeadWrites`). Always `false` outside a replay and for a record that
+ * is not a saved lead. The connection state the plugin reports plays no part: the
+ * replay sends the calls it read when it started until one of them is lost, so a
+ * connection reported lost meanwhile (by another request) may well be up, and a
+ * write sent then would still reach the server ahead of those calls. Reads the
+ * replay state and the queue reactively.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {Object} record
+ * @param {string[]|null} fieldNames
+ * @returns {boolean}
+ */
+function hasLeadWriteAhead(plugin, record, fieldNames) {
+    return plugin.syncingORM() && crmPendingLeadWrites(plugin, record, fieldNames).length > 0;
+}
+
+/**
+ * Turn of a write of the leads of `records` (a pipeline card's save, stage choice or
+ * delete) made while the replay has still to send queued writes of them, whatever
+ * connection state the plugin reports. The framework's replay sends the queue in
+ * time-stamp order, one call a second, while an online call is sent at once: a
+ * write the user makes after those queued writes would reach the server before
+ * them and be overwritten by them (a delete would make them fail). The write
+ * therefore waits until no pending write ahead of it remains (`hasLeadWriteAhead`):
+ * the replay sent or parked each of them, or the replay ended. A connection
+ * reported lost meanwhile does not end the wait, as the replay goes on until one of
+ * its calls is lost. A card save whose turn comes while the connection is still
+ * reported lost, with such a write still pending (the replay stopped on it), is
+ * queued after it instead of being sent (`CrmKanbanRecord._crmQueuesSave`), as a
+ * mobile stage write is then queued after every queued lead write. The queue is
+ * neither read for conflicts nor changed: nothing is dropped, merged or reordered,
+ * and no request is added.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {Object[]} records the datapoints of the leads the write targets
+ * @param {string[]|null} [fieldNames] the fields it writes; `null` for a delete
+ * @returns {Promise<void>|undefined} `undefined` when the write may be sent now,
+ *  which is always the case with no replay running, so that it is then sent
+ *  without any added wait; else a promise resolved at its turn
+ */
+export function crmLeadWriteTurn(plugin, records, fieldNames = null) {
+    const isAhead = () => records.some((record) => hasLeadWriteAhead(plugin, record, fieldNames));
+    if (!untrack(isAhead)) {
+        return undefined;
+    }
+    let stop;
+    const turn = new Promise((resolve) => {
+        stop = untrack(() =>
+            effect(() => {
+                if (!isAhead()) {
+                    resolve();
+                }
+            })
+        );
+    });
+    return turn.then(() => stop());
+}
+
+/**
+ * An online write of a lead record waiting for its turn (`crmLeadWriteTurn`), or
+ * made at it, as the CRM kanban model marks it on the record (`crmTurnWrite`, see
+ * `CrmKanbanModel.crmWriteInTurn`): the record's values of `fieldNames` follow
+ * every queued or replayed write of the lead stamped up to `timeStamp`, and the
+ * later ones follow them. `undefined` for a record without such a write.
+ *
+ * @typedef {{timeStamp: number, fieldNames: string[]}} CrmTurnWrite
+ */
 
 // -----------------------------------------------------------------------------
 // Replay hold (entries the replay just sent, until the views reload)
@@ -997,12 +1130,15 @@ const CRM_REPLAY_MODELS = freezeSet(["crm.lead", "crm.stage", "crm.team", "mail.
 const crmReplayPlugins = new WeakSet();
 
 /**
- * Context key of the delivery key a quick create sends with its lead create, and
- * the activity sheet with each activity it schedules, online and in its queued
- * replay alike. The framework replay is at-least-once (a create whose answer is
- * lost stays queued and is sent again), so the server's `crm.lead` `web_save` and
- * `mail.activity` `create` register the key with the record they create and answer
- * any later delivery of that key with this record instead of creating another one.
+ * Context key of the delivery key a quick create sends with its lead create, a lead
+ * form with every create of a new lead once it queued it (`CrmFormRecord`: the
+ * queued create and the online save of the still-new lead), and the activity sheet
+ * with each activity it schedules, online and in its queued replay alike. The
+ * framework replay is at-least-once (a create whose answer is lost stays queued and
+ * is sent again), so the server's `crm.lead` `web_save` and `mail.activity`
+ * `create` register the key with the record they create and answer any later
+ * delivery of that key with this record (a later lead save writing its values
+ * there) instead of creating another one.
  */
 export const CRM_OFFLINE_CREATE_KEY = "crm_offline_create_key";
 
@@ -1022,7 +1158,7 @@ export const CRM_OFFLINE_UID_KEY = "crm_offline_uid";
  *
  * @returns {string}
  */
-function newCrmOfflineCreateKey() {
+export function newCrmOfflineCreateKey() {
     let key = "";
     for (const byte of crypto.getRandomValues(new Uint8Array(16))) {
         key += byte.toString(16).padStart(2, "0");
@@ -1058,9 +1194,9 @@ async function removeReplayedFromStore(plugin, key) {
  * Every other outcome is the framework's: the call is sent unchanged, a lost
  * connection stops the replay and keeps the entry, and any other error parks it.
  * A lead or activity create whose answer is lost is therefore sent again,
- * verbatim: it carries the delivery key of its quick create or scheduled activity
- * (`CRM_OFFLINE_CREATE_KEY`), by which the server answers a create it already made
- * instead of making it twice.
+ * verbatim: it carries the delivery key of its quick create, lead form or
+ * scheduled activity (`CRM_OFFLINE_CREATE_KEY`), by which the server answers a
+ * create it already made instead of making it twice.
  *
  * @param {OfflinePlugin} plugin
  * @param {Object} silentOrm the plugin's silent ORM, with the settings of the ORM
@@ -1629,6 +1765,10 @@ export function useCrmOffline() {
          * A queued save whose `extras.changes` is not a field-value mapping is
          * ignored: the values it would display are left as they were. The writes the
          * replay has just sent stay applied until the view reloads (`holdReplayed`).
+         * An online write of the record made during the replay (`crmTurnWrite`)
+         * applies the record's values of the fields it writes at its time stamp,
+         * after the writes stamped up to it (on a tie, it was made last): the card
+         * shows it at once, while it waits for its turn, and until the view reloads.
          *
          * @param {Object} record
          * @returns {Object|null}
@@ -1649,8 +1789,21 @@ export function useCrmOffline() {
                 // Stable: on a time-stamp tie the replayed write applies first.
                 writes = [...heldWrites, ...writes].sort(byTimeStamp);
             }
+            /** @type {CrmTurnWrite|undefined} */
+            let turnWrite = record.crmTurnWrite;
+            const applyTurnWrite = () => {
+                for (const fieldName of turnWrite.fieldNames) {
+                    if (fieldName in values) {
+                        values[fieldName] = record.data[fieldName];
+                    }
+                }
+                turnWrite = undefined;
+            };
             for (const entry of writes) {
                 const { method, extras } = entry.value;
+                if (turnWrite && (extras?.timeStamp || 0) > turnWrite.timeStamp) {
+                    applyTurnWrite();
+                }
                 if (method === "web_save") {
                     const changes = isFieldMapping(extras?.changes) ? extras.changes : {};
                     for (const fieldName of [...PROJECTED_FIELDS, ...PROJECTED_OPTIONAL_FIELDS]) {
@@ -1667,6 +1820,9 @@ export function useCrmOffline() {
                 ) {
                     return null;
                 }
+            }
+            if (turnWrite) {
+                applyTurnWrite();
             }
             return values;
         },
@@ -2307,12 +2463,22 @@ patch(ViewButton.prototype, {
         return this.crmOfflineGuarded || disabled;
     },
 
+    /**
+     * While guarded, adds the framework's dimmed offline state (`o_disabled_offline`),
+     * `pe-none` and the CRM guard marker `o_crm_offline_guarded`. The framework rule
+     * `.o_disabled_offline { pointer-events: auto !important }` cancels `pe-none`;
+     * the marker scopes the CRM rule (`crm_mobile_pipeline.scss`) that keeps guarded
+     * links out of hit-testing, so hover and clicks pass to the element beneath.
+     * Unguarded buttons keep the original class list.
+     */
     getClassName() {
         const className = super.getClassName(...arguments);
         if (!this.crmOfflineGuarded) {
             return className;
         }
-        return [className, "o_disabled_offline pe-none"].filter(Boolean).join(" ");
+        return [className, "o_disabled_offline pe-none o_crm_offline_guarded"]
+            .filter(Boolean)
+            .join(" ");
     },
 
     onClick(ev, newWindow) {
@@ -2694,8 +2860,9 @@ patch(menuService, {
  * DOM state of the same entries. The framework dims a navbar entry offline from the
  * visited registry, which holds an action once any of its views was visited (a lead
  * form opened from the forecast, a report's list), so it would render the entries
- * the guard above stops as available. Online, and for every other entry, the
- * framework's value is kept.
+ * the guard above stops as available. Offline, these entries are dimmed and, on
+ * desktop, also carry `aria-disabled="true"` (`crmOfflineMenuAttrs`). Online, and for
+ * every other entry, the framework's values are kept.
  */
 patch(NavBar.prototype, {
     _isAvailable(menu) {
@@ -2703,6 +2870,26 @@ patch(NavBar.prototype, {
             return false;
         }
         return super._isAvailable(...arguments);
+    },
+
+    /**
+     * Read by the `web.NavBar.SectionsMenu`, `web.NavBar.SectionsMenu.Dropdown.MenuSlot`
+     * and `web.NavBar.SectionsMenu.MoreDropdown` extensions, which pass the framework's
+     * attributes of a desktop navbar entry (a section, a dropdown item or a "More"
+     * entry). Offline, an entry of `CRM_OFFLINE_DISABLED_MENUS`, which `_isAvailable`
+     * dims and the `selectMenu` guard stops, also gets `aria-disabled="true"`. The
+     * signal is read during render, so an open dropdown follows the connection. Online,
+     * and for every other menu, the framework's object is returned unchanged.
+     *
+     * @param {Object} menu a menu of the menu service
+     * @param {Object} attrs the framework's `attrs` of the entry's `DropdownItem`
+     * @returns {Object}
+     */
+    crmOfflineMenuAttrs(menu, attrs) {
+        if (this.offlinePlugin.isOffline() && CRM_OFFLINE_DISABLED_MENUS.has(menu?.xmlid)) {
+            return { ...attrs, "aria-disabled": "true" };
+        }
+        return attrs;
     },
 
     /**
@@ -2719,6 +2906,129 @@ patch(NavBar.prototype, {
             this.menuService.getMenu(section.appID)?.xmlid === "crm.crm_menu_root" &&
             !this._isAvailable(section)
         );
+    },
+});
+
+// -----------------------------------------------------------------------------
+// Guard: command palette results of the same menus
+// -----------------------------------------------------------------------------
+
+/**
+ * Identifies a command of the palette's menu provider (`menu_providers.js`) by what
+ * the provider gives it: its category (`apps` or `menu_items`), its name (an app's
+ * label, a menu item's path and label) and its `href`, both taken from
+ * `computeAppsAndMenuItems`.
+ *
+ * @param {string} category
+ * @param {string} name
+ * @param {string} href
+ * @returns {string}
+ */
+function menuCommandKey(category, name, href) {
+    return JSON.stringify([category, name, href]);
+}
+
+/**
+ * The `xmlid` of each `CRM_OFFLINE_DISABLED_MENUS` menu the menu provider lists, by
+ * the `menuCommandKey` of its command.
+ *
+ * @param {Object} menuService
+ * @returns {Map<string, string>}
+ */
+function disabledMenuCommandKeys(menuService) {
+    const { apps, menuItems } = computeAppsAndMenuItems(menuService.getMenuAsTree("root"));
+    const keys = new Map();
+    for (const app of apps) {
+        if (CRM_OFFLINE_DISABLED_MENUS.has(app.xmlid)) {
+            keys.set(menuCommandKey("apps", app.label, app.href), app.xmlid);
+        }
+    }
+    for (const item of menuItems) {
+        if (CRM_OFFLINE_DISABLED_MENUS.has(item.xmlid)) {
+            const name = `${item.parents} / ${item.label}`;
+            keys.set(menuCommandKey("menu_items", name, item.href), item.xmlid);
+        }
+    }
+    return keys;
+}
+
+/**
+ * The provider's commands are the framework's (action, class, name, href); a command
+ * opening a `CRM_OFFLINE_DISABLED_MENUS` menu is only tagged with that menu's `xmlid`
+ * (`crmOfflineMenu`), whatever the connection, so a palette opened online follows it.
+ * Its action still runs the guarded `selectMenu`.
+ */
+patch(registry.category("command_provider").get("menu"), {
+    async provide() {
+        // Resolved before the first `await`: the palette's scope ends there.
+        const menuService = useService("menu");
+        const commands = await super.provide(...arguments);
+        const keys = disabledMenuCommandKeys(menuService);
+        if (keys.size) {
+            for (const command of commands) {
+                const xmlid = keys.get(menuCommandKey(command.category, command.name, command.href));
+                if (xmlid) {
+                    command.crmOfflineMenu = xmlid;
+                }
+            }
+        }
+        return commands;
+    },
+});
+
+/**
+ * Offline, a tagged command (`crmOfflineMenu`) renders dimmed and `aria-disabled`,
+ * without the "new tab" hint (`web.CommandPalette` extension), and selecting it by
+ * click, Enter, Ctrl+Enter or its item's `executeCommand` does nothing: the palette
+ * stays open, no action runs, no tab opens and no request is issued. Online, and for
+ * every other command, the framework's markup and behaviour are kept.
+ */
+patch(CommandPalette.prototype, {
+    setup() {
+        super.setup(...arguments);
+        this.crmOfflinePlugin = usePlugin(OfflinePlugin);
+    },
+
+    /**
+     * Read during render, so an open palette follows the connection.
+     *
+     * @param {Object} [command]
+     * @returns {boolean}
+     */
+    crmOfflineCommandDisabled(command) {
+        return (
+            this.crmOfflinePlugin.isOffline() &&
+            CRM_OFFLINE_DISABLED_MENUS.has(command?.crmOfflineMenu)
+        );
+    },
+
+    /**
+     * The class of a command's link: the framework's `className`, with
+     * `o_disabled_offline` added while `crmOfflineCommandDisabled` holds.
+     *
+     * @param {Object} command
+     * @returns {string|Object}
+     */
+    crmOfflineCommandClass(command) {
+        if (this.crmOfflineCommandDisabled(command)) {
+            return mergeClasses(command.className, "o_disabled_offline");
+        }
+        return command.className;
+    },
+
+    executeCommand(command) {
+        if (this.crmOfflineCommandDisabled(command)) {
+            return Promise.resolve();
+        }
+        return super.executeCommand(...arguments);
+    },
+
+    async executeSelectedCommand() {
+        await this.searchValuePromise;
+        if (this.crmOfflineCommandDisabled(this.state.selectedCommand)) {
+            return;
+        }
+        return super.executeSelectedCommand(...arguments);
     },
 });
 
@@ -3045,13 +3355,45 @@ patch(KanbanRecord.prototype, {
      * Whether the card-menu toggle carries `data-available-offline` (`web.KanbanMenu`
      * extension): on lead cards, whose menu items are queued or available offline,
      * except where the framework queue cannot hold their calls
-     * (`isCrmOfflineQueueBlocked`), so the framework disables the toggle there.
+     * (`isCrmOfflineQueueBlocked`), so the framework disables the toggle there and
+     * the Delete of a menu opened online is disabled (`crmDeleteBlocked`).
      */
     get crmMenuAvailableOffline() {
         return (
             this.props.record.resModel === "crm.lead" &&
             !isCrmOfflineQueueBlocked(this.offlinePlugin)
         );
+    },
+
+    /**
+     * Whether the "Delete" trigger of a lead card (its card menu's Delete, compiled
+     * by `CrmLeadCardCompiler`) is disabled: offline where the framework queue cannot
+     * hold the `unlink` (`isCrmOfflineQueueBlocked`, a non-secure origin). The menu
+     * toggle is framework-disabled there, so only a menu opened online still shows
+     * the item; it then renders disabled and inert, and `triggerAction` deletes
+     * nothing, instead of opening a confirmation whose delete could only end in the
+     * framework's non-secure-context notification. Read on render, so an open menu
+     * follows the connection; the lead scope is tested first. Always `false` online
+     * and in a secure context, where Delete confirms and queues `unlink` offline.
+     *
+     * @returns {boolean}
+     */
+    get crmDeleteBlocked() {
+        return (
+            this.props.record.resModel === "crm.lead" &&
+            isCrmOfflineQueueBlocked(this.offlinePlugin)
+        );
+    },
+
+    /**
+     * Class of a blocked lead-card Delete (`crmDeleteBlocked`): the arch's own class
+     * expression with the framework's offline-disabled state, `pe-none` included.
+     *
+     * @param {string|Object|undefined} base the arch's `t-att-class` value, if any
+     * @returns {Object}
+     */
+    crmDeleteBlockedClass(base) {
+        return mergeClasses(base, "o_disabled_offline pe-none");
     },
 
     /**
@@ -3083,7 +3425,9 @@ patch(KanbanRecord.prototype, {
     /**
      * Offline, opening a team card (its "Configuration" link) or a lead card whose
      * form cannot open offline (`isCrmLeadFormUnavailableOffline`, the lead menu's
-     * "Edit") does nothing: no form load is requested.
+     * "Edit") does nothing: no form load is requested. Deleting a lead card where
+     * its `unlink` cannot be queued (`crmDeleteBlocked`) does nothing either: no
+     * confirmation, notification, request or queue entry, and the card stays.
      */
     triggerAction(params) {
         if (
@@ -3093,9 +3437,79 @@ patch(KanbanRecord.prototype, {
         ) {
             return;
         }
+        if (params?.type === "delete" && this.crmDeleteBlocked) {
+            return;
+        }
         return super.triggerAction(...arguments);
     },
 });
+
+/** Rendering-context expression of a lead card's blocked Delete (`crmDeleteBlocked`). */
+const CRM_DELETE_BLOCKED = "__comp__.crmDeleteBlocked";
+
+/**
+ * Sets the dynamic attribute `t-att-<name>` of a compiled card trigger to
+ * `offlineExpr` while its Delete is blocked, and to the arch's own value otherwise:
+ * its `t-att-<name>` expression, else its static attribute (moved into the
+ * expression), else none (`false` drops the attribute).
+ *
+ * @param {Element} el
+ * @param {string} name
+ * @param {string} offlineExpr
+ */
+function setCrmDeleteBlockedAttribute(el, name, offlineExpr) {
+    const dynamicName = `t-att-${name}`;
+    let onlineExpr = "false";
+    if (el.hasAttribute(dynamicName)) {
+        onlineExpr = `(${el.getAttribute(dynamicName)})`;
+    } else if (el.hasAttribute(name)) {
+        onlineExpr = toStringExpression(el.getAttribute(name));
+        el.removeAttribute(name);
+    }
+    el.setAttribute(dynamicName, `${CRM_DELETE_BLOCKED} ? ${offlineExpr} : ${onlineExpr}`);
+}
+
+/**
+ * Card compiler of the CRM lead kanban views (`crm_mobile_pipeline`). Each
+ * `type="delete"` trigger, the card menu's Delete, renders as the framework
+ * renders it, and while `KanbanRecord.crmDeleteBlocked` holds (offline on a
+ * non-secure origin) it takes the offline-disabled state of the team card's
+ * "Configuration" link in a menu opened online: `o_disabled_offline pe-none`,
+ * `aria-disabled="true"`, out of the tab order and `inert`, so no pointer, focus or
+ * key reaches it (`inert` holds whatever `pointer-events` the framework's
+ * `o_disabled_offline` rule computes). Its `t-key` re-creates it on each change of
+ * that state, so the open dropdown refreshes its keyboard-navigable items, which
+ * the `KanbanDropdownMenuWrapper` patch then rebuilds without it. A click a script
+ * dispatches on it is stopped by `triggerAction` and by that wrapper. Online and in
+ * a secure context every expression yields the arch's own attributes, so the DOM
+ * is unchanged.
+ */
+export class CrmLeadCardCompiler extends CardCompiler {
+    compileButton(el, params) {
+        // `super` removes `type` from `el` before copying its attributes.
+        const isDelete = el.getAttribute("type") === "delete";
+        const compiled = super.compileButton(...arguments);
+        if (!isDelete) {
+            return compiled;
+        }
+        const baseClass = compiled.getAttribute("t-att-class") || "''";
+        compiled.setAttribute(
+            "t-att-class",
+            `${CRM_DELETE_BLOCKED} ? __comp__.crmDeleteBlockedClass(${baseClass}) : (${baseClass})`
+        );
+        setCrmDeleteBlockedAttribute(compiled, "aria-disabled", "'true'");
+        setCrmDeleteBlockedAttribute(compiled, "tabindex", "-1");
+        setCrmDeleteBlockedAttribute(compiled, "inert", "''");
+        const baseKey = compiled.hasAttribute("t-key")
+            ? `(${compiled.getAttribute("t-key")})`
+            : "''";
+        compiled.setAttribute(
+            "t-key",
+            `(${CRM_DELETE_BLOCKED} ? 'crm_offline_' : 'crm_online_') + ${baseKey}`
+        );
+        return compiled;
+    }
+}
 
 patch(CardRenderer.prototype, {
     createWidget(props) {
@@ -3171,7 +3585,9 @@ patch(kanbanColorPickerField.component.prototype, {
 
 /**
  * Menu items a CRM guard disables offline: the team card "Configuration" link
- * (`widget.crm_offline`) is the only `.dropdown-item` that gets this state.
+ * (`widget.crm_offline`) and, on a non-secure origin, the lead card Delete
+ * (`KanbanRecord.crmDeleteBlocked`) are the only `.dropdown-item`s that get this
+ * state.
  */
 const CRM_OFFLINE_DISABLED_MENU_ITEM = ".dropdown-item.o_disabled_offline[aria-disabled='true']";
 
@@ -3199,7 +3615,8 @@ patch(KanbanDropdownMenuWrapper.prototype, {
     /**
      * The dropdown wrapper marks all items `o-navigable` after mount/patch, ignoring
      * disabled ARIA/tabindex states. Run after it to remove the mark from
-     * offline-disabled team items and preserve keyboard navigation elsewhere.
+     * offline-disabled team and lead items and preserve keyboard navigation
+     * elsewhere.
      */
     setup() {
         super.setup(...arguments);
@@ -3219,9 +3636,10 @@ patch(KanbanDropdownMenuWrapper.prototype, {
     /**
      * A click on an offline-disabled item does nothing, so it keeps the menu open:
      * a team menu opened online cannot be reopened offline (its toggle is
-     * disabled), and closing it would make its queued colour picker unreachable.
-     * The item's `href="#"` is not followed either, as that navigation closes the
-     * menu too.
+     * disabled), and closing it would make its queued colour picker unreachable;
+     * neither can a lead menu opened online on a non-secure origin, whose "Edit"
+     * of a lead form cached offline stays reachable. The item's `href="#"` is not
+     * followed either, as that navigation closes the menu too.
      */
     onClick(ev) {
         if (isCrmOfflineDisabledMenuClick(ev?.target ?? null)) {
@@ -3271,12 +3689,45 @@ patch(KanbanMany2One.prototype, {
     },
 });
 
+/** Models whose records' avatars open no avatar card offline. */
+const CRM_OFFLINE_AVATAR_MODELS = freezeSet(["crm.lead", "crm.team"]);
+
 /**
- * A dashboard card's leader avatar opens mail's avatar card, whose contact read
- * (`/mail/store`) fails offline with an uncaught `ConnectionLostError`. Offline, a
- * team's avatar opens no card, so that decorative read is skipped. Scoped by the
- * view's model as the quick-assign above; an avatar card opened online stays open
- * with what it has loaded.
+ * Env key under which a user avatar field hands its record's model to the `Avatar`
+ * it renders, whose own props only name the user.
+ */
+const CRM_AVATAR_RECORD_MODEL = Symbol("crmAvatarRecordModel");
+
+/**
+ * The user avatar fields (`many2one_avatar_user` in forms and lists, CRM's
+ * `many2one_avatar_leader_user` through inheritance, `card.many2one_avatar_user` on
+ * kanban cards) expose their record's model to their avatar. The record, not the
+ * view's root, is what scopes the avatar guard below: a lead list inside another
+ * model's form (the merge and mass-convert wizards' lead lists) shows lead avatars,
+ * and a lead view may embed records of other models. The env only gains a key, so
+ * the fields render and behave as before.
+ */
+for (const AvatarUserField of [Many2OneAvatarUserField, CardMany2OneAvatarUserField]) {
+    patch(AvatarUserField.prototype, {
+        setup() {
+            super.setup(...arguments);
+            useSubEnv({ [CRM_AVATAR_RECORD_MODEL]: this.props.record?.resModel });
+        },
+    });
+}
+
+/**
+ * An avatar opens mail's avatar card, whose contact read (`/mail/store`, fetch
+ * `avatar_card`) fails offline with an uncaught `ConnectionLostError`. Offline, the
+ * avatar of a lead (salesperson on pipeline and lead kanban cards, lead lists, the
+ * lead form, the wizards' lead lists) or of a team (a dashboard card's leader) opens
+ * no card, so that decorative read is neither issued nor queued and nothing is
+ * raised; a direct `onClickAvatar` call reads the same getter. The scope is the
+ * model of the record whose field renders the avatar, or, for an avatar rendered
+ * outside such a field, the view's root model; it is tested before the connection,
+ * so other models' avatars never read the offline signal and open as the framework
+ * renders them. Online every avatar opens its card as before, and a card opened
+ * online stays open with what it has loaded.
  */
 patch(Avatar.prototype, {
     setup() {
@@ -3284,14 +3735,18 @@ patch(Avatar.prototype, {
         this.crmOfflinePlugin = usePlugin(OfflinePlugin);
     },
 
+    /** True for a lead's or a team's avatar while offline (scope tested first). */
+    get crmOfflineAvatarGuarded() {
+        const recordModel = this.env[CRM_AVATAR_RECORD_MODEL] ?? this.env.model?.root?.resModel;
+        return CRM_OFFLINE_AVATAR_MODELS.has(recordModel) && this.crmOfflinePlugin.isOffline();
+    },
+
     get canOpenPopover() {
         const canOpen = super.canOpenPopover;
         if (!canOpen) {
             return canOpen;
         }
-        return !(
-            this.env.model?.root?.resModel === "crm.team" && this.crmOfflinePlugin.isOffline()
-        );
+        return !this.crmOfflineAvatarGuarded;
     },
 });
 

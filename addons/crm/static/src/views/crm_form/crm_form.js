@@ -39,11 +39,13 @@ import { FollowerList } from "@mail/core/web/follower_list";
 import { FollowerSubtypeDialog } from "@mail/core/web/follower_subtype_dialog";
 import {
     CRM_MOBILE_ACTIVITY_LIMIT,
+    CRM_OFFLINE_CREATE_KEY,
     crmReportError,
     crmReturnFocusFromSheet,
     getCrmActivitySubfields,
     isCrmOfflineQueueBlocked,
     isFieldMapping,
+    newCrmOfflineCreateKey,
     useCrmOffline,
 } from "@crm/mobile/crm_offline_hooks";
 import { CrmMobileLeadActivities } from "@crm/mobile/crm_mobile_lead_card/crm_mobile_lead_card";
@@ -54,6 +56,9 @@ const ARCHIVE_METHODS = Object.freeze(["action_archive", "action_unarchive"]);
 
 /** Field types whose record value is a list (its change is a list of commands). */
 const X2MANY_TYPES = Object.freeze(["one2many", "many2many"]);
+
+/** Format of a lead create's delivery key (`CRM_OFFLINE_CREATE_KEY`) the server accepts. */
+const CRM_CREATE_KEY_FORMAT = /^[0-9a-f]{32}$/;
 
 /** Lead contact fields the CRM save forces, each with the flag that decides it. */
 const FORCED_CONTACT_FLAGS = Object.freeze({
@@ -107,6 +112,22 @@ function crmWrittenLeadFields(value) {
 }
 
 class CrmFormRecord extends formView.Model.Record {
+    /**
+     * @override
+     * While a create of the still-new lead is built synchronously (its queued create,
+     * its page-close beacon: `_crmSendsCreateKey`), the context carries the lead's
+     * delivery key (`_crmCreateKey`), so every delivery of that create names the same
+     * lead. Every other read is the parent's context, unchanged.
+     */
+    get context() {
+        const context = super.context;
+        const record = toRaw(this);
+        if (!record._crmSendsCreateKey || !record._crmCreateKey || this.resId) {
+            return context;
+        }
+        return { ...context, [CRM_OFFLINE_CREATE_KEY]: record._crmCreateKey };
+    }
+
      /**
      * override of record _save mechanism intended to affect the main form record
      * We check if the stage_id field was altered and if we need to display a rainbowman
@@ -128,8 +149,11 @@ class CrmFormRecord extends formView.Model.Record {
         if (this.resModel !== "crm.lead") {
             return super._save(...arguments);
         }
-        // Online, while the running replay has still to send a queued write of the lead,
-        // the save is sent after it (`_crmAwaitLeadReplay`); any other save starts at once.
+        // While the running replay has still to send a queued write of the lead, or the
+        // queued create of the still-new lead, the save waits for it
+        // (`_crmAwaitLeadReplay`). While the connection is still reported lost, a save
+        // of a lead with such a write is then queued after that write instead of being
+        // sent (`_crmQueuesSave`). Any other save starts at once.
         const leadReplay = this._crmAwaitLeadReplay();
         if (leadReplay) {
             await leadReplay;
@@ -163,33 +187,57 @@ class CrmFormRecord extends formView.Model.Record {
             changeStage = this._values.stage_id !== this.data.stage_id;
         }
 
-        const res = await super._save(...arguments);
+        // Read after the replay hold above, which the end of the replay releases, also
+        // when the replay stopped on a lost connection. A save queued this way needs a
+        // lead id, and only a save of a still-new lead sends its delivery key, so at
+        // most one of the two paths changes the save.
+        const queues = untrack(() => this._crmQueuesSave());
+        const res = queues
+            ? await this._crmQueueSave(() => super._save(...arguments))
+            : await this._crmSaveSendingCreateKey(() => super._save(...arguments));
         // The rainbowman lookup is decorative: offline it is neither issued nor queued.
         // The signal is read after the save, because a connection lost during the save
-        // turns the plugin offline before the queued (offline) save resolves.
-        if (res && changeStage && !this.model.offlinePlugin.isOffline()) {
+        // turns the plugin offline before the queued (offline) save resolves. A save
+        // queued while the connection is reported lost is an offline save as well,
+        // even once the connection check it starts reports the connection back. A new
+        // lead whose save was queued into its still-queued create has no id to look up.
+        if (res && changeStage && this.resId && !queues && !this.model.offlinePlugin.isOffline()) {
             await checkRainbowmanMessage(this.model.orm, this.model.effect, this.resId);
         }
         return res;
     }
 
     /**
-     * Holds an online save of the lead until the running replay has sent the lead's
-     * queued writes. The replay sends each queued call with the values it held when
-     * it was queued, in queue order and one call a second, so a save sent while a
+     * Holds a save of the lead until the running replay has sent the lead's queued
+     * writes. The replay sends each queued call with the values it held when the
+     * replay started, in queue order and one call a second, so a save sent while a
      * write of the lead is still to be replayed reaches the server first and is then
      * overwritten by it, although the user made it last.
      *
      * The save is released once no pending (not parked) queued `crm.lead` call
-     * writing a field of the lead remains (`crmWrittenLeadFields`), once the replay
-     * ends, or once the connection is lost (the save is then queued, merged into the
-     * record's still-queued save). It waits in the model mutex, as any save does:
-     * edits made meanwhile apply after it, and the form's buttons stay disabled. The
-     * queue is left as it is.
+     * writing a field of the lead remains (`crmWrittenLeadFields`), or once the
+     * replay ends. A connection reported lost during the replay does not release it:
+     * the replay goes on until a call of it is lost, so a save sent, or merged into
+     * the record's queued save, before then would still be overwritten by that save's
+     * replay if the connection is in fact back. Once the replay stopped on a lost
+     * call, the save is queued without being sent, merged into the record's
+     * still-queued save (`_crmQueuesSave`). It waits in the model mutex, as any save
+     * does: edits made meanwhile apply after it, and the form's buttons stay
+     * disabled. The queue is left as it is.
      *
-     * Nothing is held for a record without an id (no queued write targets it), for an
-     * urgent save (the page is being left, and its beacon cannot wait), offline, when
-     * no replay runs, or for a save without an edit of the user (`_crmHasOwnEdits`).
+     * A new lead (no id, so no queued write targets it) is held the same way while
+     * its own queued create (`offlineId`) is pending: saving it before that create's
+     * replay would create the lead a second time. Once the create has left the queue,
+     * the save, which carries the create's delivery key (`_crmSaveSendingCreateKey`),
+     * reaches the server after it and writes its values on the lead it created; when
+     * the replay ends with the create still queued, the save is queued into it.
+     *
+     * Nothing is held for an urgent save (the page is being left, and its beacon
+     * cannot wait), when no replay runs, or for a save without an edit of the user
+     * (`_crmHasOwnEdits`); a record without an id is held only for its own pending
+     * queued create. While the connection is reported lost and no replay runs, a save
+     * of a lead with an id and a pending queued write is queued after that write
+     * instead (`_crmQueuesSave`).
      *
      * @returns {Promise<void>|undefined} resolved once the save may be sent;
      *   `undefined` when it may be sent at once
@@ -231,20 +279,191 @@ class CrmFormRecord extends formView.Model.Record {
     }
 
     /**
-     * Whether an online save of the lead waits for the running replay
-     * (`_crmAwaitLeadReplay`). It reads the plugin's connection, sync and queue
-     * signals, so that an effect calling it follows them.
+     * Whether a save of the lead waits for the running replay
+     * (`_crmAwaitLeadReplay`), whatever the connection state the plugin reports. It
+     * reads the plugin's sync and queue signals, so that an effect calling it
+     * follows them.
      *
      * @returns {boolean}
      */
     _crmIsLeadReplayPending() {
         const plugin = this.model.offlinePlugin;
-        if (!this.resId || this.model._urgentSave || plugin.isOffline() || !plugin.syncingORM()) {
+        if (this.model._urgentSave || !plugin.syncingORM()) {
             return false;
         }
+        if (!this.resId) {
+            return this._crmIsOwnCreatePending();
+        }
+        return this._crmHasPendingLeadWrite();
+    }
+
+    /**
+     * Whether a pending (not parked) queued `crm.lead` call writes a field of the
+     * lead (`crmWrittenLeadFields`): its replay, still to come, would overwrite the
+     * same fields of a save sent now. A parked call is not replayed.
+     *
+     * @returns {boolean}
+     */
+    _crmHasPendingLeadWrite() {
         return this._crmLeadQueuedCalls().some(
             ({ value }) => !value.extras?.error && crmWrittenLeadFields(value).length > 0
         );
+    }
+
+    /**
+     * Whether the save of the lead is queued after its pending queued writes instead
+     * of being sent (`_crmQueueSave`).
+     *
+     * The framework sends a save whatever the connection state, and queues it only
+     * when its request is lost. Once the connection is back, the connection is still
+     * reported lost until a request reaches the server, and no replay runs: a save
+     * made meanwhile reaches the server, which takes the connection for restored,
+     * and the replay then sends the lead's older queued writes over it. So, while
+     * the connection is reported lost and such a write is pending
+     * (`_crmHasPendingLeadWrite`), the save is queued as the framework queues a save
+     * whose request is lost (`_offlineSave`), which orders it after every queued
+     * call of the lead: the replay sends the older writes first, and the user's
+     * values last.
+     *
+     * Every other save is sent as before: online (the replay hold applies), for a
+     * record without an id (no queued write targets it; a still-new lead's save is
+     * queued into its own pending create by `_crmSaveSendingCreateKey` instead), for
+     * an urgent save (its beacon cannot wait, and a queue entry could not be stored
+     * before the page is left), and while no pending queued call writes the lead.
+     *
+     * @returns {boolean}
+     */
+    _crmQueuesSave() {
+        return (
+            Boolean(this.resId) &&
+            !this.model._urgentSave &&
+            this.model.offlinePlugin.isOffline() &&
+            this._crmHasPendingLeadWrite()
+        );
+    }
+
+    /**
+     * Runs the framework save `save` (`Record._save`) so that the lead's own
+     * `web_save` is not sent: the model's ORM fails it at once as a lost connection,
+     * before any request, so the framework queues the save (`_offlineSave`), exactly
+     * as when its request is lost. Every step before the request runs as it does for
+     * any save (validity, the controller's `onWillSaveRecord`), and every other call
+     * of the model's ORM is sent unchanged meanwhile.
+     *
+     * The request the save would have sent was also what told the framework that the
+     * connection is back. Once the save is queued, the plugin checks the connection
+     * (`checkConnection`, the check the offline systray offers) instead: when it is
+     * back, the replay starts and sends the lead's queued writes, this save last;
+     * otherwise nothing changes. The check is not awaited, so the save ends at once.
+     *
+     * @param {() => Promise<boolean>} save the parent's save
+     * @returns {Promise<boolean>} its result
+     */
+    async _crmQueueSave(save) {
+        const model = toRaw(this.model);
+        const orm = model.orm;
+        const resModel = this.resModel;
+        const resId = this.resId;
+        let queued = false;
+        const queuingOrm = Object.assign(Object.create(orm), {
+            webSave(saveModel, resIds) {
+                if (saveModel === resModel && resIds?.length === 1 && resIds[0] === resId) {
+                    queued = true;
+                    return Promise.reject(
+                        new ConnectionLostError(`/web/dataset/call_kw/${saveModel}/web_save`)
+                    );
+                }
+                return orm.webSave(...arguments);
+            },
+        });
+        model.orm = queuingOrm;
+        try {
+            return await save();
+        } finally {
+            if (model.orm === queuingOrm) {
+                model.orm = orm;
+            }
+            if (queued) {
+                model.offlinePlugin.checkConnection();
+            }
+        }
+    }
+
+    /**
+     * Whether the own queued create (`offlineId`) of this new lead is pending (queued,
+     * not parked). It reads the plugin's queue signal.
+     *
+     * @returns {boolean}
+     */
+    _crmIsOwnCreatePending() {
+        const entry = this._offlineId && this.model.offlinePlugin._ormToSync()[this._offlineId];
+        return Boolean(entry) && !entry.value.extras?.error;
+    }
+
+    /**
+     * Runs `save`, the parent save of this record, so that the create of the
+     * still-new lead it sends carries the lead's delivery key (`_crmCreateKey`): the
+     * key of the lead's queued create, which a lead has once it queued one. Its online
+     * `web_save` then names the lead its queued create names, so the server creates
+     * that lead once and writes the values of the later delivery on it. The page-close
+     * beacon (built synchronously by `save`) and a save queued when the connection is
+     * lost (`_offlineSave`) carry it through the record's context (`context`). A lead
+     * with an id, or without a key (no queued create), is saved as the parent saves it.
+     *
+     * The online create is sent only once the lead's own queued create has left the
+     * queue (replayed, or discarded) or is parked. While that create is still pending
+     * (a replay that stopped on a lost answer, or one not started yet), sending the
+     * save would let that older create, replayed later, write its values over the
+     * save's: the save is queued into it instead (`_offlineSave`, through the
+     * framework's lost-connection fallback), which replays the lead's create once,
+     * with the save's values, in its place in the queue.
+     *
+     * The form model's ORM is replaced until the save has sent its request, by one
+     * handling a `crm.lead` `web_save` without ids as above; every other call goes to
+     * the model's ORM.
+     *
+     * @param {() => Promise<boolean>} save
+     * @returns {Promise<boolean>}
+     */
+    async _crmSaveSendingCreateKey(save) {
+        const key = !this.resId && this._crmCreateKey;
+        if (!key) {
+            return save();
+        }
+        const record = toRaw(this);
+        const model = toRaw(this.model);
+        const orm = model.orm;
+        const keyedOrm = Object.assign(Object.create(orm), {
+            webSave(resModel, resIds, values, kwargs) {
+                if (resModel !== "crm.lead" || resIds.length) {
+                    return orm.webSave(...arguments);
+                }
+                if (untrack(() => record._crmIsOwnCreatePending())) {
+                    throw new ConnectionLostError(`/web/dataset/call_kw/${resModel}/web_save`);
+                }
+                kwargs = {
+                    ...kwargs,
+                    context: { ...kwargs?.context, [CRM_OFFLINE_CREATE_KEY]: key },
+                };
+                return orm.webSave(resModel, resIds, values, kwargs);
+            },
+        });
+        model.orm = keyedOrm;
+        const sendsKey = record._crmSendsCreateKey;
+        record._crmSendsCreateKey = true;
+        let promise;
+        try {
+            promise = save();
+        } finally {
+            record._crmSendsCreateKey = sendsKey;
+        }
+        try {
+            return await promise;
+        } finally {
+            if (model.orm === keyedOrm) {
+                model.orm = orm;
+            }
+        }
     }
 
     /**
@@ -548,6 +767,9 @@ class CrmFormRecord extends formView.Model.Record {
      * (`_crmOwnQueuedSaveKey`), never a follow-up write of it (`_offlineSave`), which
      * the form shows as a later queued write instead (`crmShowQueuedWrites`).
      *
+     * A new lead restored from its queued create takes that create's delivery key
+     * (`_crmCreateKey`), so its later saves, queued or online, name the same lead.
+     *
      * @param {string} [id] queue key of the save to restore (offline systray)
      */
     setOfflineChanges(id) {
@@ -555,6 +777,7 @@ class CrmFormRecord extends formView.Model.Record {
         if (!restoration) {
             return restoration;
         }
+        this._crmAdoptCreateKey();
         return restoration.then((result) => {
             const signatures = {};
             for (const fieldName in this._changes) {
@@ -587,6 +810,12 @@ class CrmFormRecord extends formView.Model.Record {
      *   lead (`_crmQueueFollowUpWrite`).
      * Every other save (no such field, a creation, another model) is the
      * framework's.
+     *
+     * The queued create of a new lead carries the lead's delivery key in its context
+     * (`CRM_OFFLINE_CREATE_KEY`), drawn at its first queued create and kept by the
+     * record (`_crmCreateKey`): the framework sends it again whenever its answer is
+     * lost, and the form's online save of the still-new lead sends it as well
+     * (`_crmSaveSendingCreateKey`), so the server creates that lead once.
      */
     _offlineSave() {
         this._crmForgetUnqueuedOfflineSave();
@@ -595,11 +824,45 @@ class CrmFormRecord extends formView.Model.Record {
         if (plan.timeStamp) {
             this._offlineTimeStamp = plan.timeStamp;
         }
-        const result = super._offlineSave(...arguments);
+        const drawsKey = this.resModel === "crm.lead" && !this.resId && !this._crmCreateKey;
+        if (drawsKey) {
+            this._crmCreateKey = newCrmOfflineCreateKey();
+        }
+        const record = toRaw(this);
+        const sendsKey = record._crmSendsCreateKey;
+        record._crmSendsCreateKey = true;
+        let result;
+        try {
+            result = super._offlineSave(...arguments);
+        } catch (error) {
+            // Nothing was queued (a non-secure origin has no queue): no create to name.
+            if (drawsKey) {
+                this._crmCreateKey = undefined;
+            }
+            throw error;
+        } finally {
+            record._crmSendsCreateKey = sendsKey;
+        }
         if (plan.followUp) {
             this._crmQueueFollowUpWrite(plan.followUp);
         }
         return result;
+    }
+
+    /**
+     * Takes the delivery key (`CRM_OFFLINE_CREATE_KEY`) of the queued create this new
+     * lead was just restored from (`offlineId`), when it has a valid one; a queued
+     * create without one leaves the record as it is.
+     */
+    _crmAdoptCreateKey() {
+        if (this.resModel !== "crm.lead" || this.resId || !this._offlineId) {
+            return;
+        }
+        const entry = this.model.offlinePlugin._ormToSync()[this._offlineId];
+        const key = entry?.value.kwargs?.context?.[CRM_OFFLINE_CREATE_KEY];
+        if (typeof key === "string" && CRM_CREATE_KEY_FORMAT.test(key)) {
+            this._crmCreateKey = key;
+        }
     }
 
     /**
@@ -827,9 +1090,10 @@ class CrmFormRecord extends formView.Model.Record {
      * Writes the record's queued changes (`_offlineChanges`) into its own offline
      * save while that save is still queued, at its key and with its other extras:
      * its time stamp, and the error of a parked save, which stays parked. A save
-     * made once the connection is back (the framework may still be offline) is
-     * written before the queue replays, so the replay must not send the values
-     * this save superseded.
+     * sent while that save is still queued (parked, or pending while the connection
+     * is up) is written before the queue replays it, so the replay must not send the
+     * values this save superseded. While the connection is reported lost, a save of
+     * the lead with a pending write is queued instead (`_crmQueuesSave`).
      */
     _crmRescheduleOwnSave() {
         if (!this._crmIsOwnSaveQueued()) {
@@ -1625,7 +1889,8 @@ export class CrmFormController extends formView.Controller {
         // replace the local presentation (won, archived): edits made since the form
         // restored the lead's queued save are saved, while the replayed values it
         // restored are not sent again. A lead created offline (no id), whose create
-        // was replayed, is left instead (`crmLeaveCreatedLead`). A parked call keeps
+        // was replayed, is left instead (`crmLeaveCreatedLead`), unless a save of the
+        // user during the replay gave it the created lead's id. A parked call keeps
         // the local presentation. Replayed calls the form still holds, with none of
         // its calls left, mean that the reconciliation after their replay was lost
         // (with the connection, or refused by the server): any later sync end, even
@@ -1887,16 +2152,20 @@ export class CrmFormController extends formView.Controller {
      * replay returns no id, so the form cannot show the created lead: it is left for
      * the containing action, which loads it from the server (a dialog is closed),
      * the exit the framework takes when a form has no record left. Unsaved edits are
-     * discarded first: they cannot reach the created lead, and leaving would save
-     * them as a second create. Nothing happens once the controller is destroyed or
-     * the model shows another record.
+     * discarded first: the user did not save them, and leaving would. Nothing happens
+     * once the controller is destroyed or the model shows another record, nor once
+     * the record has an id: the user saved it during the replay, and that save
+     * (`CrmFormRecord._crmSaveSendingCreateKey`) wrote on the created lead, which the
+     * form now shows.
      *
      * @param {Object} root the new record whose create was replayed
      * @returns {Promise<void>}
      */
     async crmLeaveCreatedLead(root) {
         const isStale = () =>
-            status(this) === "destroyed" || toRaw(this.model.root) !== toRaw(root);
+            status(this) === "destroyed" ||
+            toRaw(this.model.root) !== toRaw(root) ||
+            Boolean(root.resId);
         if ((await root.isDirty()) && !isStale()) {
             await root.discard();
         }
@@ -2587,9 +2856,11 @@ const LEAD_CHATTERS_BY_DROPZONE_REF = new WeakMap();
  * the attachments and the dropzone are also guarded where they run (below and in
  * the follower and dropzone patches).
  *
- * What a lead chatter skips offline is remembered for the displayed thread and
- * loaded once when the connection returns, so a lead opened or reloaded offline
- * gets its messages, followers and access rights back without being reopened.
+ * What a lead chatter skips offline, or loses to a dropped connection, is remembered
+ * for the displayed thread and loaded once when the connection returns, so a lead
+ * opened or reloaded offline, including one opened as the connection drops (before
+ * the framework notices it), gets its messages, followers and access rights back
+ * without being reopened, and shows no endless loading spinner.
  */
 patch(Chatter.prototype, {
     setup() {
@@ -2700,16 +2971,41 @@ patch(Chatter.prototype, {
      * Offline, a lead thread fetches nothing: it shows the messages already in the
      * store, and resolves (no rejection, no error). The skipped requests are loaded
      * once the connection returns.
+     *
+     * Online, a lead thread load whose connection is lost resolves the same way and
+     * keeps its requests for the reconnection. This is a lead opened while the
+     * connection is down but before the framework has noticed (it learns it from
+     * this load's failure, `RPC:RESPONSE`, and goes offline before the rejection
+     * reaches here), or a reconnection load during which the connection drops again.
+     * Mail leaves such a thread loading: its follower count and attachments are
+     * never fetched, and nothing fetches them later. Any other error is mail's, and
+     * other models' loads are untouched.
      */
     async load(thread, requestList) {
         // This Chatter has no `props` object: its `threadModel` prop is read through
         // the `propComputed` accessor `this.threadModel()`.
         const threadModel = thread?.model ?? this.threadModel();
-        if (threadModel === "crm.lead" && this.crmOfflinePlugin.isOffline()) {
+        if (threadModel !== "crm.lead") {
+            return super.load(...arguments);
+        }
+        if (this.crmOfflinePlugin.isOffline()) {
             this.crmRememberLoad(thread, requestList);
             return;
         }
-        return super.load(...arguments);
+        try {
+            return await super.load(...arguments);
+        } catch (error) {
+            if (!(error instanceof ConnectionLostError)) {
+                throw error;
+            }
+            // Mail marks the attachments loading as it requests them and clears the
+            // flag only when they arrive, so the lost request would leave the
+            // attachment spinner on: nothing is loading until the reconnection load.
+            if (thread && requestList?.includes("attachments")) {
+                thread.isLoadingAttachments = false;
+            }
+            this.crmRememberLoad(thread, requestList);
+        }
     },
 
     /**
@@ -2798,9 +3094,9 @@ patch(Chatter.prototype, {
     },
 
     /**
-     * Remembers requests skipped offline. Only those of the displayed thread are
-     * kept, as `load` ignores any other thread; a newly displayed thread (pager)
-     * replaces the requests of the previous one.
+     * Remembers requests skipped offline, or lost to a dropped connection. Only those
+     * of the displayed thread are kept, as `load` ignores any other thread; a newly
+     * displayed thread (pager) replaces the requests of the previous one.
      *
      * @param {import("models").Thread} thread
      * @param {string[]} [requestList]
@@ -2818,9 +3114,10 @@ patch(Chatter.prototype, {
     },
 
     /**
-     * Back online: loads, once, the requests skipped offline when their thread is
-     * still displayed. A connection lost again during that load keeps them for the
-     * next reconnection; the framework already treats that loss as going offline.
+     * Back online: loads, once, the requests skipped or lost offline when their
+     * thread is still displayed. A connection lost again during that load keeps them
+     * for the next reconnection (`load`); the framework already treats that loss as
+     * going offline.
      */
     crmLoadPending() {
         const pending = this.crmPendingLoad;
@@ -2828,13 +3125,7 @@ patch(Chatter.prototype, {
         if (!pending || !this.state.thread?.eq(pending.thread)) {
             return;
         }
-        const requestList = [...pending.requestList];
-        this.load(pending.thread, requestList).catch((error) => {
-            if (!(error instanceof ConnectionLostError)) {
-                throw error;
-            }
-            this.crmRememberLoad(pending.thread, requestList);
-        });
+        this.load(pending.thread, [...pending.requestList]);
     },
 
     /**

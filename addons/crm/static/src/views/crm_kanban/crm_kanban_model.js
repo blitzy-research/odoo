@@ -1,4 +1,5 @@
-import { toRaw } from "@odoo/owl";
+import { toRaw, untrack } from "@odoo/owl";
+import { crmLeadWriteTurn, crmPendingLeadWrites } from "@crm/mobile/crm_offline_hooks";
 import { checkRainbowmanMessage } from "@crm/views/check_rainbowman_message";
 import { ConnectionLostError } from "@web/core/network/rpc";
 import { RelationalModel } from "@web/model/relational_model/relational_model";
@@ -79,6 +80,21 @@ async function removeRecordsDeletedOffline(list, records) {
 }
 
 /**
+ * Turn of an online delete, from `list`, of leads the replay has still to send
+ * queued writes of (`crmLeadWriteTurn`): an `unlink` sent ahead of them would make
+ * them fail and park. The leads are the given records, else (a delete of the
+ * selection) the selected ones.
+ *
+ * @param {Object} list `CrmKanbanDynamicRecordList` or `CrmKanbanDynamicGroupList`
+ * @param {Object[]} records the records passed to `_deleteRecords`
+ * @returns {Promise<void>|undefined} `undefined` when the delete may be sent now
+ */
+function deleteTurn(list, records) {
+    const targets = records.length ? records : list.selection || [];
+    return crmLeadWriteTurn(list.model.offlinePlugin, targets);
+}
+
+/**
  * CRM kanban model, also used by `crm_mobile_pipeline` and, through
  * `ForecastKanbanModel`, by the forecast kanban.
  *
@@ -87,15 +103,69 @@ async function removeRecordsDeletedOffline(list, records) {
  * `crmServerValues`. Its lists retain that snapshot across group loads, so
  * overlapping loads cannot mix roots. The snapshot persists nothing and serves
  * no reads.
+ *
+ * A write of a lead from its card (a save, such as a stage move or a colour, or a
+ * delete) made while the replay has still to send queued writes of that lead waits
+ * for them, whatever connection state the plugin reports (`crmWriteInTurn`,
+ * `crmLeadWriteTurn`), so that the write made last reaches the server last. A card
+ * save made while the connection is reported lost and such a write is pending is
+ * queued after it instead of being sent (`CrmKanbanRecord`).
  */
 export class CrmKanbanModel extends RelationalModel {
     setup(params, { effect }) {
         super.setup(...arguments);
         this.effect = effect;
-        // Assigned here rather than as a class field: `Model`'s constructor runs
+        // Assigned here rather than as class fields: `Model`'s constructor runs
         // `setup` (including subclasses' such as ForecastKanbanModel) before any
         // class field of this class would be initialised.
         this._crmLoadingServerValues = null;
+        /** @type {Set<Promise<void>>} settlements of the writes `crmWriteInTurn` holds */
+        this._crmHeldWrites = new Set();
+    }
+
+    /**
+     * Runs `write`, a write of the lead `record` setting `fieldNames`, once the
+     * replay has sent (or parked) the queued writes of that lead it must follow, or
+     * has ended (`crmLeadWriteTurn`), so that the server keeps the value written
+     * last; a connection reported lost meanwhile does not end the wait. With no
+     * replay running, or none of those writes left, `write` runs at once, with no
+     * added wait. A held write marks the record (`crmTurnWrite`, which the mobile
+     * projections read): its values of `fieldNames` show over the queued and
+     * replayed writes stamped up to now, while it waits and once it is done, until
+     * a reload replaces the record; a write that fails or saves nothing (`false`)
+     * drops the mark. Root loads started meanwhile wait for the held write (`load`),
+     * so that the reload ending a replay reads what it wrote.
+     *
+     * @template T
+     * @param {Object} record
+     * @param {string[]} fieldNames
+     * @param {() => Promise<T>} write
+     * @returns {Promise<T>}
+     */
+    crmWriteInTurn(record, fieldNames, write) {
+        const turn = crmLeadWriteTurn(this.offlinePlugin, [record], fieldNames);
+        if (!turn) {
+            return write();
+        }
+        const mark = { timeStamp: Date.now(), fieldNames: [...fieldNames] };
+        record.crmTurnWrite = mark;
+        const dropMark = () => {
+            if (toRaw(record.crmTurnWrite) === mark) {
+                record.crmTurnWrite = undefined;
+            }
+        };
+        const result = turn.then(write);
+        const settled = result.then(
+            (saved) => {
+                if (saved === false) {
+                    dropMark();
+                }
+            },
+            dropMark
+        );
+        this._crmHeldWrites.add(settled);
+        settled.then(() => this._crmHeldWrites.delete(settled));
+        return result;
     }
 
     /**
@@ -117,9 +187,14 @@ export class CrmKanbanModel extends RelationalModel {
      * propagates as the framework raises it. Each variant is read as
      * `_crmLoadRoot` reads it, so a load makes at most four attempts. The
      * server-value snapshot needs no handling here: it belongs to the root the load
-     * builds.
+     * builds. A load started while card writes wait for their turn in the replay
+     * (`crmWriteInTurn`) first waits for them, whatever their outcome, so that it
+     * reads what they wrote; otherwise it starts at once.
      */
     async load(params = {}) {
+        if (this._crmHeldWrites.size) {
+            await Promise.all(this._crmHeldWrites);
+        }
         try {
             await this._crmLoadRoot(...arguments);
         } catch (error) {
@@ -168,6 +243,29 @@ export class CrmKanbanModel extends RelationalModel {
     /**
      * @override
      *
+     * A root load given `crmServerGroups: true` lists only the groups the server
+     * returns. On a reload of the same search, the framework lists again, emptied,
+     * the groups it showed before and the server no longer returns
+     * (`config.currentGroups`), so a stage deleted on the server since would stay
+     * listed. Those groups are dropped from the configuration of that load only: a
+     * load that fails leaves the model's configuration as it was. Without the
+     * option (every framework and desktop load), nothing changes.
+     *
+     * @param {Object} currentConfig
+     * @param {Object} params
+     * @returns {Object}
+     */
+    _getNextConfig(currentConfig, params) {
+        const config = super._getNextConfig(...arguments);
+        if (params?.crmServerGroups) {
+            delete config.currentGroups;
+        }
+        return config;
+    }
+
+    /**
+     * @override
+     *
      * Every root, including the empty one of the first load, is built with a
      * fresh server-value snapshot of its own.
      */
@@ -196,6 +294,179 @@ export class CrmKanbanModel extends RelationalModel {
     }
 }
 
+export class CrmKanbanRecord extends RelationalModel.Record {
+    /**
+     * @override
+     *
+     * A save of a lead (a card's stage move, by drag or by the mobile stage select,
+     * its colour, any field a card saves) made while the replay has still to send
+     * queued writes of that lead writing one of the saved fields is sent after them
+     * (`CrmKanbanModel.crmWriteInTurn`), so that the server keeps the value saved
+     * last; a connection reported lost meanwhile does not release it. The record
+     * already shows its changes meanwhile. The save then runs as the framework runs
+     * it (queued if its request is lost), except that while the connection is
+     * reported lost and such a write is still pending, it is queued after that write
+     * without being sent (`_crmQueuesSave`). Urgent saves (page close) are never
+     * held or queued here, and online with no replay running every save is sent at
+     * once.
+     */
+    _save() {
+        if (this.model._urgentSave || this.resModel !== "crm.lead") {
+            return super._save(...arguments);
+        }
+        const args = arguments;
+        toRaw(this)._crmSaveQueued = false;
+        return this.model.crmWriteInTurn(this, Object.keys(this._changes), () =>
+            untrack(() => this._crmQueuesSave())
+                ? this._crmQueueSave(() => super._save(...args))
+                : super._save(...args)
+        );
+    }
+
+    /**
+     * Whether the save of the lead is queued after its pending queued writes instead
+     * of being sent (`_crmQueueSave`).
+     *
+     * The framework sends a save whatever the connection state, and queues it only
+     * when its request is lost. Once the connection is back, it is still reported
+     * lost until a request reaches the server: a card save made meanwhile reaches the
+     * server, which takes the connection for restored, and the replay then sends the
+     * lead's older queued writes of the same fields over it. So, while the connection
+     * is reported lost and a pending (not parked) queued write of the lead writes one
+     * of the saved fields (`crmPendingLeadWrites`), the save is queued as the
+     * framework queues a save whose request is lost (`_offlineSave`), after those
+     * writes: the replay sends them first, and the card's values last.
+     *
+     * Every other save is sent as before: online (the replay turn applies), for a
+     * record without an id, for an urgent save (its beacon cannot wait), and while no
+     * pending queued write of the lead writes a saved field.
+     *
+     * @returns {boolean}
+     */
+    _crmQueuesSave() {
+        return (
+            Boolean(this.resId) &&
+            !this.model._urgentSave &&
+            this.model.offlinePlugin.isOffline() &&
+            crmPendingLeadWrites(this.model.offlinePlugin, this, Object.keys(this._changes))
+                .length > 0
+        );
+    }
+
+    /**
+     * Runs the framework save `save` (`Record._save`) so that the lead's own
+     * `web_save` is not sent: the model's ORM fails it at once as a lost connection,
+     * before any request, so the framework queues the save (`_offlineSave`), exactly
+     * as when its request is lost. Every step before the request runs as it does for
+     * any save, and every other call of the model's ORM is sent unchanged meanwhile.
+     * A queued save marks the record (`_crmSaveQueued`), so that the stage move it
+     * belongs to does no rainbowman lookup, as for any offline move.
+     *
+     * The request the save would have sent was also what told the framework that the
+     * connection is back. Once the save is queued, the plugin checks the connection
+     * (`checkConnection`, the check the offline systray offers) instead: when it is
+     * back, the replay starts and sends the lead's queued writes, this save last;
+     * otherwise nothing changes. The check is not awaited, so the save ends at once.
+     *
+     * @param {() => Promise<boolean>} save the parent's save
+     * @returns {Promise<boolean>} its result
+     */
+    async _crmQueueSave(save) {
+        const model = toRaw(this.model);
+        const orm = model.orm;
+        const resModel = this.resModel;
+        const resId = this.resId;
+        let queued = false;
+        const queuingOrm = Object.assign(Object.create(orm), {
+            webSave(saveModel, resIds) {
+                if (saveModel === resModel && resIds?.length === 1 && resIds[0] === resId) {
+                    queued = true;
+                    return Promise.reject(
+                        new ConnectionLostError(`/web/dataset/call_kw/${saveModel}/web_save`)
+                    );
+                }
+                return orm.webSave(...arguments);
+            },
+        });
+        model.orm = queuingOrm;
+        try {
+            return await save();
+        } finally {
+            if (model.orm === queuingOrm) {
+                model.orm = orm;
+            }
+            if (queued) {
+                toRaw(this)._crmSaveQueued = true;
+                model.offlinePlugin.checkConnection();
+            }
+        }
+    }
+
+    /**
+     * @override
+     *
+     * The framework queues every offline save of a record under the key and time
+     * stamp of its first one, and replays the queue in time-stamp order. A field this
+     * save writes that a pending queued write of the lead stamped since also writes
+     * (made through another record of the lead, such as its form) would then replay
+     * before that write and lose to it, although the user wrote it last. Such a save
+     * is queued as an entry of its own, holding the changes of this save only,
+     * stamped after those writes (`_crmOfflineSaveTimeStamp`): the record's earlier
+     * queued save, if any, stays as it is, in its place, and the user's card values
+     * replay last. Every other offline save is the framework's.
+     *
+     * @returns {boolean}
+     */
+    _offlineSave() {
+        const timeStamp = untrack(() => this._crmOfflineSaveTimeStamp());
+        if (!timeStamp) {
+            return super._offlineSave(...arguments);
+        }
+        const { _offlineId, _offlineChanges, _offlineTimeStamp } = this;
+        this._offlineId = undefined;
+        this._offlineChanges = undefined;
+        this._offlineTimeStamp = timeStamp;
+        try {
+            return super._offlineSave(...arguments);
+        } catch (error) {
+            // Nothing was queued (a non-secure origin has no queue): the record keeps
+            // its queued save.
+            Object.assign(this, { _offlineId, _offlineChanges, _offlineTimeStamp });
+            throw error;
+        }
+    }
+
+    /**
+     * Time stamp at which the lead's offline save about to be queued (`_offlineSave`)
+     * is queued as an entry of its own: after every pending (not parked) queued write
+     * of the lead writing one of the saved fields (`crmPendingLeadWrites`) and stamped
+     * with or after the time stamp the framework would give the save (that of the
+     * record's queued save, else of its previous one, else now). `0` when there is
+     * no such write: the framework's save then replays after every write of those
+     * fields already.
+     *
+     * @returns {number}
+     */
+    _crmOfflineSaveTimeStamp() {
+        if (this.resModel !== "crm.lead" || !this.resId) {
+            return 0;
+        }
+        const plugin = this.model.offlinePlugin;
+        const ownKey = this._offlineId;
+        const own = ownKey ? plugin._ormToSync()[ownKey] : undefined;
+        const saveTimeStamp = own?.value.extras?.timeStamp || this._offlineTimeStamp || Date.now();
+        const writes = crmPendingLeadWrites(plugin, this, Object.keys(this._changes));
+        let timeStamp = 0;
+        for (const { key, value } of writes) {
+            const writeTimeStamp = value.extras?.timeStamp || 0;
+            if (key !== ownKey && writeTimeStamp >= saveTimeStamp) {
+                timeStamp = Math.max(timeStamp, Date.now(), writeTimeStamp + 1);
+            }
+        }
+        return timeStamp;
+    }
+}
+
 export class CrmKanbanDynamicGroupList extends RelationalModel.DynamicGroupList {
     /**
      * @override
@@ -215,7 +486,11 @@ export class CrmKanbanDynamicGroupList extends RelationalModel.DynamicGroupList 
      * a rainbowman message if that's the case. The lookup is decorative, so it is
      * skipped while offline: the connection is read once the move has been saved
      * (or queued, which flips the offline signal), so nothing is issued, queued or
-     * raised.
+     * raised. A move made during a replay that has still to send queued writes of
+     * the lead's stage is saved after them (`CrmKanbanRecord`), and looked up then.
+     * A move queued while the connection was still reported lost
+     * (`CrmKanbanRecord._crmQueueSave`) is an offline move as well, even once the
+     * connection check it started reports the connection back: it is not looked up.
      */
     async moveRecord(dataRecordId, dataGroupId, refId, targetGroupId) {
         await super.moveRecord(...arguments);
@@ -229,7 +504,9 @@ export class CrmKanbanDynamicGroupList extends RelationalModel.DynamicGroupList 
             !this.model.offlinePlugin.isOffline()
         ) {
             const record = targetGroup.list.records.find((r) => r.id === dataRecordId);
-            await checkRainbowmanMessage(this.model.orm, this.model.effect, record.resId);
+            if (!toRaw(record)._crmSaveQueued) {
+                await checkRainbowmanMessage(this.model.orm, this.model.effect, record.resId);
+            }
         }
     }
 
@@ -266,9 +543,15 @@ export class CrmKanbanDynamicGroupList extends RelationalModel.DynamicGroupList 
      *
      * The kanban card menu deletes through the root (`model.root.deleteRecords`),
      * which is this list when grouped: offline, the deleted cards are removed from
-     * their groups at once, each group decrementing its own count.
+     * their groups at once, each group decrementing its own count. Online, during a
+     * replay that has still to send queued writes of the deleted leads, the delete
+     * is sent after them (`deleteTurn`).
      */
     async _deleteRecords(records) {
+        const turn = deleteTurn(this, records);
+        if (turn) {
+            await turn;
+        }
         const res = await super._deleteRecords(...arguments);
         await removeRecordsDeletedOffline(this, records);
         return res;
@@ -381,15 +664,22 @@ export class CrmKanbanDynamicRecordList extends RelationalModel.DynamicRecordLis
      *
      * Offline, the deleted records are removed from the list at once (ungrouped
      * root, or a group's list through `Group.deleteRecords`, the group then
-     * decrementing its own count). Online, `super` reloads the model.
+     * decrementing its own count). Online, `super` reloads the model; during a
+     * replay that has still to send queued writes of the deleted leads, the delete
+     * is sent after them (`deleteTurn`).
      */
     async _deleteRecords(records) {
+        const turn = deleteTurn(this, records);
+        if (turn) {
+            await turn;
+        }
         const res = await super._deleteRecords(...arguments);
         await removeRecordsDeletedOffline(this, records);
         return res;
     }
 }
 
+CrmKanbanModel.Record = CrmKanbanRecord;
 CrmKanbanModel.DynamicGroupList = CrmKanbanDynamicGroupList;
 CrmKanbanModel.DynamicRecordList = CrmKanbanDynamicRecordList;
 CrmKanbanModel.services = [...RelationalModel.services, "effect"];
