@@ -1,6 +1,8 @@
 import { checkRainbowmanMessage } from "@crm/views/check_rainbowman_message";
 import { registry } from "@web/core/registry";
+import { FormCompiler } from "@web/views/form/form_compiler";
 import { formView } from "@web/views/form/form_view";
+import { StatusBarButtons } from "@web/views/form/status_bar_buttons/status_bar_buttons";
 
 import {
     computed,
@@ -2653,10 +2655,90 @@ export class CrmFormController extends formView.Controller {
     }
 }
 
+/**
+ * Tells whether a compiled header element is a view button whose arch tags it
+ * `data-available-offline` ("Won" in the lead form): the compiler serializes the
+ * button's non-click attributes as the JSON of its `attrs` prop
+ * (`ViewCompiler.compileButton`).
+ *
+ * @param {Element} compiled
+ * @returns {boolean}
+ */
+function isAvailableOfflineViewButton(compiled) {
+    if (compiled?.tagName !== "ViewButton") {
+        return false;
+    }
+    try {
+        const attrs = JSON.parse(compiled.getAttribute("attrs") || "{}");
+        return Boolean(attrs["data-available-offline"]);
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Form compiler of the lead form (`crm_form`). It compiles as the framework does,
+ * and also gives each header button slot of `StatusBarButtons` whose button the arch
+ * tags `data-available-offline` the slot param `crmAvailableOffline`.
+ *
+ * On a small screen `StatusBarButtons` shows only its first visible button and puts
+ * the others under a "More" dropdown, whose toggle the framework disables offline.
+ * An addon adding a header button before "Won" (`sale_crm`'s "New Quotation") so
+ * pushes "Won" under that toggle, and the offline mark-won (queued by
+ * `CrmFormController`) can no longer be reached on a phone. The slot param lets the
+ * `StatusBarButtons` patch below keep that toggle available offline while it holds
+ * such a button. It renders nothing itself: the wide layout and every other form are
+ * unchanged.
+ */
+export class CrmFormCompiler extends FormCompiler {
+    compileHeader(el, params) {
+        const statusBar = super.compileHeader(...arguments);
+        const statusBarButtons = [...statusBar.children].find(
+            (child) => child.tagName === "StatusBarButtons"
+        );
+        for (const slot of statusBarButtons?.children || []) {
+            if (isAvailableOfflineViewButton(slot.firstElementChild)) {
+                slot.setAttribute("crmAvailableOffline", "true");
+            }
+        }
+        return statusBar;
+    }
+}
+
+patch(StatusBarButtons.prototype, {
+    setup() {
+        super.setup(...arguments);
+        this.crmOfflinePlugin = usePlugin(OfflinePlugin);
+    },
+
+    /**
+     * Whether the small-screen "More" toggle carries `data-available-offline`
+     * (`web.StatusBarButtons` extension): when one of the visible buttons it holds
+     * is tagged available offline by the lead form's arch (`CrmFormCompiler`), as
+     * "Won" is under `sale_crm`'s "New Quotation". Offline the framework then leaves
+     * the toggle enabled: the dropdown opens on that button, which stays enabled,
+     * while every other button in it keeps the framework's disabled offline state.
+     * Like the lead card-menu toggle, the toggle is framework-disabled where the
+     * framework queue cannot hold the queued call of those buttons
+     * (`isCrmOfflineQueueBlocked`), as "Won" then is. Slots without that param, the
+     * buttons of every other form, are tested first, so their toggle is unchanged.
+     *
+     * @returns {boolean}
+     */
+    get crmMoreAvailableOffline() {
+        const slots = this.props.slots || {};
+        return (
+            this.visibleSlotNames.slice(1).some((name) => slots[name].crmAvailableOffline) &&
+            !isCrmOfflineQueueBlocked(this.crmOfflinePlugin)
+        );
+    },
+});
+
 registry.category("views").add("crm_form", {
     ...formView,
     Model: CrmFormModel,
     Controller: CrmFormController,
+    Compiler: CrmFormCompiler,
 });
 
 /**

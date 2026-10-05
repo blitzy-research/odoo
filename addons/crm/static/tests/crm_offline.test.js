@@ -16288,3 +16288,225 @@ test("[Offline] parked lead save retried from the systray after a server change 
     expect(".o_form_view").toHaveCount(0);
     expect(queued("crm.lead")).toEqual([]);
 });
+
+// Refine D3.2a (P2): an addon adding a header button before "Won", as sale_crm adds
+// "New Quotation", moves "Won" under the phone header's "More" toggle, which the
+// framework disables offline. While that toggle holds a lead-form button tagged
+// available offline ("Won"), it stays available offline, so the offline mark-won is
+// still reached on a phone; every other "More" toggle keeps the framework's state.
+
+/** Lead form header as `sale_crm` extends it: "New Quotation" before "Won", then "Lost". */
+const QUOTATION_FIRST_HEADER = /* xml */ `
+    <header>
+        <button name="action_sale_quotations_new" string="New Quotation" type="object" class="oe_highlight"
+            invisible="type == 'lead' or probability == 0 and not active"/>
+        <button name="action_set_won_rainbowman" string="Won" type="object" class="oe_highlight"
+            data-hotkey="w" title="Mark as won" data-available-offline="1"
+            invisible="won_status == 'won' or type == 'lead' or not active"/>
+        <button name="${LOST_ACTION_ID}" string="Lost" type="action" data-hotkey="l" title="Mark as lost"
+            invisible="won_status != 'pending' or not active"/>
+        <field name="stage_id" widget="rotting_statusbar_duration"
+            options="{'clickable': '1', 'fold_field': 'fold', 'crm_call_activity_type_id': ${CALL_ACTIVITY_TYPE_ID}}"
+            invisible="type == 'lead'" readonly="won_status == 'lost' or not active"/>
+    </header>`;
+
+/** Lead form arch (`LEAD_FORM_ARCH`) with the `sale_crm` header. */
+const LEAD_FORM_QUOTATION_FIRST_ARCH = LEAD_FORM_ARCH.replace(
+    LEAD_FORM_HEADER,
+    QUOTATION_FIRST_HEADER
+);
+
+/** The same lead form without "Won": "More" holds only "Lost", which is DISABLE. */
+const LEAD_FORM_QUOTATION_NO_WON_ARCH = LEAD_FORM_QUOTATION_FIRST_ARCH.replace(
+    /<button name="action_set_won_rainbowman"[^>]*\/>/,
+    ""
+);
+
+const HEADER_QUOTATION = ".o_statusbar_buttons button[name=action_sale_quotations_new]";
+const HEADER_MORE = ".o_statusbar_buttons button[title=More]";
+const MORE_WON = ".o-dropdown--menu button[name=action_set_won_rainbowman]";
+const MORE_LOST = `.o-dropdown--menu button[name='${LOST_ACTION_ID}']`;
+
+test.tags("mobile");
+test("[Offline] phone lead form reaches Won under the header's More toggle and queues it", async () => {
+    registerInlineViewArchs("crm.lead", { "form,false": LEAD_FORM_QUOTATION_FIRST_ARCH });
+    const setOffline = mockOffline();
+    stepRoutes(
+        (route) =>
+            route === RAINBOWMAN_ROUTE ||
+            /\/crm\.lead\/(action_set_won_rainbowman|action_sale_quotations_new)$/.test(route)
+    );
+    await openPipeline();
+    await openLead(1);
+    await flushStartupSync();
+
+    // Online: the phone header shows "New Quotation", with "Won" and "Lost" under
+    // "More", whose toggle carries the attribute (it has no effect online).
+    expect(HEADER_QUOTATION).toHaveCount(1);
+    expect(".o_statusbar_buttons button[name=action_set_won_rainbowman]").toHaveCount(0);
+    expectAvailableOffline(HEADER_MORE);
+    await contains(HEADER_MORE).click();
+    expect(MORE_WON).toHaveCount(1);
+    expect(MORE_LOST).toHaveCount(1);
+    await contains(HEADER_MORE).click();
+    expect(MORE_WON).toHaveCount(0);
+
+    // Offline: "New Quotation" is guarded; "More" stays available and opens on an
+    // enabled "Won" next to a guarded "Lost".
+    await setOffline(true);
+    expectGuarded(HEADER_QUOTATION, 1);
+    expectAvailableOffline(HEADER_MORE);
+    await contains(HEADER_MORE).click();
+    expectAvailableOffline(MORE_WON);
+    expectGuarded(MORE_LOST, 1);
+    await contains(MORE_WON).click();
+
+    expect(".ribbon:contains(Won)").toHaveCount(1);
+    expect(".o_field_widget[name=probability]").toHaveText("100.00");
+    const won = {
+        model: "crm.lead",
+        method: "action_set_won",
+        args: [[1]],
+        kwargs: { context: queuedContext(PIPELINE_ACTION.context) },
+    };
+    expect(queuedCalls("crm.lead")).toEqual([won]);
+    // Neither the rainbowman variant nor the rainbowman lookup, nor "New Quotation".
+    expect.verifySteps([]);
+
+    await reconnect(setOffline);
+    await expect.waitForSteps([won]);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0]).toMatchObject({
+        stage_id: STAGE_WON,
+        won_status: "won",
+        probability: 100,
+    });
+    expect.verifySteps([]);
+});
+
+test.tags("mobile");
+test("[Offline] phone header More toggle holding no available-offline lead button stays framework-disabled", async () => {
+    const setOffline = mockOffline();
+    await mountView({
+        type: "form",
+        resModel: "crm.lead",
+        resId: 1,
+        arch: LEAD_FORM_QUOTATION_NO_WON_ARCH,
+        config: { actionId: 1 },
+    });
+    await flushStartupSync();
+    expect(HEADER_QUOTATION).toHaveCount(1);
+    expect(HEADER_MORE).toHaveCount(1);
+    expect(HEADER_MORE).not.toHaveAttribute("data-available-offline");
+
+    await setOffline(true);
+    expectGuarded(HEADER_QUOTATION, 1);
+    expectFrameworkDisabled(HEADER_MORE);
+    await click(HEADER_MORE);
+    await animationFrame();
+    expect(MORE_LOST).toHaveCount(0);
+
+    await setOffline(false);
+    await animationFrame();
+    expect(HEADER_MORE).not.toHaveClass("o_disabled_offline");
+    expect(HEADER_MORE).toBeEnabled();
+    await contains(HEADER_MORE).click();
+    expect(MORE_LOST).toHaveCount(1);
+});
+
+test.tags("mobile");
+test("[Offline] phone header More toggle of another model's form keeps the framework state", async () => {
+    const setOffline = mockOffline();
+    // Not a lead form (`crm_form`): a button tagged available offline under "More"
+    // leaves the toggle as the framework renders it.
+    await mountView({
+        type: "form",
+        resModel: "res.partner",
+        resId: serverState.partnerId,
+        arch: /* xml */ `
+            <form>
+                <header>
+                    <button name="action_first" string="First" type="object"/>
+                    <button name="action_second" string="Second" type="object" data-available-offline="1"/>
+                </header>
+                <sheet>
+                    <field name="name"/>
+                </sheet>
+            </form>`,
+    });
+    expect(HEADER_MORE).toHaveCount(1);
+    expect(HEADER_MORE).not.toHaveAttribute("data-available-offline");
+
+    await setOffline(true);
+    expectFrameworkDisabled(HEADER_MORE);
+
+    await setOffline(false);
+    await animationFrame();
+    expect(HEADER_MORE).not.toHaveClass("o_disabled_offline");
+    expect(HEADER_MORE).toBeEnabled();
+});
+
+test.tags("mobile");
+test("[Offline] non-secure origin disables the phone header More toggle holding Won", async () => {
+    registerInlineViewArchs("crm.lead", { "form,false": LEAD_FORM_QUOTATION_FIRST_ARCH });
+    const setOffline = mockOffline();
+    stepRoutes((route) => /\/crm\.lead\/(action_set_won|action_set_won_rainbowman)$/.test(route));
+    await openPipeline();
+    // A non-secure origin, where the framework queue refuses every call (set after
+    // the web client started, as in "non-secure origin disables Won").
+    patchWithCleanup(window, { isSecureContext: false });
+    await openLead(1);
+    await flushStartupSync();
+    expectAvailableOffline(HEADER_MORE);
+
+    // Offline, "Won" could not be queued: the toggle holding it is framework-disabled.
+    await setOffline(true);
+    expectFrameworkDisabled(HEADER_MORE);
+    await click(HEADER_MORE);
+    await animationFrame();
+    expect(MORE_WON).toHaveCount(0);
+    expect(".ribbon:contains(Won)").toHaveCount(0);
+    expect(queued("crm.lead")).toEqual([]);
+    expect.verifySteps([]);
+
+    // Online again, the toggle is available and "Won" marks the lead won.
+    await setOffline(false);
+    await animationFrame();
+    expectAvailableOffline(HEADER_MORE);
+    await contains(HEADER_MORE).click();
+    await contains(MORE_WON).click();
+    await expect.waitForSteps([
+        buttonRoute("crm.lead", "action_set_won_rainbowman"),
+        "action_set_won_rainbowman [1]",
+    ]);
+    await animationFrame();
+    expect(".ribbon:contains(Won)").toHaveCount(1);
+    expect(queued("crm.lead")).toEqual([]);
+});
+
+test.tags("desktop");
+test("[Offline] desktop lead form header with a button before Won keeps Won inline", async () => {
+    registerInlineViewArchs("crm.lead", { "form,false": LEAD_FORM_QUOTATION_FIRST_ARCH });
+    const setOffline = mockOffline();
+    await openPipeline();
+    await openLead(1);
+    await flushStartupSync();
+    const wonButton = ".o_statusbar_buttons button[name=action_set_won_rainbowman]";
+    expect(HEADER_MORE).toHaveCount(0);
+    expect(".o_statusbar_buttons > button").toHaveCount(3);
+
+    await setOffline(true);
+    expect(HEADER_MORE).toHaveCount(0);
+    expectGuarded(HEADER_QUOTATION, 1);
+    expectAvailableOffline(wonButton);
+    await contains(wonButton).click();
+    expect(".ribbon:contains(Won)").toHaveCount(1);
+    expect(queuedCalls("crm.lead")).toEqual([
+        {
+            model: "crm.lead",
+            method: "action_set_won",
+            args: [[1]],
+            kwargs: { context: queuedContext(PIPELINE_ACTION.context) },
+        },
+    ]);
+});

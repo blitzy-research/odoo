@@ -21,6 +21,12 @@ const OFFLINE_CARD = ".o_crm_mobile_lead_card:contains(Offline Lead)";
 const SYNCED_OFFLINE_CARD = `${OFFLINE_CARD}:not(.o_crm_mobile_lead_card_provisional):not(:has(.o_crm_mobile_pending_sync))`;
 const ACTIVITY_SHEET = ".o_crm_mobile_lead_activities_sheet";
 const ACTIVITY_ROWS = ".o_crm_mobile_lead_activities .o_crm_mobile_activity_row";
+/** The phone header's "More" toggle, enabled and available offline (`crmMoreAvailableOffline`). */
+const HEADER_MORE =
+    ".o_form_view .o_statusbar_buttons button[title=More][data-available-offline]:enabled";
+/** The saved name of "Offline Lead" in its form (text widget, hence a textarea). */
+const OFFLINE_LEAD_SAVED_NAME =
+    ".o_form_saved .o_field_widget[name=name] textarea:value(Offline Lead)";
 
 /**
  * Whether a `console.error` argument reports a `ConnectionLostError`: the error
@@ -349,8 +355,22 @@ registry.category("web_tour.tours").add("crm_mobile_offline", {
             run: "click",
         },
         {
+            // Refine D3.2a (P2): an addon adding a header button before "Won"
+            // (sale_crm's "New Quotation") puts "Won" under the phone header's
+            // "More" toggle, which stays available offline while it holds "Won".
+            content:
+                "Reach Won offline, under the header's More toggle when another button comes first",
+            trigger: `.o_form_view button[name=action_set_won_rainbowman]:enabled, ${HEADER_MORE}`,
+            async run({ queryFirst, click }) {
+                if (!queryFirst(".o_form_view button[name=action_set_won_rainbowman]")) {
+                    await click(queryFirst(HEADER_MORE));
+                }
+            },
+        },
+        {
             content: "Mark the lead won offline",
-            trigger: ".o_form_view button[name=action_set_won_rainbowman]:enabled",
+            trigger:
+                ".o_form_view button[name=action_set_won_rainbowman]:enabled, .o-dropdown--menu button[name=action_set_won_rainbowman]:enabled",
             run: "click",
         },
         {
@@ -358,8 +378,11 @@ registry.category("web_tour.tours").add("crm_mobile_offline", {
             trigger: ".o_form_view .ribbon span:contains(Won)",
         },
         {
+            // Under "More", a gone "Won" also leaves the toggle without the offline
+            // attribute it carried while holding "Won".
             content: "The Won button is gone",
-            trigger: ".o_form_view:not(:has(button[name=action_set_won_rainbowman]))",
+            trigger:
+                ".o_form_view:not(:has(button[name=action_set_won_rainbowman])):not(:has(.o_statusbar_buttons button[title=More][data-available-offline]))",
         },
         {
             content: "No rainbowman is shown offline",
@@ -393,10 +416,15 @@ registry.category("web_tour.tours").add("crm_mobile_offline", {
             run: "click",
         },
         {
-            // A pending opportunity: its form shows the Won button. The lead form
-            // renders its name with the text widget, hence a textarea.
+            // A pending opportunity: its form shows the Won button, or, when another
+            // addon's header button comes first (Refine D3.2a (P2)), the "More"
+            // toggle holding it, the one that carries the offline attribute. The
+            // lead form renders its name with the text widget, hence a textarea.
             content: "The server record of the created lead opens in its form",
-            trigger: `.o_form_view:has(button[name=action_set_won_rainbowman]) .o_form_saved .o_field_widget[name=name] textarea:value(Offline Lead)`,
+            trigger: [
+                `.o_form_view:has(button[name=action_set_won_rainbowman]) ${OFFLINE_LEAD_SAVED_NAME}`,
+                `.o_form_view:has(.o_statusbar_buttons button[title=More][data-available-offline]) ${OFFLINE_LEAD_SAVED_NAME}`,
+            ].join(", "),
         },
     ],
 });

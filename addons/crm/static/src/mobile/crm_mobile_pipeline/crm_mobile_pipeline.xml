@@ -324,6 +324,18 @@
         </xpath>
     </t>
 
+    <!--
+        Small-screen "More" toggle of the form header buttons: available offline while
+        it holds a lead-form button tagged available offline, such as "Won" under
+        sale_crm's "New Quotation" (crmMoreAvailableOffline, crm_form.js). Otherwise
+        the attribute is absent, as in the framework template.
+    -->
+    <t t-inherit="web.StatusBarButtons" t-inherit-mode="extension">
+        <xpath expr="//button[@title='More']" position="attributes">
+            <attribute name="t-att-data-available-offline">this.crmMoreAvailableOffline ? '1' : false</attribute>
+        </xpath>
+    </t>
+
     <!-- View-mount backstop (crmOfflineBlocked, crm_offline_hooks.js): a blocked CRM target shows the offline helper instead of its controller. -->
     <t t-inherit="web.View" t-inherit-mode="extension">
         <xpath expr="//WithSearch" position="attributes">
