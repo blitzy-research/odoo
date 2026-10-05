@@ -582,6 +582,271 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         for fname in ('activity_ids', 'activity_state', 'activity_date_deadline', 'activity_type_id'):
             self.assertEqual(lead[fname], online_lead[fname], f'Replayed and online Mark Done differ on lead {fname}')
 
+    def _activity_call_vals(self, user, lead, summary='Call'):
+        """ The values of the ``mail.activity`` ``create`` the CRM activity sheet
+        sends for "Log a call" on ``lead``, assigned to ``user``, JSON-serialized:
+        the lead named by ``res_model`` only, the deadline a "YYYY-MM-DD" string. """
+        return {
+            'res_model': 'crm.lead',
+            'res_id': lead.id,
+            'activity_type_id': self.call_type.id,
+            'summary': summary,
+            'date_deadline': fields.Date.to_string(fields.Date.today()),
+            'user_id': user.id,
+        }
+
+    def _log_call(self, user, lead, key, summary='Call', **context):
+        """ Deliver, as ``user``, the call the CRM activity sheet sends for "Log a
+        call", online or replayed from the offline queue: ``mail.activity``
+        ``create`` of one value with the scheduled activity's delivery key
+        (``crm_offline_create_key``) plus ``context`` in its context.
+
+        :return: the ``create`` answer, a ``mail.activity`` record
+        """
+        return self.env['mail.activity'].with_user(user).with_context(crm_offline_create_key=key, **context).create(
+            [self._activity_call_vals(user, lead, summary)],
+        )
+
+    def _lead_activities(self, lead):
+        """ Every activity of ``lead``, done (archived) ones included. """
+        return self.env['mail.activity'].with_context(active_test=False).search([
+            ('res_model', '=', 'crm.lead'), ('res_id', '=', lead.id),
+        ])
+
+    def test_offline_activity_create_replay_same_key_creates_once(self):
+        """ "Log a call" whose answer was lost (the server created the activity,
+        then the connection dropped) is sent again verbatim with the same
+        delivery key: replayed again from the queue, or queued by the online
+        create whose answer was lost and replayed. The server answers with the
+        activity the first delivery created and creates nothing: one activity
+        per scheduled activity. Through the web client's JSON-RPC route, both
+        deliveries answer the same id. A done (archived) activity is still the
+        delivered one; a deleted one takes its key with it. """
+        salesman = self.user_sales_salesman
+        lead = self._create_salesman_opportunity('Lost Answer Activity Lead')
+        key = secrets.token_hex(16)
+
+        first = self._log_call(salesman, lead, key)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(self._lead_activities(lead), first)
+        self.assertEqual((first.create_uid, first.user_id, first.summary), (salesman, salesman, 'Call'))
+        self.assertEqual(first.activity_type_id, self.call_type)
+        # ir.model is not readable by salespersons: the link is read as superuser
+        self.assertEqual(first.sudo().res_model_id.model, 'crm.lead')
+        self.assertIn(first, lead.with_user(salesman).activity_ids)
+        xmlid = self._quick_create_xmlids(key)
+        self.assertEqual(len(xmlid), 1)
+        self.assertEqual(
+            (xmlid.model, xmlid.res_id, xmlid.noupdate, xmlid.complete_name),
+            ('mail.activity', first.id, True, f'__crm_offline__.{key}'),
+        )
+        self.assertEqual(self.env.ref(f'__crm_offline__.{key}'), first)
+        lead.invalidate_recordset(['message_ids', 'message_follower_ids'])
+        messages, followers = lead.message_ids, lead.message_follower_ids
+
+        # delivered again, twice: the same activity, nothing created or posted
+        for _delivery in range(2):
+            self.assertEqual(self._log_call(salesman, lead, key), first)
+        self.assertEqual(self._lead_activities(lead), first)
+        self.assertEqual(self.env['mail.activity'].with_context(active_test=False).search_count([('summary', '=', 'Call'), ('res_id', '=', lead.id)]), 1)
+        self.assertEqual(self._quick_create_xmlids(key), xmlid)
+        lead.invalidate_recordset(['message_ids', 'message_follower_ids'])
+        self.assertEqual(lead.message_ids, messages, 'A repeated delivery posts nothing')
+        self.assertEqual(lead.message_follower_ids, followers, 'A repeated delivery subscribes nobody')
+
+        # the web client's JSON-RPC route: the call the sheet sends online, then
+        # the same call replayed from the queue (with the id of its user)
+        self.authenticate(salesman.login, salesman.login)
+        route_key = secrets.token_hex(16)
+        call = {
+            'model': 'mail.activity',
+            'method': 'create',
+            'args': [[self._activity_call_vals(salesman, lead, 'Route Call')]],
+            'kwargs': {'context': {'uid': salesman.id, 'crm_offline_create_key': route_key}},
+        }
+        delivered = self.make_jsonrpc_request('/web/dataset/call_kw/mail.activity/create', call)
+        replayed_call = copy.deepcopy(call)
+        replayed_call['kwargs']['context']['crm_offline_uid'] = salesman.id
+        redelivered = self.make_jsonrpc_request('/web/dataset/call_kw/mail.activity/create', replayed_call)
+        route_activity = self._lead_activities(lead) - first
+        self.assertEqual(len(route_activity), 1)
+        self.assertEqual(delivered, route_activity.ids)
+        self.assertEqual(redelivered, delivered)
+        self.assertEqual((route_activity.create_uid, route_activity.summary), (salesman, 'Route Call'))
+        self.assertEqual(self._quick_create_xmlids(route_key).res_id, route_activity.id)
+
+        # marked done (archived): still the delivered activity
+        first.with_user(salesman).action_done()
+        self.assertTrue(first.exists())
+        self.assertFalse(first.active)
+        self.assertEqual(self._log_call(salesman, lead, key), first)
+        self.assertEqual(self._lead_activities(lead), first | route_activity)
+
+        # deleted: its external identifier goes, and the key creates it again
+        first.sudo().unlink()
+        self.assertFalse(self._quick_create_xmlids(key))
+        recreated = self._log_call(salesman, lead, key)
+        self.assertNotEqual(recreated.id, first.id)
+        self.assertEqual(self._lead_activities(lead), recreated | route_activity)
+        self.assertEqual(self._quick_create_xmlids(key).res_id, recreated.id)
+
+        # an external identifier left behind by an activity deleted without the
+        # ORM is taken over by the next delivery of its key
+        self.env.cr.execute('DELETE FROM mail_activity WHERE id = %s', [recreated.id])
+        self.env['mail.activity'].invalidate_model()
+        taken_over = self._log_call(salesman, lead, key)
+        self.assertNotIn(taken_over.id, (first.id, recreated.id))
+        self.assertEqual(self._quick_create_xmlids(key).res_id, taken_over.id)
+        self.assertEqual(self._log_call(salesman, lead, key), taken_over)
+        self.assertEqual(self._lead_activities(lead), taken_over | route_activity)
+
+    def test_offline_activity_create_replay_key_refused(self):
+        """ A delivery key registered by another user's activity create, or by a
+        lead create, is refused: no activity is returned or created. A keyed
+        create whose context ``uid`` names another user than the caller (one
+        user's queued create replayed in the session of the next user of a
+        shared browser) is refused before its key is looked up, and creates and
+        registers nothing; delivered by the user it names, it creates its
+        activity once. """
+        salesman, other = self.user_sales_salesman, self.user_sales_leads
+        lead = self._create_salesman_opportunity('Foreign Key Activity Lead')
+
+        key = secrets.token_hex(16)
+        foreign = self._log_call(other, lead, key)
+        self.assertEqual(foreign.create_uid, other)
+        with self.assertRaises(AccessError) as refused:
+            self._log_call(salesman, lead, key)
+        # sent by its own user: the web client keeps it parked, it is not replayed again
+        self.assertNotIsInstance(refused.exception, CrmOfflineOriginError)
+        self.assertEqual(refused.exception.args[0], 'This activity was already created by another user.')
+        self.assertEqual(self._lead_activities(lead), foreign)
+        self.assertEqual(self._quick_create_xmlids(key).res_id, foreign.id)
+
+        # the key of a lead created by the mobile quick create names no activity
+        lead_key = secrets.token_hex(16)
+        [quick] = self._quick_create(salesman, {
+            'name': 'Quick Key Lead',
+            'contact_name': '',
+            'phone': '',
+            'email_from': '',
+            'expected_revenue': 0.0,
+            'stage_id': self.stage_gen_1.id,
+        }, lead_key)
+        with self.assertRaises(AccessError) as refused:
+            self._log_call(salesman, lead, lead_key)
+        self.assertNotIsInstance(refused.exception, CrmOfflineOriginError)
+        self.assertEqual(self._lead_activities(lead), foreign)
+        self.assertEqual(
+            (self._quick_create_xmlids(lead_key).model, self._quick_create_xmlids(lead_key).res_id),
+            ('crm.lead', quick['id']),
+        )
+
+        # queued by another user than the caller: refused, nothing registered
+        origin_key = secrets.token_hex(16)
+        with self._assert_queued_by_another_user():
+            self._log_call(salesman, lead, origin_key, uid=other.id)
+        self.assertEqual(self._lead_activities(lead), foreign)
+        self.assertFalse(self._quick_create_xmlids(origin_key))
+
+        # delivered by the user who queued it: created once
+        own = self._log_call(salesman, lead, origin_key, uid=salesman.id)
+        self.assertEqual(own.create_uid, salesman)
+        self.assertEqual(self._log_call(salesman, lead, origin_key, uid=salesman.id), own)
+        self.assertEqual(self._lead_activities(lead), foreign | own)
+        self.assertEqual(self._quick_create_xmlids(origin_key).res_id, own.id)
+
+        # a later delivery naming another user is refused before the key is looked up
+        with self._assert_queued_by_another_user():
+            self._log_call(salesman, lead, origin_key, uid=other.id)
+        with self._assert_queued_by_another_user():
+            self._log_call(other, lead, origin_key, uid=salesman.id)
+        # a boolean is no user id: the delivery is checked as without one
+        self.assertEqual(self._log_call(salesman, lead, origin_key, uid=False), own)
+        self.assertEqual(self._lead_activities(lead), foreign | own)
+
+    def test_offline_activity_create_replay_invalid_key(self):
+        """ Without a well-formed delivery key, or for a create of several values
+        (a key names one scheduled activity), an activity create is a plain
+        create: every delivery creates its activities, and no external
+        identifier is registered. """
+        salesman = self.user_sales_salesman
+        lead = self._create_salesman_opportunity('Unkeyed Activity Lead')
+        # fixed, with letters, so that its upper-case variant is not a valid key
+        hex_key = '0123456789abcdef' * 2
+        invalid_keys = [
+            hex_key.upper(), hex_key[:-1], hex_key + '0', f'{hex_key[:-1]}g', f' {hex_key}',
+            f'{hex_key}\n', int(hex_key, 16), False, None,
+        ]
+        for key in invalid_keys:
+            with self.subTest(key=key):
+                for _delivery in range(2):
+                    self._log_call(salesman, lead, key)
+        # without the context key
+        for _delivery in range(2):
+            self.env['mail.activity'].with_user(salesman).create([self._activity_call_vals(salesman, lead)])
+        activities = self._lead_activities(lead)
+        self.assertEqual(len(activities), 2 * len(invalid_keys) + 2)
+        self.assertEqual(set(activities.mapped('summary')), {'Call'})
+        self.assertFalse(self.env['ir.model.data'].search([('model', '=', 'mail.activity'), ('res_id', 'in', activities.ids)]))
+        self.assertFalse(self.env['ir.model.data'].search([('module', '=', '__crm_offline__'), ('name', 'ilike', hex_key[:-1])]))
+
+        # a valid key sent with several values selects no delivery
+        batch_key = secrets.token_hex(16)
+        for _delivery in range(2):
+            batch = self.env['mail.activity'].with_user(salesman).with_context(crm_offline_create_key=batch_key).create([
+                self._activity_call_vals(salesman, lead, 'Batch Call'),
+                self._activity_call_vals(salesman, lead, 'Batch Follow-up'),
+            ])
+            self.assertEqual(batch.mapped('summary'), ['Batch Call', 'Batch Follow-up'])
+            self.assertEqual(batch.sudo().res_model_id.mapped('model'), ['crm.lead'])
+        batches = self._lead_activities(lead) - activities
+        self.assertEqual(len(batches), 4)
+        self.assertFalse(self._quick_create_xmlids(batch_key))
+
+    def test_offline_activity_create_replay_concurrent_delivery(self):
+        """ A delivery whose lookup does not see the key a concurrent delivery
+        registered (another tab replaying the same queued create, its
+        registration committed after this delivery's snapshot) creates an
+        activity it cannot register the key for. It is rolled back with that
+        activity and retried by the RPC layer, and the retry answers with the
+        activity the first delivery created: no error reaches the web client,
+        which would park a create that succeeded. The lookup of the first
+        attempt is made blind to the registration, which happens in the same
+        transaction, so the retry is deterministic. """
+        salesman = self.user_sales_salesman
+        lead = self._create_salesman_opportunity('Concurrent Activity Lead')
+        key = secrets.token_hex(16)
+        first = self._log_call(salesman, lead, key)
+        self.assertEqual(self._quick_create_xmlids(key).res_id, first.id)
+
+        IrModelData = self.registry['ir.model.data']
+        search = IrModelData.search
+        key_domain = [('module', '=', '__crm_offline__'), ('name', '=', key)]
+        blind_lookups = []
+
+        def search_blind_once(records, domain, *args, **kwargs):
+            if domain == key_domain and not blind_lookups:
+                blind_lookups.append(domain)
+                return records.browse()
+            return search(records, domain, *args, **kwargs)
+
+        self.authenticate(salesman.login, salesman.login)
+        call = {
+            'model': 'mail.activity',
+            'method': 'create',
+            'args': [[self._activity_call_vals(salesman, lead)]],
+            'kwargs': {'context': {'uid': salesman.id, 'crm_offline_uid': salesman.id, 'crm_offline_create_key': key}},
+        }
+        with patch.object(IrModelData, 'search', search_blind_once):
+            redelivered = self.make_jsonrpc_request('/web/dataset/call_kw/mail.activity/create', call)
+        self.assertEqual(blind_lookups, [key_domain], 'The first attempt did not see the registration')
+        self.assertEqual(redelivered, [first.id], 'The retry answers with the activity the first delivery created')
+        self.assertEqual(
+            self._lead_activities(lead), first,
+            'The activity of the attempt that could not register the key was rolled back',
+        )
+        self.assertEqual(self._quick_create_xmlids(key).res_id, first.id)
+
     def test_offline_quick_create_replay(self):
         """ The mobile quick create queues ``web_save [[], vals]`` with the six
         fields it captures and ``{context: <pipeline list context>,
@@ -1326,6 +1591,12 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         # ir.model is not readable by salespersons: the link is read as superuser
         self.assertEqual(call_activity.sudo().res_model_id.model, 'crm.lead')
         self.assertEqual(call_activity.res_id, synced_lead.id)
+        # sent with its delivery key, registered once with the activity it created
+        call_key = self.env['ir.model.data'].search([
+            ('module', '=', '__crm_offline__'), ('model', '=', 'mail.activity'), ('res_id', '=', call_activity.id),
+        ])
+        self.assertEqual(len(call_key), 1)
+        self.assertRegex(call_key.name, r'^[0-9a-f]{32}$')
         # the deadline is the browser's "today", which may differ from the server's by the timezone
         self.assertTrue(call_activity.date_deadline)
         self.assertLessEqual(abs(call_activity.date_deadline - fields.Date.today()), timedelta(days=1))

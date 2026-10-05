@@ -12733,7 +12733,8 @@ function queueQuickCreate(plugin, vals, deliveryKey) {
 
 /**
  * Queues an activity create of a pipeline lead as the mobile activity sheet does
- * (`scheduleActivity`): the session user's context and the pipeline's extras.
+ * (`scheduleActivity`): the session user's context with a new delivery key
+ * (`CRM_OFFLINE_CREATE_KEY`, 32 lowercase hex digits) and the pipeline's extras.
  *
  * @param {OfflinePlugin} plugin
  * @param {number} resId the lead
@@ -12742,6 +12743,9 @@ function queueQuickCreate(plugin, vals, deliveryKey) {
  * @returns {string} its queue key
  */
 function queueLeadActivity(plugin, resId, summary, userId) {
+    const deliveryKey = [...crypto.getRandomValues(new Uint8Array(16))]
+        .map((byte) => byte.toString(16).padStart(2, "0"))
+        .join("");
     return plugin.scheduleORM(
         "mail.activity",
         "create",
@@ -12757,7 +12761,7 @@ function queueLeadActivity(plugin, resId, summary, userId) {
                 },
             ],
         ],
-        { context: user.context },
+        { context: { ...user.context, [CRM_OFFLINE_CREATE_KEY]: deliveryKey } },
         {
             extras: {
                 actionId: PIPELINE_ACTION.id,

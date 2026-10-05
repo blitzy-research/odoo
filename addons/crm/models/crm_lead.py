@@ -80,9 +80,10 @@ PARTNER_ADDRESS_FIELDS_TO_SYNC = [
 PLS_COMPUTE_BATCH_STEP = 50000  # PREFETCH_MAX = 1000 but larger cluster can speed up global computation
 PLS_UPDATE_BATCH_STEP = 5000
 
-# Delivery key of a lead create sent by the mobile quick create, online or replayed
-# from the offline queue (context key, see `web_save`), and the external identifier
-# module under which it is registered with the lead it created.
+# Delivery key of a lead create sent by the mobile quick create, or of an activity
+# create sent by the CRM activity sheet, online or replayed from the offline queue
+# (context key, see `web_save` and `mail.activity` `create`), and the external
+# identifier module under which it is registered with the record it created.
 CRM_OFFLINE_CREATE_KEY = 'crm_offline_create_key'
 CRM_OFFLINE_CREATE_MODULE = '__crm_offline__'
 CRM_OFFLINE_CREATE_KEY_RE = re.compile(r'[0-9a-f]{32}')

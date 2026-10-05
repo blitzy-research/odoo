@@ -9084,6 +9084,9 @@ test("mobile activities: log a call queues the Call type offline and shows pendi
 
     const [create] = queued("mail.activity");
     expect(create.method).toBe("create");
+    // Queued with the activity's delivery key.
+    const key = create.kwargs.context[CRM_OFFLINE_CREATE_KEY];
+    expect(key).toMatch(DELIVERY_KEY);
     const createCall = {
         model: "mail.activity",
         method: "create",
@@ -9099,7 +9102,13 @@ test("mobile activities: log a call queues the Call type offline and shows pendi
                 },
             ],
         ],
-        kwargs: { context: { ...user.context, [CRM_OFFLINE_UID_KEY]: user.userId } },
+        kwargs: {
+            context: {
+                ...user.context,
+                [CRM_OFFLINE_CREATE_KEY]: key,
+                [CRM_OFFLINE_UID_KEY]: user.userId,
+            },
+        },
     };
     expect(create.args).toEqual(createCall.args);
     // The user context: no default of the lead action becomes an activity default.
@@ -9226,12 +9235,21 @@ test("mobile activities: schedule follow-up queues offline and shows pending", a
         user_id: serverState.userId,
     };
     expect(create.args[0][0]).toEqual(followUpValues);
-    // The user context only: no key of the lead action becomes an activity default.
+    const key = create.kwargs.context[CRM_OFFLINE_CREATE_KEY];
+    expect(key).toMatch(DELIVERY_KEY);
+    // The user context and the activity's delivery key only: no key of the lead
+    // action becomes an activity default.
     const createCall = {
         model: "mail.activity",
         method: "create",
         args: [[followUpValues]],
-        kwargs: { context: { ...user.context, [CRM_OFFLINE_UID_KEY]: user.userId } },
+        kwargs: {
+            context: {
+                ...user.context,
+                [CRM_OFFLINE_CREATE_KEY]: key,
+                [CRM_OFFLINE_UID_KEY]: user.userId,
+            },
+        },
     };
     expect(queued("mail.activity").map(ormCall)).toEqual([createCall]);
     const pending = ".o_crm_mobile_activity_pending";
@@ -9730,12 +9748,15 @@ test("mobile activities: an open form keeps its type options when the cached typ
         date_deadline: "2026-10-03",
         user_id: serverState.userId,
     };
+    // Sent online with the user context and the activity's delivery key.
+    const key = received[0]?.kwargs.context[CRM_OFFLINE_CREATE_KEY];
+    expect(key).toMatch(DELIVERY_KEY);
     expect(received).toEqual([
         {
             model: "mail.activity",
             method: "create",
             args: [[followUpValues]],
-            kwargs: { context: user.context },
+            kwargs: { context: { ...user.context, [CRM_OFFLINE_CREATE_KEY]: key } },
         },
     ]);
     expect(".o_crm_mobile_activity_form").toHaveCount(0);
@@ -11766,6 +11787,201 @@ test("mobile activities: the schedule form opens in view and focused, styled lik
     expect(Math.round(emptyLine.getBoundingClientRect().top - headerBottom())).toBe(
         headerToFirstRow
     );
+});
+
+// -----------------------------------------------------------------------------
+// Refine D1.4 (R4): an activity create whose answer is lost is created once, by
+// the delivery key (`CRM_OFFLINE_CREATE_KEY`) it carries online and queued alike
+// -----------------------------------------------------------------------------
+
+/**
+ * Emulates the server's activity create by delivery key (the CRM `mail.activity`
+ * `create` override): a create whose context carries the key
+ * (`CRM_OFFLINE_CREATE_KEY`) of an activity already created answers with that
+ * activity and creates nothing. The mock server also loses the answer of the next
+ * creates, one per value pushed to the returned `losses`: the server creates the
+ * activity, then its answer reaches the page as a lost connection (a 502). Each
+ * create is stepped as `create <summary>`, or `create <summary> (delivered)` when
+ * its key answered it, with ` (answer lost)` appended when its answer is lost; its
+ * payload (`ormCall`) is appended to `received`.
+ *
+ * @returns {{losses: true[], received: Object[]}}
+ */
+function mockActivityCreatesByKey() {
+    const state = { losses: [], received: [] };
+    const activityIdsByKey = new Map();
+    onRpc("mail.activity", "create", async (call) => {
+        const { args, kwargs, parent } = call;
+        state.received.push(JSON.parse(JSON.stringify(ormCall(call))));
+        const key = kwargs.context?.[CRM_OFFLINE_CREATE_KEY];
+        let step = `create ${args[0][0].summary}`;
+        let result;
+        if (activityIdsByKey.has(key)) {
+            step += " (delivered)";
+            result = [activityIdsByKey.get(key)];
+        } else {
+            result = await parent();
+            if (typeof key === "string") {
+                activityIdsByKey.set(key, result[0]);
+            }
+        }
+        if (state.losses.length && state.losses.shift()) {
+            expect.step(`${step} (answer lost)`);
+            return new Response("", { status: 502 });
+        }
+        expect.step(step);
+        return result;
+    });
+    return state;
+}
+
+/** Ids of the server activities of "Office Design" (lead 1) summarized `summary`. */
+function officeDesignActivityIds(summary) {
+    return MockServer.env["mail.activity"]
+        .search_read(
+            [
+                ["res_model", "=", "crm.lead"],
+                ["res_id", "=", 1],
+                ["summary", "=", summary],
+            ],
+            ["id"]
+        )
+        .map(({ id }) => id);
+}
+
+/** The values "Log a call" schedules on "Office Design" (lead 1) on 2026-10-02. */
+function officeDesignCall() {
+    return {
+        res_model: "crm.lead",
+        res_id: 1,
+        activity_type_id: CALL_TYPE_ID,
+        summary: "Call",
+        date_deadline: "2026-10-02",
+        user_id: serverState.userId,
+    };
+}
+
+test.tags("mobile");
+test("mobile activities: a call logged offline whose replay answer is lost is sent again with its key and created once", async () => {
+    mockDate("2026-10-02 10:00:00");
+    const server = mockActivityCreatesByKey();
+    const setOffline = mockOffline();
+    await mountPipeline();
+    await setOffline(true);
+    await openActivities("Office Design");
+    await contains(".o_crm_mobile_log_call").click();
+    await contains(".o_crm_mobile_activity_save").click();
+
+    // Queued with a new delivery key and the id of the session user.
+    const [create] = queued("mail.activity");
+    const key = create.kwargs.context[CRM_OFFLINE_CREATE_KEY];
+    expect(key).toMatch(DELIVERY_KEY);
+    const createCall = {
+        model: "mail.activity",
+        method: "create",
+        args: [[officeDesignCall()]],
+        kwargs: {
+            context: {
+                ...user.context,
+                [CRM_OFFLINE_CREATE_KEY]: key,
+                [CRM_OFFLINE_UID_KEY]: user.userId,
+            },
+        },
+    };
+    expect(ormCall(create)).toEqual(createCall);
+    expect(".o_crm_mobile_activity_pending .o_crm_mobile_pending_sync").toHaveText("Pending sync");
+
+    // The replay's create reaches the server, which creates the activity, but its
+    // answer is lost: the create stays queued, unparked and unchanged, and its row
+    // stays pending.
+    server.losses.push(true);
+    await setOffline(false);
+    await expect.waitForSteps(["create Call (answer lost)"]);
+    await animationFrame();
+    expect(getService(OfflinePlugin).isOffline()).toBe(true);
+    expect(officeDesignActivityIds("Call")).toHaveLength(1);
+    const [kept] = queued("mail.activity");
+    expect(ormCall(kept)).toEqual(createCall);
+    expect(kept.extras.error).toBe(undefined);
+    expect(".o_crm_mobile_activity_pending .o_crm_mobile_activity_title").toHaveText("Call");
+    expect(".o_crm_mobile_activity_pending .o_crm_mobile_pending_sync").toHaveText("Pending sync");
+
+    // Reconnected, the replay sends the very same call, which the server answers with
+    // the activity it created: one server activity, shown once as a synced row of the
+    // still-open sheet.
+    await reconnect(setOffline);
+    expect.verifySteps(["create Call (delivered)"]);
+    expect(server.received).toEqual([createCall, createCall]);
+    expect(queued("mail.activity")).toEqual([]);
+    const callIds = officeDesignActivityIds("Call");
+    expect(callIds).toHaveLength(1);
+    expect(".o_bottom_sheet .o_crm_mobile_lead_activities_sheet").toHaveCount(1);
+    expect(".o_crm_mobile_activity_pending").toHaveCount(0);
+    expect(activityTitles().sort()).toEqual(["Call", "Follow-up call", "Send brochure"]);
+    expect(`${activityRow(callIds[0])} .o_crm_mobile_activity_title`).toHaveText("Call");
+    expect(`${activityRow(callIds[0])} .o_crm_mobile_activity_done`).toBeEnabled();
+});
+
+test.tags("mobile");
+test("mobile activities: a call logged online whose answer is lost queues the key it sent and is created once", async () => {
+    mockDate("2026-10-02 10:00:00");
+    const server = mockActivityCreatesByKey();
+    const setOffline = mockOffline();
+    await mountPipeline();
+    await openActivities("Office Design");
+
+    // Saved online, the server creates the activity but its answer is lost: the
+    // create is queued with the delivery key the online create sent, and its row is
+    // pending in the still-open sheet.
+    server.losses.push(true);
+    await contains(".o_crm_mobile_log_call").click();
+    await contains(".o_crm_mobile_activity_save").click();
+    await expect.waitForSteps(["create Call (answer lost)"]);
+    await animationFrame();
+    expect(getService(OfflinePlugin).isOffline()).toBe(true);
+    expect(".o_crm_mobile_activity_form").toHaveCount(0);
+    expect(officeDesignActivityIds("Call")).toHaveLength(1);
+    const [sent] = server.received;
+    const key = sent.kwargs.context[CRM_OFFLINE_CREATE_KEY];
+    expect(key).toMatch(DELIVERY_KEY);
+    expect(sent).toEqual({
+        model: "mail.activity",
+        method: "create",
+        args: [[officeDesignCall()]],
+        kwargs: { context: { ...user.context, [CRM_OFFLINE_CREATE_KEY]: key } },
+    });
+    const [create] = queued("mail.activity");
+    const queuedCall = {
+        ...sent,
+        kwargs: { context: { ...sent.kwargs.context, [CRM_OFFLINE_UID_KEY]: user.userId } },
+    };
+    expect(ormCall(create)).toEqual(queuedCall);
+    expect(create.extras.error).toBe(undefined);
+    expect(".o_crm_mobile_activity_pending .o_crm_mobile_activity_title").toHaveText("Call");
+    expect(".o_crm_mobile_activity_pending .o_crm_mobile_pending_sync").toHaveText("Pending sync");
+
+    // Its replay sends the call the online create sent, queued with the id of the
+    // session user, which the server answers with the activity it created: one
+    // server activity, shown once as a synced row.
+    await reconnect(setOffline);
+    expect.verifySteps(["create Call (delivered)"]);
+    expect(server.received).toEqual([sent, queuedCall]);
+    expect(queued("mail.activity")).toEqual([]);
+    const callIds = officeDesignActivityIds("Call");
+    expect(callIds).toHaveLength(1);
+    expect(".o_crm_mobile_activity_pending").toHaveCount(0);
+    expect(activityTitles().sort()).toEqual(["Call", "Follow-up call", "Send brochure"]);
+    expect(`${activityRow(callIds[0])} .o_crm_mobile_activity_done`).toBeEnabled();
+
+    // A new call, logged online, carries a new key and is a second activity.
+    await contains(".o_crm_mobile_log_call").click();
+    await contains(".o_crm_mobile_activity_save").click();
+    await expect.waitForSteps(["create Call"]);
+    expect(server.received).toHaveLength(3);
+    expect(server.received[2].kwargs.context[CRM_OFFLINE_CREATE_KEY]).toMatch(DELIVERY_KEY);
+    expect(server.received[2].kwargs.context[CRM_OFFLINE_CREATE_KEY]).not.toBe(key);
+    expect(officeDesignActivityIds("Call")).toHaveLength(2);
+    expect(queued("mail.activity")).toEqual([]);
 });
 
 // -----------------------------------------------------------------------------

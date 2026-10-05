@@ -997,11 +997,12 @@ const CRM_REPLAY_MODELS = freezeSet(["crm.lead", "crm.stage", "crm.team", "mail.
 const crmReplayPlugins = new WeakSet();
 
 /**
- * Context key of the delivery key a quick create sends with its lead create, online
- * and in its queued replay alike. The framework replay is at-least-once (a create
- * whose answer is lost stays queued and is sent again), so the server's `crm.lead`
- * `web_save` registers the key with the lead it creates and answers any later
- * delivery of that key with this lead instead of creating another one.
+ * Context key of the delivery key a quick create sends with its lead create, and
+ * the activity sheet with each activity it schedules, online and in its queued
+ * replay alike. The framework replay is at-least-once (a create whose answer is
+ * lost stays queued and is sent again), so the server's `crm.lead` `web_save` and
+ * `mail.activity` `create` register the key with the record they create and answer
+ * any later delivery of that key with this record instead of creating another one.
  */
 export const CRM_OFFLINE_CREATE_KEY = "crm_offline_create_key";
 
@@ -1056,9 +1057,10 @@ async function removeReplayedFromStore(plugin, key) {
  *
  * Every other outcome is the framework's: the call is sent unchanged, a lost
  * connection stops the replay and keeps the entry, and any other error parks it.
- * A lead create whose answer is lost is therefore sent again, verbatim: it carries
- * the delivery key of its quick create (`CRM_OFFLINE_CREATE_KEY`), by which the
- * server answers a create it already made instead of making it twice.
+ * A lead or activity create whose answer is lost is therefore sent again,
+ * verbatim: it carries the delivery key of its quick create or scheduled activity
+ * (`CRM_OFFLINE_CREATE_KEY`), by which the server answers a create it already made
+ * instead of making it twice.
  *
  * @param {OfflinePlugin} plugin
  * @param {Object} silentOrm the plugin's silent ORM, with the settings of the ORM
@@ -2022,6 +2024,13 @@ export function useCrmOffline() {
          * only a server error of the create rejects; once the activity is created,
          * the lead reload does not (`reloadRecord`).
          *
+         * The context also carries a new delivery key (`CRM_OFFLINE_CREATE_KEY`),
+         * one per scheduled activity. An offline create is queued with it; an
+         * online create whose connection drops is queued as the very call it sent,
+         * key included. A create whose answer was lost may have created the
+         * activity, and its replay (sent again after another lost answer, from any
+         * tab) is then answered with that activity rather than creating it twice.
+         *
          * @param {Object} record the lead
          * @param {{activity_type_id: number, summary: string|false, date_deadline: string, user_id: number}} vals
          */
@@ -2041,7 +2050,7 @@ export function useCrmOffline() {
                         },
                     ],
                 ],
-                { context: user.context },
+                { context: { ...user.context, [CRM_OFFLINE_CREATE_KEY]: newCrmOfflineCreateKey() } },
                 getScheduleORMExtras(record.model, [record])
             );
             if (!queued) {
