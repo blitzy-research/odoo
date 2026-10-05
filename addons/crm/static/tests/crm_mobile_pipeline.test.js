@@ -8,7 +8,7 @@
  * preset; the three desktop checks run in the desktop preset.
  */
 
-import { after, beforeEach, expect, mockDate, test } from "@odoo/hoot";
+import { after, beforeEach, expect, mockDate, mockUserAgent, test } from "@odoo/hoot";
 import {
     advanceTime,
     animationFrame,
@@ -11146,6 +11146,56 @@ test("mobile activities: one remaining activity reads in the singular, online an
     expect(".o_crm_mobile_activities_more_online").toHaveCount(0);
     expect(".o_crm_mobile_activities_more").toHaveText("1 more activity after sync");
     expect(".o_crm_mobile_activities_more").toHaveAttribute("role", "status");
+});
+
+// Refine D3.1 (P1): the activity sheet on iOS Safari. Chrome and current WebKit
+// keep an expanded sheet's rail at its end when the sheet grows, by re-snapping
+// the rail to the sheet (its mandatory scroll snapping). A rail that is not
+// re-snapped (Safari without re-snapping, or any browser before the sheet's
+// slide-in has enabled snapping) stays where it was, below the sheet's new end.
+// Safari does not focus a tapped button either, so no focus move reveals a row:
+// the sheet expands itself after the patch that grew it. On a mobile OS the
+// bottom sheet also takes the browser's Back (iOS edge swipe, Android back).
+test.tags("mobile");
+test("mobile activities: Show more keeps the sheet expanded on an iPhone rail that is not re-snapped", async () => {
+    mockUserAgent("ios");
+    await addOfficeDesignActivities();
+    await mountWithCleanup(WebClient);
+    await openAction(ACTION_ID);
+    await openActivities("Office Design");
+    expect(activityTitles()).toEqual(OFFICE_DESIGN_ACTIVITIES.slice(0, ACTIVITY_PAGE));
+    expect(isSheetExpanded()).toBe(true);
+    const openers = [".o_crm_mobile_log_call", ".o_crm_mobile_schedule_followup"];
+    expectEqualButtonsInView(openers);
+
+    // As in Safari, nothing moves the rail when the content grows: no re-snapping
+    // and no scroll anchoring.
+    const rail = queryFirst(".o_bottom_sheet_rail");
+    rail.style.setProperty("scroll-snap-type", "none");
+    rail.style.setProperty("overflow-anchor", "none");
+    const scrollTop = rail.scrollTop;
+    const scrollEnd = rail.scrollHeight - rail.clientHeight;
+
+    // "Show more", tapped as Safari taps a button (activated, not focused), adds two
+    // rows below the viewport: the sheet scrolls its rail to the new end, so its
+    // sticky actions row stays in view.
+    const focused = document.activeElement;
+    queryFirst(".o_crm_mobile_activities_load_more").click();
+    await waitUntil(() => activityTitles().length === OFFICE_DESIGN_ACTIVITIES.length);
+    await animationFrame();
+    expect(document.activeElement).toBe(focused);
+    expect(activityTitles()).toEqual(OFFICE_DESIGN_ACTIVITIES);
+    expect(rail.scrollHeight - rail.clientHeight).toBeGreaterThan(scrollEnd);
+    expect(rail.scrollTop).toBeGreaterThan(scrollTop);
+    expect(isSheetExpanded()).toBe(true);
+    expectEqualButtonsInView(openers);
+
+    // The browser's Back closes the sheet and leaves the pipeline where it was.
+    browser.history.back();
+    await animationFrame();
+    expect(".o_bottom_sheet").toHaveCount(0);
+    expect(".o_crm_mobile_pipeline_header").toHaveCount(1);
+    expect(card("Office Design")).toHaveCount(1);
 });
 
 test.tags("mobile");
