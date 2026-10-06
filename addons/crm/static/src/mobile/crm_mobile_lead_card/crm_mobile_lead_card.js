@@ -1017,7 +1017,7 @@ export class CrmMobileLeadCard extends Component {
             values,
             partnerLabel,
             revenueLabel,
-            stage: this.stageChoice(values),
+            stage: this.stageChoice(values, syncState),
             syncState,
             syncStatus: this.syncStatus(values, syncState),
             openAriaLabel: leadName(values) || false,
@@ -1125,11 +1125,18 @@ export class CrmMobileLeadCard extends Component {
      * the choices (no stage, or one the pipeline does not list): the selector then
      * shows `label` as its current, unselectable option, so that no real stage is
      * presented as current. A lead without stage reads "None", as its group does.
+     * Any other stage reads its name, also while the lead's writes (or its
+     * provisional create) are pending, and "Stage unavailable" once one of them is
+     * parked (`syncState` "failed": its replay was refused, as it is for a stage
+     * deleted on the server), so that a stage the server no longer lists is never
+     * named.
      *
      * @param {Object} values display values (see `values`)
+     * @param {"failed"|"pending"|false} [syncState=false] the card's sync state
+     *  (see `syncState`)
      * @returns {{id: number|false, missing: boolean, label: string}|null}
      */
-    stageChoice(values) {
+    stageChoice(values, syncState = false) {
         if (values.stage_id === undefined || !this.props.stages.length) {
             return null;
         }
@@ -1137,7 +1144,14 @@ export class CrmMobileLeadCard extends Component {
         const missing = !this.props.stages.some((stage) => stage.id === id);
         let label = "";
         if (missing) {
-            label = id ? values.stage_id.display_name || "" : _t("None");
+            if (!id) {
+                label = _t("None");
+            } else {
+                label =
+                    syncState === "failed"
+                        ? _t("Stage unavailable")
+                        : values.stage_id.display_name || "";
+            }
         }
         return { id, missing, label };
     }

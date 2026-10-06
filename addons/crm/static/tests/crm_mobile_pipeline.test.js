@@ -4330,10 +4330,10 @@ test("mobile pipeline keeps a lead whose parked move targets a deleted stage in 
     expect(headerTexts()).toEqual(["New", "3", "$ 600"]);
     expect(cardNames()).toEqual(["Office Design", "Quote for Chairs", "Desk Upgrade"]);
     expect(badge).toHaveText("Sync failed");
-    // Its selector shows the stage of the parked move as its current, unselectable
-    // option, and offers the stages the pipeline shows.
+    // Its selector shows a neutral current, unselectable option instead of the
+    // deleted stage of the parked move, and offers the stages the pipeline shows.
     expect(select).toHaveValue("");
-    expect(`${select} option[disabled]`).toHaveText("Proposition");
+    expect(`${select} option[disabled]`).toHaveText("Stage unavailable");
     expect(queryAllTexts(`${select} option:not([disabled])`)).toEqual(["New", "Qualified", "Won"]);
     // No other stage shows or counts it.
     await contains(".o_crm_mobile_pipeline_next").click();
@@ -4696,9 +4696,17 @@ test("mobile pipeline lists no stage deleted on the server after a discard reloa
     expect(`${card("Desk Upgrade")} .o_crm_mobile_pending_sync`).toHaveCount(0);
     expect(`${card("Desk Upgrade")} .o_crm_mobile_lead_stage`).toHaveValue(String(NEW));
     expect(`${card("Orphan Lead")} .o_crm_mobile_pending_sync`).toHaveText("Sync failed");
-    // Neither the card stage selectors nor the quick create offer the deleted stage.
+    // No card stage selector, the provisional one included, nor the quick create
+    // offers or names the deleted stage: the provisional card, still disabled,
+    // shows a neutral current option instead.
     expect(stageOptions("Office Design")).toEqual(remaining);
     expect(stageOptions("Desk Upgrade")).toEqual(remaining);
+    expect(stageOptions("Orphan Lead")).toEqual(["Stage unavailable", ...remaining]);
+    expect(`${card("Orphan Lead")} .o_crm_mobile_lead_stage`).not.toBeEnabled();
+    expect(`${card("Orphan Lead")} .o_crm_mobile_lead_stage option[disabled]`).toHaveText(
+        "Stage unavailable"
+    );
+    expect(`${card("Orphan Lead")} .o_crm_mobile_lead_stage`).toHaveValue("");
     expect(await quickCreateStageNames()).toEqual(remaining);
 
     // The stage shown is deleted on the server, then the create is discarded online:
@@ -5730,6 +5738,38 @@ test("New Lead deep link: only crm_quick_create=1 opens the quick create, once",
     await animationFrame();
     expect(".o_crm_mobile_pipeline_header").toHaveCount(1);
     expect(".o_bottom_sheet").toHaveCount(0);
+});
+
+test.tags("mobile");
+test("New Lead deep link focuses the quick-create title without a focus ring", async () => {
+    patchWithCleanup(quickCreateDeepLink, {
+        pending: isQuickCreateDeepLink("?menu_id=1&crm_quick_create=1"),
+    });
+    const title = ".o_bottom_sheet .o_crm_mobile_quick_create_title";
+    const titleOutline = () => {
+        const { outlineStyle, outlineWidth } = getComputedStyle(queryFirst(title));
+        return { outlineStyle, outlineWidth };
+    };
+    const noOutline = { outlineStyle: "none", outlineWidth: "0px" };
+    await mountWithCleanup(WebClient);
+
+    // Opened by the deep link: the focused title draws no ring, even where the browser
+    // matches it as `:focus-visible` (a fresh document with no pointer input, as in the
+    // headless suite).
+    await openAction(ACTION_ID);
+    await animationFrame();
+    expect(".o_bottom_sheet form.o_crm_mobile_quick_create").toHaveCount(1);
+    expect(quickCreateDeepLink.pending).toBe(false);
+    expect(title).toBeFocused();
+    expect(titleOutline()).toEqual(noOutline);
+
+    // Opened by tapping New: the focused title draws no ring either.
+    await contains(".o_crm_mobile_quick_create_cancel").click();
+    expect(".o_bottom_sheet").toHaveCount(0);
+    await contains(".o_crm_mobile_pipeline_new").click();
+    expect(".o_bottom_sheet form.o_crm_mobile_quick_create").toHaveCount(1);
+    expect(title).toBeFocused();
+    expect(titleOutline()).toEqual(noOutline);
 });
 
 /**

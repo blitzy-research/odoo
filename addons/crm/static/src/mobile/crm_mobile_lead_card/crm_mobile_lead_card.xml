@@ -44,7 +44,7 @@
                 aria-hidden="true"
                 t-out="card.unavailableReason"/>
             <div class="o_crm_mobile_lead_actions d-flex gap-2 align-items-center">
-                <!-- No selector without a loaded stage or choices; a stage outside the choices shows as an unselectable current option. -->
+                <!-- No selector without a loaded stage or choices; a stage outside the choices shows as an unselectable current option: its name while pending, "Stage unavailable" once its sync failed, "None" without stage. -->
                 <select t-if="card.stage"
                     class="o_crm_mobile_lead_stage form-select"
                     name="stage_id"

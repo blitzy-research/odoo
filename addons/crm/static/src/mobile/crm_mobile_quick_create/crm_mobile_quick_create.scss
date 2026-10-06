@@ -30,6 +30,17 @@
     gap: var(--CrmMobileQuickCreate-gap);
     width: 100%;
 
+    // The title takes the focus when the sheet opens, as a `tabindex="-1"` target
+    // rather than a control, so it draws no ring, whatever the last input: a sheet
+    // opened by the "New Lead" deep link on a fresh document focuses it as
+    // `:focus-visible`, and looks the same as one opened by tapping New. Tab moves
+    // on to the first field, which keeps its ring.
+    .o_crm_mobile_quick_create_title {
+        &:focus {
+            outline: 0;
+        }
+    }
+
     .o_crm_mobile_quick_create_row {
         display: flex;
         flex-direction: column;
