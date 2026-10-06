@@ -16886,6 +16886,593 @@ test("[Online] card save held during a replay is refused, and changes nothing, o
     expect.verifySteps([]);
 });
 
+// A save of selected leads from a lead list (its multi-edit) made while the replay has
+// still to send queued writes of those leads, or while the framework still reports the
+// connection lost once it is back, reaches the server after those writes: the list's
+// values, saved last, are the ones the server keeps. On a phone, a tap on a list in
+// selection mode only toggles the row's selection, so no multi-edit is reachable there
+// and these tests need desktop markup.
+
+/** Opens the Opportunities list (`LEADS_ACTION`) and lets its start-up sync run. */
+async function openLeadList() {
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(LEADS_ACTION.id);
+    await flushStartupSync();
+}
+
+/**
+ * Lead list arch (`crm_case_tree_view_oppor`) with its expected revenue column, whose
+ * multi-edit takes relative values (`+=10`), saved by `web_save_multi`.
+ */
+const LEAD_REVENUE_LIST_ARCH = /* xml */ `
+    <list string="Opportunities" js_class="crm_list" multi_edit="1">
+        <field name="name"/>
+        <field name="expected_revenue"/>
+    </list>`;
+
+/** Mounts the lead list of `LEAD_REVENUE_LIST_ARCH` and lets its start-up sync run. */
+async function openLeadRevenueList() {
+    await mountView({
+        type: "list",
+        resModel: "crm.lead",
+        arch: LEAD_REVENUE_LIST_ARCH,
+        config: { actionId: LEADS_ACTION.id },
+    });
+    await flushStartupSync();
+}
+
+/**
+ * Toggles the selection checkbox of the list row of the lead `name`.
+ *
+ * @param {string} name
+ */
+async function toggleLeadRow(name) {
+    await contains(`.o_data_row:contains(${name}) .o_list_record_selector input`).click();
+}
+
+/**
+ * Edits the `fieldName` cell of the selected list row of the lead `rowName`: the list's
+ * multi-edit saves `value` on every selected row, once its confirmation is accepted
+ * when several rows are selected.
+ *
+ * @param {string} rowName
+ * @param {string} fieldName
+ * @param {string} value
+ */
+async function editSelectedLeads(rowName, fieldName, value) {
+    await contains(`.o_data_row:contains(${rowName}) .o_data_cell[name=${fieldName}]`).click();
+    await contains(`.o_selected_row .o_field_widget[name=${fieldName}] input`).edit(value);
+    if (queryAll(".o_data_row .o_list_record_selector input:checked").length > 1) {
+        await contains(".modal .btn-primary").click();
+    }
+}
+
+/**
+ * Presses Enter in the input `selector` of the edited list row as a browser delivers a
+ * key: a browser runs the microtasks a listener queues before it calls the next one,
+ * so the input's own listener commits the typed value, and all the commit does without
+ * waiting for a task is done, before the key reaches the list's cell listener. A test
+ * dispatch calls every listener at once: the key is stopped at the input, the commit's
+ * microtasks run, and the key is dispatched again, the input having nothing left to
+ * commit.
+ *
+ * @param {string} selector
+ */
+async function pressEnterAsBrowser(selector) {
+    const input = queryFirst(selector);
+    const init = { key: "Enter", bubbles: true, cancelable: true };
+    input.addEventListener("keydown", (ev) => ev.stopPropagation(), { once: true });
+    input.dispatchEvent(new KeyboardEvent("keydown", init));
+    for (let turn = 0; turn < 100; turn++) {
+        await microTick();
+    }
+    input.dispatchEvent(new KeyboardEvent("keydown", init));
+    await animationFrame();
+}
+
+/**
+ * Queues an expected revenue write of a lead as the lead form of "My Pipeline" saves it
+ * offline (see `queueLeadRename`).
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {number} resId
+ * @param {number} revenue
+ * @param {number} previousRevenue the value it replaces
+ * @returns {string} its queue key
+ */
+function queueLeadRevenue(plugin, resId, revenue, previousRevenue) {
+    return plugin.scheduleORM(
+        "crm.lead",
+        "web_save",
+        [[resId], { expected_revenue: revenue }],
+        { context: callContext(PIPELINE_ACTION.context), specification: {} },
+        {
+            extras: {
+                actionId: PIPELINE_ACTION.id,
+                actionName: PIPELINE_ACTION.name,
+                viewType: "form",
+                displayName: `Lead ${resId}`,
+                timeStamp: Date.now() + 1,
+                changes: { expected_revenue: revenue },
+                originalValues: { expected_revenue: previousRevenue },
+            },
+        }
+    );
+}
+
+test.tags("desktop");
+test("[Offline] lead list edit made before the connection is seen back replays after the lead's queued save", async () => {
+    // Offline root loads served from the cache: the lead form, and the list back from it.
+    expect.errors(2);
+    stepLeadWrites();
+    const network = mockNetwork();
+    // The connection checks are answered once `ping` is resolved, when it is set.
+    let ping = null;
+    onRpc("/web/webclient/version_info", () => ping?.promise);
+    await openLeadList();
+    // Visited online, so that its form is available offline.
+    await contains(".o_data_row:contains(Lead 1) .o_data_cell[name=name]").click();
+    await goBack();
+    const plugin = getService(OfflinePlugin);
+
+    // T1, offline: the lead form saves a name, queued.
+    await loseConnection(network);
+    await contains(".o_data_row:contains(Lead 1) .o_data_cell[name=name]").click();
+    await contains(".o_field_widget[name=name] input").edit("Lead 1 renamed");
+    await contains(".o_form_button_save").click();
+    await goBack();
+    expect.verifyErrors([LEAD_RECORD_LOAD, LEAD_LIST_LOAD]);
+    const [formSave] = queued("crm.lead");
+    expect(formSave.value.args).toEqual([[1], { name: "Lead 1 renamed" }]);
+
+    // T2: the connection is back, while the framework still reports it lost, when the
+    // list renames the lead again. The list's save is not sent ahead of the lead's
+    // queued form save, whose replay would overwrite it: it is queued after it, as the
+    // framework queues an offline save of the row, and the row shows the name at once,
+    // out of edition, with no error.
+    network.down = false;
+    ping = Promise.withResolvers();
+    expect(plugin.isOffline()).toBe(true);
+    await toggleLeadRow("Lead 1");
+    await editSelectedLeads("Lead 1", "name", "Lead 1 listed");
+    await animationFrame();
+    expect.verifySteps([]);
+    const entries = queued("crm.lead");
+    expect(entries).toHaveLength(2);
+    expect(entries[0].key).toBe(formSave.key);
+    expect(entries[1].value).toMatchObject({
+        model: "crm.lead",
+        method: "web_save",
+        args: [[1], { name: "Lead 1 listed" }],
+        kwargs: { context: queuedContext(LEADS_ACTION.context), specification: {} },
+        extras: { viewType: "list", changes: { name: "Lead 1 listed" } },
+    });
+    expect(entries[1].value.extras.timeStamp).toBeGreaterThan(formSave.value.extras.timeStamp);
+    expect(".o_data_row:contains(Lead 1) .o_data_cell[name=name]").toHaveText("Lead 1 listed");
+    expect(".o_selected_row").toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+
+    // The connection check the save started finds the connection back: the replay sends
+    // the form save first and the list's name last, which the server keeps.
+    ping.resolve();
+    await expect.waitForSteps([`web_save [1] ${JSON.stringify({ name: "Lead 1 renamed" })}`]);
+    await runAllTimers();
+    await expect.waitForSteps([`web_save [1] ${JSON.stringify({ name: "Lead 1 listed" })}`]);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.isOffline()).toBe(false);
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].name).toBe("Lead 1 listed");
+    expect(".o_data_row:contains(Lead 1) .o_data_cell[name=name]").toHaveText("Lead 1 listed");
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Offline] lead list edit queued after the lead's queued save by Enter leaves the row out of edition", async () => {
+    stepLeadWrites();
+    mockDate("2026-10-02 09:00:00");
+    const setOffline = mockOffline();
+    await openLeadList();
+    const plugin = getService(OfflinePlugin);
+
+    // Offline: a rename of the lead, as its form saves it, is queued.
+    await setOffline(true);
+    const formKey = queueLeadRename(plugin, 1, "Lead 1 renamed");
+
+    // The list renames the lead again, the name committed by Enter as a browser delivers
+    // the key. The save is queued after the lead's queued rename, with no request, and
+    // the key leaves the row: it is out of edition and shows the name, with no error.
+    await toggleLeadRow("Lead 1");
+    await contains(".o_data_row:contains(Lead 1) .o_data_cell[name=name]").click();
+    const input = ".o_selected_row .o_field_widget[name=name] input";
+    await contains(input).edit("Lead 1 listed", { confirm: false });
+    await pressEnterAsBrowser(input);
+    expect.verifySteps([]);
+    const entries = queued("crm.lead");
+    expect(entries.map(({ key }) => key)[0]).toBe(formKey);
+    expect(entries).toHaveLength(2);
+    expect(entries[1].value.args).toEqual([[1], { name: "Lead 1 listed" }]);
+    expect(".o_selected_row").toHaveCount(0);
+    expect(".o_data_row:contains(Lead 1) .o_data_cell[name=name]").toHaveText("Lead 1 listed");
+    expect(".modal").toHaveCount(0);
+
+    // Reconnected, the replay sends the rename first and the list's name last, which the
+    // server keeps.
+    await setOffline(false);
+    await runAllTimers();
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ name: "Lead 1 renamed" })}`,
+        `web_save [1] ${JSON.stringify({ name: "Lead 1 listed" })}`,
+    ]);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].name).toBe("Lead 1 listed");
+    expect(".o_data_row:contains(Lead 1) .o_data_cell[name=name]").toHaveText("Lead 1 listed");
+    expect(".o_selected_row").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] lead list edit during the replay of the lead's queued save is sent after it, with the user and database that made it", async () => {
+    const lead2Write = stepLeadWritesHoldingLead2();
+    const sent = recordCallContexts("crm.lead", "web_save");
+    // The clock is set before the views and the cache are created (see the tests above).
+    mockDate("2026-10-02 09:00:00");
+    const setOffline = mockOffline();
+    await openLeadList();
+    const plugin = getService(OfflinePlugin);
+
+    // Offline: a write of another lead is queued, then, a minute later, a rename of the
+    // lead as its form saves it.
+    await setOffline(true);
+    const renameKey = queueLead2RenameFirst(plugin);
+    const formKey = queueLeadRename(plugin, 1, "Lead 1 renamed");
+    expect.verifySteps([]);
+
+    // Reconnected: the replay sends the other lead's write first, and is held there,
+    // with the lead's queued rename still to be sent.
+    await setOffline(false);
+    await expect.waitForSteps([LEAD_2_RENAME_STEP]);
+    expect(plugin.syncingORM()).toBe(true);
+    expect(queued("crm.lead").map(({ key }) => key)).toEqual([renameKey, formKey]);
+
+    // A list edit of a lead the replay has nothing to send before is sent at once, as
+    // before, with no user id nor database.
+    await toggleLeadRow("Lead 3");
+    await editSelectedLeads("Lead 3", "name", "Lead 3 listed");
+    await expect.waitForSteps([`web_save [3] ${JSON.stringify({ name: "Lead 3 listed" })}`]);
+    expect(sent.at(-1).context).not.toInclude(CRM_OFFLINE_UID_KEY);
+    expect(sent.at(-1).context).not.toInclude(CRM_OFFLINE_DB_KEY);
+    await toggleLeadRow("Lead 3");
+
+    // The list renames the lead online meanwhile: its save is not sent ahead of the
+    // lead's queued rename. The row already shows the name.
+    await toggleLeadRow("Lead 1");
+    await editSelectedLeads("Lead 1", "name", "Lead 1 listed");
+    await animationFrame();
+    expect.verifySteps([]);
+    expect(".o_selected_row .o_field_widget[name=name] input").toHaveValue("Lead 1 listed");
+
+    // The queued rename replays one second later, then the list's save is sent, naming
+    // the user who made it and the database of their session: the list's name wins.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ name: "Lead 1 renamed" })}`,
+        `web_save [1] ${JSON.stringify({ name: "Lead 1 listed" })}`,
+    ]);
+    const [, heldSave] = sent.filter(({ ids }) => ids[0] === 1);
+    expect(heldSave.context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    expect(heldSave.context[CRM_OFFLINE_DB_KEY]).toBe(session.db);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].name).toBe("Lead 1 listed");
+    expect(MockServer.env["crm.lead"].browse(2)[0].name).toBe("Lead 2 renamed");
+    expect(MockServer.env["crm.lead"].browse(3)[0].name).toBe("Lead 3 listed");
+    expect(".o_data_row:contains(Lead 1) .o_data_cell[name=name]").toHaveText("Lead 1 listed");
+    expect(".o_selected_row").toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] lead list edit waiting for the replay is queued after the lead's queued save as soon as the connection drops", async () => {
+    const lead2Write = stepLeadWritesHoldingLead2();
+    mockDate("2026-10-02 09:00:00");
+    const setOffline = mockOffline();
+    await openLeadList();
+    const plugin = getService(OfflinePlugin);
+
+    // Offline: a write of another lead, then a rename of the lead.
+    await setOffline(true);
+    const renameKey = queueLead2RenameFirst(plugin);
+    const formKey = queueLeadRename(plugin, 1, "Lead 1 renamed");
+
+    // Reconnected, the replay is held on the other lead's write, and the list renames
+    // the lead: its save waits for the lead's queued rename.
+    await setOffline(false);
+    await expect.waitForSteps([LEAD_2_RENAME_STEP]);
+    await toggleLeadRow("Lead 1");
+    await editSelectedLeads("Lead 1", "name", "Lead 1 listed");
+    await animationFrame();
+    expect.verifySteps([]);
+
+    // The connection drops while it waits, with the lead's queued rename still to be
+    // sent: the save stops waiting without being sent ahead of it, and is queued after
+    // it. The row keeps the name, out of edition, with no error.
+    await setOffline(true);
+    await animationFrame();
+    const listSave = queued("crm.lead").find(({ key }) => key !== renameKey && key !== formKey);
+    expect(listSave.value.args).toEqual([[1], { name: "Lead 1 listed" }]);
+    expect(queued("crm.lead").map(({ key }) => key)).toEqual([renameKey, formKey, listSave.key]);
+    expect(".o_data_row:contains(Lead 1) .o_data_cell[name=name]").toHaveText("Lead 1 listed");
+    expect(".o_selected_row").toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+
+    // The other lead's write is answered; the replay stops at the lead's queued rename,
+    // which the lost connection keeps queued, the list's save after it.
+    lead2Write.resolve();
+    await waitUntil(() => !(renameKey in plugin._ormToSync()));
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead").map(({ key }) => key)).toEqual([formKey, listSave.key]);
+    expect.verifySteps([]);
+
+    // Reconnected, the replay sends the rename, then the list's name: the name saved
+    // last is the one the server keeps.
+    await setOffline(false);
+    await runAllTimers();
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ name: "Lead 1 renamed" })}`,
+        `web_save [1] ${JSON.stringify({ name: "Lead 1 listed" })}`,
+    ]);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].name).toBe("Lead 1 listed");
+    expect(".o_data_row:contains(Lead 1) .o_data_cell[name=name]").toHaveText("Lead 1 listed");
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] lead list edit with no replay running is sent at once, unchanged", async () => {
+    stepLeadWrites();
+    const sent = recordCallContexts("crm.lead", "web_save");
+    await openLeadList();
+    const plugin = getService(OfflinePlugin);
+
+    // Online, with no replay running and nothing queued, the list's save is sent at
+    // once, in one request whose context names neither user nor database.
+    await toggleLeadRow("Lead 1");
+    await editSelectedLeads("Lead 1", "name", "Lead 1 listed");
+    expect.verifySteps([`web_save [1] ${JSON.stringify({ name: "Lead 1 listed" })}`]);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].context).not.toInclude(CRM_OFFLINE_UID_KEY);
+    expect(sent[0].context).not.toInclude(CRM_OFFLINE_DB_KEY);
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].name).toBe("Lead 1 listed");
+    expect(".o_data_row:contains(Lead 1) .o_data_cell[name=name]").toHaveText("Lead 1 listed");
+    expect(".o_selected_row").toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+});
+
+test.tags("desktop");
+test("[Online] lead list relative edit of several leads during the replay of a lead's queued save is sent after it", async () => {
+    const lead2Write = stepLeadWritesHoldingLead2();
+    const multiSaves = recordCallContexts("crm.lead", "web_save_multi");
+    onRpc("crm.lead", "web_save_multi", ({ args }) => {
+        expect.step(`web_save_multi ${JSON.stringify(args[0])} ${JSON.stringify(args[1])}`);
+    });
+    mockDate("2026-10-02 09:00:00");
+    const setOffline = mockOffline();
+    await openLeadRevenueList();
+    const plugin = getService(OfflinePlugin);
+
+    // Offline: a write of another lead, then a revenue of lead 1 as its form saves it.
+    await setOffline(true);
+    const renameKey = queueLead2RenameFirst(plugin);
+    queueLeadRevenue(plugin, 1, 100, 5);
+
+    // Reconnected, the replay is held on the other lead's write. Online meanwhile, the
+    // list adds 10 to the revenue of leads 1 and 3, confirmed for both: the save of
+    // both waits for the queued revenue of lead 1, as one request. The rows show the
+    // values at once.
+    await setOffline(false);
+    await expect.waitForSteps([LEAD_2_RENAME_STEP]);
+    await toggleLeadRow("Lead 1");
+    await toggleLeadRow("Lead 3");
+    await editSelectedLeads("Lead 1", "expected_revenue", "+=10");
+    await animationFrame();
+    expect.verifySteps([]);
+    expect(".o_data_row:contains(Lead 3) .o_data_cell[name=expected_revenue]").toHaveText(
+        "13.00"
+    );
+
+    // The queued revenue replays one second later, then the list's save of both leads is
+    // sent, naming the user who made it and the database of their session: the
+    // revenues saved last are the ones the server keeps.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ expected_revenue: 100 })}`,
+        `web_save_multi [1,3] ${JSON.stringify([{ expected_revenue: 15 }, { expected_revenue: 13 }])}`,
+    ]);
+    expect(multiSaves).toHaveLength(1);
+    expect(multiSaves[0].context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    expect(multiSaves[0].context[CRM_OFFLINE_DB_KEY]).toBe(session.db);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(15);
+    expect(MockServer.env["crm.lead"].browse(3)[0].expected_revenue).toBe(13);
+    expect(".o_data_row:contains(Lead 1) .o_data_cell[name=expected_revenue]").toHaveText(
+        "15.00"
+    );
+    expect(".o_data_row:contains(Lead 3) .o_data_cell[name=expected_revenue]").toHaveText(
+        "13.00"
+    );
+    expect(".o_selected_row").toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] lead list relative edit of several leads waiting for the replay is queued lead by lead after a lead's queued save as soon as the connection drops", async () => {
+    /** `[method, ids, values]` of each `crm.lead` save reaching the mock server, in order. */
+    const writes = [];
+    // The replayed rename of lead 2 is held until released (`queueLead2RenameFirst`).
+    const lead2Write = Promise.withResolvers();
+    for (const method of ["web_save", "web_save_multi"]) {
+        onRpc("crm.lead", method, async ({ args }) => {
+            writes.push(JSON.stringify([method, args[0], args[1]]));
+            if (method === "web_save" && args[0][0] === 2) {
+                await lead2Write.promise;
+            }
+        });
+    }
+    mockDate("2026-10-02 09:00:00");
+    const setOffline = mockOffline();
+    await openLeadRevenueList();
+    const plugin = getService(OfflinePlugin);
+
+    // Offline: a write of another lead, then a revenue of lead 1 as its form saves it.
+    await setOffline(true);
+    const renameKey = queueLead2RenameFirst(plugin);
+    const revenueKey = queueLeadRevenue(plugin, 1, 100, 5);
+    const revenueTimeStamp = plugin._ormToSync()[revenueKey].value.extras.timeStamp;
+
+    // Reconnected, the replay is held on the other lead's write. The list adds 10 to the
+    // revenue of leads 1 and 3, confirmed for both: the save of both waits for the
+    // queued revenue of lead 1.
+    await setOffline(false);
+    await waitUntil(() => writes.length === 1);
+    expect(writes).toEqual([JSON.stringify(["web_save", [2], { name: "Lead 2 renamed" }])]);
+    await toggleLeadRow("Lead 1");
+    await toggleLeadRow("Lead 3");
+    await editSelectedLeads("Lead 1", "expected_revenue", "+=10");
+    await animationFrame();
+    expect(writes).toHaveLength(1);
+
+    // The connection drops while it waits, with lead 1's queued revenue still to be
+    // sent: nothing is sent, and each lead's row is queued with its own value as an
+    // offline save of the row is, lead 1's after its queued revenue. The rows show the
+    // values, out of edition, with no error.
+    await setOffline(true);
+    await animationFrame();
+    const listSaves = queued("crm.lead").filter(
+        ({ key }) => key !== renameKey && key !== revenueKey
+    );
+    const listSaveOf = (resId) => listSaves.find(({ value }) => value.args[0][0] === resId);
+    expect(listSaves).toHaveLength(2);
+    expect(listSaveOf(1).value.args).toEqual([[1], { expected_revenue: 15 }]);
+    expect(listSaveOf(3).value.args).toEqual([[3], { expected_revenue: 13 }]);
+    expect(listSaveOf(1).value.extras.timeStamp).toBeGreaterThan(revenueTimeStamp);
+    expect(".o_data_row:contains(Lead 1) .o_data_cell[name=expected_revenue]").toHaveText(
+        "15.00"
+    );
+    expect(".o_data_row:contains(Lead 3) .o_data_cell[name=expected_revenue]").toHaveText(
+        "13.00"
+    );
+    expect(".o_selected_row").toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+
+    // The other lead's write is answered; the lost connection stops the replay before
+    // the queued revenue, and the list's saves stay queued.
+    lead2Write.resolve();
+    await waitUntil(() => !(renameKey in plugin._ormToSync()));
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toHaveLength(3);
+    expect(writes).toHaveLength(1);
+
+    // Reconnected, the replay sends the three queued saves one by one, lead 1's queued
+    // revenue before the list's value of it: the values saved last are the ones the
+    // server keeps.
+    await setOffline(false);
+    await waitUntil(() => writes.length === 2);
+    for (const count of [3, 4]) {
+        await advanceTime(1000);
+        await waitUntil(() => writes.length === count);
+    }
+    await runAllTimers();
+    await animationFrame();
+    const revenueWrite = JSON.stringify(["web_save", [1], { expected_revenue: 100 }]);
+    const listWrite = JSON.stringify(["web_save", [1], { expected_revenue: 15 }]);
+    expect(writes).toInclude(JSON.stringify(["web_save", [3], { expected_revenue: 13 }]));
+    expect(writes).toInclude(revenueWrite);
+    expect(writes.indexOf(listWrite)).toBeGreaterThan(writes.indexOf(revenueWrite));
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(15);
+    expect(MockServer.env["crm.lead"].browse(3)[0].expected_revenue).toBe(13);
+    expect(".modal").toHaveCount(0);
+});
+
+test.tags("desktop");
+test("[Online] forecast list edit during the replay of the lead's queued save is sent after it", async () => {
+    const lead2Write = stepLeadWritesHoldingLead2();
+    const sent = recordCallContexts("crm.lead", "web_save");
+    mockDate("2026-10-02 09:00:00");
+    const setOffline = mockOffline();
+    // The forecast list (`crm_lead_view_tree_forecast`), a multi-edit lead list.
+    await mountView({
+        type: "list",
+        resModel: "crm.lead",
+        arch: /* xml */ `
+            <list js_class="forecast_list" multi_edit="1">
+                <field name="name"/>
+                <field name="date_deadline"/>
+            </list>`,
+        context: FORECAST_ACTION.context,
+        config: { actionId: FORECAST_ACTION.id },
+    });
+    await flushStartupSync();
+    const plugin = getService(OfflinePlugin);
+
+    // Offline: a write of another lead, then a rename of the lead.
+    await setOffline(true);
+    const renameKey = queueLead2RenameFirst(plugin);
+    queueLeadRename(plugin, 1, "Lead 1 renamed");
+
+    // Reconnected, the replay is held on the other lead's write, and the forecast list
+    // renames the lead: its save is not sent ahead of the lead's queued rename.
+    await setOffline(false);
+    await expect.waitForSteps([LEAD_2_RENAME_STEP]);
+    await toggleLeadRow("Lead 1");
+    await editSelectedLeads("Lead 1", "name", "Lead 1 listed");
+    await animationFrame();
+    expect.verifySteps([]);
+
+    // The queued rename replays one second later, then the list's save is sent with the
+    // user who made it and the database of their session: the list's name wins.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ name: "Lead 1 renamed" })}`,
+        `web_save [1] ${JSON.stringify({ name: "Lead 1 listed" })}`,
+    ]);
+    expect(sent.at(-1).context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    expect(sent.at(-1).context[CRM_OFFLINE_DB_KEY]).toBe(session.db);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].name).toBe("Lead 1 listed");
+    expect(".o_data_row:contains(Lead 1) .o_data_cell[name=name]").toHaveText("Lead 1 listed");
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
 test("[Offline] lead form opened after a card move shows its queued stage, not as an edit", async () => {
     // Offline root loads served from the cache: the lead form, the pipeline groups back
     // from it, and the lead form again.

@@ -1753,6 +1753,51 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         held_by(doomed, manager, dbname).unlink()
         self.assertFalse(doomed.exists())
 
+    def test_offline_held_lead_list_save_from_another_user_or_database(self):
+        """ A lead list multi-edit with a relative value (``+= 10``), which the
+        web client saves by ``web_save_multi``, held until the replay of the
+        leads' queued writes, is sent with the user who made it and the database
+        of the session they made it in. Reaching the session of another user, or
+        a session of another database where the same user id names another user,
+        it is refused and changes nothing. Reaching the session it was made in,
+        or sent without being held (no origin), it is applied as before. """
+        salesman, other = self.user_sales_salesman, self.user_sales_leads
+        dbname = self.env.cr.dbname
+        leads = (
+            self._create_salesman_opportunity('Held List Lead A', expected_revenue=100)
+            | self._create_salesman_opportunity('Held List Lead B', expected_revenue=200)
+        )
+        context = self.pipeline_context
+
+        def held_by(origin, db):
+            # as the held save reaches the salesman's session: made by ``origin``, in a
+            # session of ``db``
+            return leads.with_user(salesman).with_context(dict(context, crm_offline_uid=origin.id, crm_offline_db=db))
+
+        def leads_audit():
+            # with the tracking messages of the writes made so far
+            self.env.cr.flush()
+            leads.invalidate_recordset()
+            return [(lead.expected_revenue, lead.write_uid, lead.message_ids) for lead in leads]
+
+        vals_list = [{'expected_revenue': 110}, {'expected_revenue': 210}]
+        before = leads_audit()
+        for origin, db in ((other, dbname), (salesman, f'not_{dbname}')):
+            with self.subTest(origin=origin.login, db=db), self._assert_queued_by_another_user():
+                held_by(origin, db).web_save_multi(vals_list, specification={})
+            self.assertEqual(leads_audit(), before)
+
+        result = held_by(salesman, dbname).web_save_multi(vals_list, specification={'expected_revenue': {}})
+        self.assertEqual(result, [
+            {'id': leads[0].id, 'expected_revenue': 110},
+            {'id': leads[1].id, 'expected_revenue': 210},
+        ])
+        self.assertEqual([(revenue, uid) for revenue, uid, _messages in leads_audit()], [(110, salesman), (210, salesman)])
+        leads.with_user(salesman).with_context(context).web_save_multi(
+            [{'expected_revenue': 120}, {'expected_revenue': 220}], specification={},
+        )
+        self.assertEqual([revenue for revenue, _uid, _messages in leads_audit()], [120, 220])
+
     def test_offline_replay_queued_by_another_user_activity_calls(self):
         """ The activity calls the CRM queue replays ("Log a call", "Schedule
         follow-up", "Mark done") are refused when queued by another user than

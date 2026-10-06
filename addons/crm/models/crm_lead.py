@@ -1168,6 +1168,16 @@ class CrmLead(models.Model):
             return leads.browse(next_id).with_context(bin_size=True).web_read(specification)
         return result
 
+    def web_save_multi(self, vals_list, specification):
+        """ Refuse a save of several leads (a lead list multi-edit with a
+        relative value, such as ``+= 10``) that the web client held until the
+        replay of the leads' queued writes, sent in the session of another user
+        than the one who made it, or in a session of another database
+        (``_check_offline_queue_origin``), before anything is written. The save
+        itself is unchanged. """
+        self._check_offline_queue_origin()
+        return super().web_save_multi(vals_list, specification)
+
     @api.model
     def _check_offline_queue_origin(self):
         """ Refuse a call queued offline by another user than the caller, or
