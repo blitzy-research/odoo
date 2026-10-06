@@ -695,15 +695,19 @@ function writtenLeadFields(value) {
 
 /**
  * The pending (not parked) queued writes of the lead of `record` (`leadWritesIn`:
- * the record's own offline save, or a call targeting its id) whose replay would
- * overwrite a write of `fieldNames` sent now: those writing one of those fields, or,
- * for a delete (`fieldNames` is `null`), every pending one, which the delete would
- * make fail. In replay order; none for a record that is not a saved lead. Reads the
- * queue reactively.
+ * the record's own offline save, or a call targeting its id) whose replay could
+ * overwrite a write of `fieldNames` sent now: for a field write, every one writing a
+ * field of the lead (`writtenLeadFields`), whatever fields it names; for a delete
+ * (`fieldNames` is `null`), every pending one, which the delete would make fail. The
+ * fields a call names are not all the fields its replay changes: the server
+ * recomputes stored fields it does not name (a team or type change recomputes the
+ * lead's stage), so no write of the lead is independent of another one. In replay
+ * order; none for a record that is not a saved lead. Reads the queue reactively,
+ * through the shared per-lead index (`readQueueIndex`).
  *
  * @param {OfflinePlugin} plugin
  * @param {Object} record
- * @param {string[]|null} fieldNames
+ * @param {string[]|null} fieldNames the fields the write sets; `null` for a delete
  * @returns {{key: string, value: Object}[]}
  */
 export function crmPendingLeadWrites(plugin, record, fieldNames) {
@@ -712,17 +716,16 @@ export function crmPendingLeadWrites(plugin, record, fieldNames) {
     }
     return leadWritesIn(readQueueIndex(plugin), record).filter(
         (entry) =>
-            !isParked(entry) &&
-            (fieldNames === null ||
-                writtenLeadFields(entry.value).some((fieldName) => fieldNames.includes(fieldName)))
+            !isParked(entry) && (fieldNames === null || writtenLeadFields(entry.value).length > 0)
     );
 }
 
 /**
  * Tells whether the replay running on `plugin` has still to send a queued write of
  * the lead of `record` that an online write of `fieldNames` made now must follow
- * (`crmPendingLeadWrites`). Always `false` outside a replay and for a record that
- * is not a saved lead. The connection state the plugin reports plays no part: the
+ * (`crmPendingLeadWrites`: any pending write of a field of the lead, or any pending
+ * call of it for a delete). Always `false` outside a replay and for a record that is
+ * not a saved lead. The connection state the plugin reports plays no part here: the
  * replay sends the calls it read when it started until one of them is lost, so a
  * connection reported lost meanwhile (by another request) may well be up, and a
  * write sent then would still reach the server ahead of those calls. Reads the
@@ -745,33 +748,45 @@ function hasLeadWriteAhead(plugin, record, fieldNames) {
  * write the user makes after those queued writes would reach the server before
  * them and be overwritten by them (a delete would make them fail). The write
  * therefore waits until no pending write ahead of it remains (`hasLeadWriteAhead`):
- * the replay sent or parked each of them, or the replay ended. A connection
- * reported lost meanwhile does not end the wait, as the replay goes on until one of
- * its calls is lost. A card save whose turn comes while the connection is still
- * reported lost, with such a write still pending (the replay stopped on it), is
- * queued after it instead of being sent (`CrmKanbanRecord._crmQueuesSave`), as a
- * mobile stage write is then queued after every queued lead write. The queue is
- * neither read for conflicts nor changed: nothing is dropped, merged or reordered,
- * and no request is added.
+ * the replay sent or parked each of them, or the replay ended. It is then sent as
+ * any write is (a card save whose turn comes while the connection is still reported
+ * lost, with such a write still pending because the replay stopped on it, is queued
+ * after it instead: `CrmKanbanRecord._crmQueuesSave`).
+ *
+ * The wait also ends, with writes still ahead, as soon as the plugin reports the
+ * connection lost or the owner of the write is destroyed (`isDestroyed`): the
+ * replay's request may then never be answered (a request has no time-out, and a
+ * connection reported lost does not stop the replay), and nothing would end the
+ * wait otherwise. The write is then queued after the writes ahead instead of being
+ * sent ("queue only"): the running replay may still send them, so a write sent then
+ * would reach the server first. The replay that follows sends it after them
+ * (`crmReplayQueued`, and the replay's own end, `OfflinePlugin._syncORM`). The queue
+ * is neither read for conflicts nor changed: nothing is dropped, merged or
+ * reordered, and no request is added while the write waits. The effect following
+ * the replay is stopped at every outcome.
  *
  * Sent at its turn, the write reaches the server in whatever session the browser
  * then holds, which another user, or the same user id on another database served on
- * this origin, may have opened meanwhile (in another tab). So the turn resolves with
- * the user who made the write and the database of the session they made it in, read
- * when its wait starts (`CrmWriteOrigin`), which its request sends in its context
- * (`crmContextWithOrigin`): the server refuses it in another user's session, as it
- * refuses a queued call replayed there, and in a session of another database, and
- * nothing is applied.
+ * this origin, may have opened meanwhile (in another tab). So the turn's outcome
+ * carries the user who made the write and the database of the session they made it
+ * in, read when its wait starts (`CrmWriteOrigin`), which its request sends in its
+ * context (`crmContextWithOrigin`): the server refuses it in another user's session,
+ * as it refuses a queued call replayed there, and in a session of another database,
+ * and nothing is applied. A write queued only carries the identity every queued CRM
+ * call carries (the CRM `OfflinePlugin.scheduleORM`).
  *
  * @param {OfflinePlugin} plugin
  * @param {Object[]} records the datapoints of the leads the write targets
  * @param {string[]|null} [fieldNames] the fields it writes; `null` for a delete
- * @returns {Promise<CrmWriteOrigin>|undefined} `undefined` when the write may be
- *  sent now, which is always the case with no replay running, so that it is then
- *  sent as before, without any added wait; else a promise resolved at its turn with
- *  the origin of the write
+ * @param {(() => boolean)|null} [isDestroyed] signal of the destruction of the
+ *  write's owner (its model)
+ * @returns {Promise<CrmWriteTurn>|undefined} `undefined` when the write may be sent
+ *  now, which is always the case with no replay running, so that it is then sent as
+ *  before, without any added wait; else a promise resolved at its turn with its
+ *  outcome (`CrmWriteTurn`): `queueOnly` is `false` once no write is ahead of it,
+ *  `true` when it is to be queued only, and `origin` is the origin of the write
  */
-export function crmLeadWriteTurn(plugin, records, fieldNames = null) {
+export function crmLeadWriteTurn(plugin, records, fieldNames = null, isDestroyed = null) {
     const isAhead = () => records.some((record) => hasLeadWriteAhead(plugin, record, fieldNames));
     if (!untrack(isAhead)) {
         return undefined;
@@ -782,17 +797,22 @@ export function crmLeadWriteTurn(plugin, records, fieldNames = null) {
     });
     let stop;
     const turn = new Promise((resolve) => {
+        // Created outside any computation, so that only `stop` disposes of it. Its
+        // first run is synchronous; it runs again on every change of the sync, queue,
+        // connection and owner signals it reads.
         stop = untrack(() =>
             effect(() => {
                 if (!isAhead()) {
-                    resolve();
+                    resolve(false);
+                } else if (plugin.isOffline() || isDestroyed?.()) {
+                    resolve(true);
                 }
             })
         );
     });
-    return turn.then(() => {
+    return turn.then((queueOnly) => {
         stop();
-        return origin;
+        return { queueOnly, origin };
     });
 }
 
@@ -804,6 +824,17 @@ export function crmLeadWriteTurn(plugin, records, fieldNames = null) {
  * session of another database.
  *
  * @typedef {{crm_offline_uid: number|false, crm_offline_db: string}} CrmWriteOrigin
+ */
+
+/**
+ * Outcome of the turn of a lead write held for it (`crmLeadWriteTurn`). `queueOnly`
+ * is `true` when the wait ended with writes of the lead still ahead of it (the
+ * connection reported lost, or the write's owner destroyed): the write is then
+ * queued after them without being sent. It is `false` once none is ahead: the write
+ * then goes on as any write does, and its request sends `origin`, read when the wait
+ * started, in its context (`crmContextWithOrigin`).
+ *
+ * @typedef {{queueOnly: boolean, origin: CrmWriteOrigin}} CrmWriteTurn
  */
 
 /**
@@ -820,13 +851,39 @@ export function crmContextWithOrigin(context, origin) {
 }
 
 /**
- * An online write of a lead record waiting for its turn (`crmLeadWriteTurn`), or
- * made at it, as the CRM kanban model marks it on the record (`crmTurnWrite`, see
- * `CrmKanbanModel.crmWriteInTurn`): the record's values of `fieldNames` follow
- * every queued or replayed write of the lead stamped up to `timeStamp`, and the
- * later ones follow them. Its `timeStamp` is `crmTurnWriteTimeStamp`: not before any
- * write of the lead queued or replayed when it was made, so that those, made before
- * it, never show over it. `undefined` for a record without such a write.
+ * Makes the replay deliver a CRM call that was just queued instead of being sent (a
+ * write released "queue only" by `crmLeadWriteTurn` or the lead form's replay hold,
+ * or a save queued while the connection is still reported lost). The request the
+ * call would have sent was also what told the framework that the connection is back.
+ * So, while the connection is reported lost, the plugin checks it (`checkConnection`,
+ * the check the offline systray offers): when it is back, the replay starts and
+ * sends the queue in time-stamp order, the call last; otherwise nothing changes.
+ * Online with no replay running, the replay starts. A running replay read the queue
+ * before the call was queued: its end starts the next one (`OfflinePlugin._syncORM`).
+ * Nothing is awaited.
+ *
+ * @param {OfflinePlugin} plugin
+ */
+export function crmReplayQueued(plugin) {
+    untrack(() => {
+        if (plugin.isOffline()) {
+            crmOwnEffectPromise(plugin.checkConnection());
+        } else if (!plugin.syncingORM()) {
+            crmOwnEffectPromise(plugin._syncORM());
+        }
+    });
+}
+
+/**
+ * An online write of a lead record waiting for its turn (`crmLeadWriteTurn`: behind
+ * every pending queued write of the lead, whatever fields it writes), or made at it,
+ * as the CRM kanban model marks it on the record (`crmTurnWrite`, see
+ * `CrmKanbanModel.crmWriteInTurn`): the record's values of `fieldNames`, the fields
+ * the write sets, show over every queued or replayed write of the lead stamped up to
+ * `timeStamp`, and the later ones show over them. Its `timeStamp` is
+ * `crmTurnWriteTimeStamp`: not before any write of the lead queued or replayed when
+ * it was made, so that those, made before it, never show over it. `undefined` for a
+ * record without such a write.
  *
  * @typedef {{timeStamp: number, fieldNames: string[]}} CrmTurnWrite
  */
@@ -1346,6 +1403,159 @@ async function removeReplayedFromStore(plugin, key) {
 }
 
 /**
+ * Arguments (`args`, the very array sent) of the calls the replay of each offline
+ * plugin started sending through `crmReplayCall` and that have not failed since: in
+ * flight, or delivered. A call that failed (connection lost, refused) leaves the set.
+ * Plugins and arguments are keyed raw (`toRaw`): views read them through reactive
+ * proxies, the replay through the plugin itself.
+ *
+ * @type {WeakMap<OfflinePlugin, WeakSet<any[]>>}
+ */
+const crmSentReplayArgs = new WeakMap();
+
+/**
+ * Per offline plugin, the arguments queued calls held before `rewriteCrmQueuedCall`
+ * replaced them → the queue key of each call. A running replay sends each call with
+ * the arguments it read when it started, so `crmReplayCall` finds a rewritten call
+ * by them and sends the arguments its entry holds instead. Keyed raw, as
+ * `crmSentReplayArgs` is.
+ *
+ * @type {WeakMap<OfflinePlugin, WeakMap<any[], string>>}
+ */
+const crmRewrittenReplayArgs = new WeakMap();
+
+/**
+ * Per offline plugin, the arguments (`args`, as sent) of each `crm.lead` `web_save`
+ * holding x2many commands (a list value) that its replay delivered through
+ * `crmReplayCall`, by queue key, in delivery order, for the lifetime of the page. A
+ * lead form reads them (`crmDeliveredArgs`) to tell whether the queued save creating
+ * or linking records of its lists was delivered once that save left the queue: the
+ * queue no longer holds it then, and the framework reuses a record's key for its
+ * later saves. Keyed raw, as `crmSentReplayArgs` is.
+ *
+ * @type {WeakMap<OfflinePlugin, Map<string, any[][]>>}
+ */
+const crmDeliveredReplayArgs = new WeakMap();
+
+/**
+ * Whether a replay of `plugin` started sending the queued call `entry` as it holds it
+ * now (its `args`), and that call has not failed: it is in flight, or delivered and
+ * about to leave the queue. Such a call can no longer be rewritten
+ * (`rewriteCrmQueuedCall`): what the server receives is what was sent. A call whose
+ * sending failed is replayed again with what its entry holds then.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {{key: string, value: Object}} entry a queue entry
+ * @returns {boolean}
+ */
+export function isCrmReplaySent(plugin, entry) {
+    const sent = crmSentReplayArgs.get(toRaw(plugin));
+    return Boolean(entry && sent?.has(toRaw(entry.value.args)));
+}
+
+/**
+ * The arguments of the `crm.lead` `web_save` calls holding x2many commands that the
+ * replay of `plugin` delivered under the queue key `key` during the lifetime of the
+ * page, oldest first (`crmDeliveredReplayArgs`): a new array, empty when it delivered
+ * none. A call parked, discarded, or still queued unsent is not among them, nor one
+ * the replay of another page delivered: this page reads that one as discarded.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {string} key
+ * @returns {any[][]}
+ */
+export function crmDeliveredArgs(plugin, key) {
+    return [...(crmDeliveredReplayArgs.get(toRaw(plugin))?.get(key) || [])];
+}
+
+/**
+ * Records `args`, delivered by the replay of `plugin` for the queued call `key`
+ * (`crmReplayCall`), in `crmDeliveredReplayArgs` when it is a `crm.lead` `web_save`
+ * holding x2many commands; any other call is not recorded.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {string} key
+ * @param {string} model
+ * @param {string} method
+ * @param {any[]} args
+ */
+function recordDeliveredArgs(plugin, key, model, method, args) {
+    const values = args?.[1];
+    if (
+        model !== "crm.lead" ||
+        method !== "web_save" ||
+        !isFieldMapping(values) ||
+        !Object.values(values).some(Array.isArray)
+    ) {
+        return;
+    }
+    let delivered = crmDeliveredReplayArgs.get(toRaw(plugin));
+    if (!delivered) {
+        delivered = new Map();
+        crmDeliveredReplayArgs.set(toRaw(plugin), delivered);
+    }
+    const ofKey = delivered.get(key);
+    if (ofKey) {
+        ofKey.push(toRaw(args));
+    } else {
+        delivered.set(key, [toRaw(args)]);
+    }
+}
+
+/**
+ * Rewrites the queued call `key` of `plugin` with the arguments `args` and the extras
+ * `extras`, keeping its model, method and keyword arguments, unless a replay already
+ * sent it as it is (`isCrmReplaySent`) or it left the queue. Rewritten while a
+ * replay runs, before that replay reached it, the call is still sent at its place
+ * in that replay, with the arguments and keyword arguments its entry holds when its
+ * turn comes, not with those the replay read when it started (`crmReplayCall`).
+ * The call must be one the replay finds by its arguments: any call but a keyed lead
+ * create (`leadCreateDeliveryKey`), whose rewrites `crmReplayCall` follows by its
+ * delivery key.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {string} key
+ * @param {any[]} args
+ * @param {Object} extras the call's extras, its time stamp and error included
+ * @returns {boolean} whether the call was rewritten
+ */
+export function rewriteCrmQueuedCall(plugin, key, args, extras) {
+    const entry = untrack(() => plugin._ormToSync()[key]);
+    if (!entry || isCrmReplaySent(plugin, entry)) {
+        return false;
+    }
+    let rewritten = crmRewrittenReplayArgs.get(toRaw(plugin));
+    if (!rewritten) {
+        rewritten = new WeakMap();
+        crmRewrittenReplayArgs.set(toRaw(plugin), rewritten);
+    }
+    // Arguments an earlier rewrite replaced keep pointing at the key as well.
+    rewritten.set(toRaw(entry.value.args), key);
+    const { model, method, kwargs } = entry.value;
+    plugin.scheduleORM(model, method, args, kwargs, { id: key, extras });
+    return true;
+}
+
+/**
+ * The queue entry of a call the replay sends with the arguments `args` it read before
+ * `rewriteCrmQueuedCall` replaced them, when that entry is still queued for the same
+ * model and method; `undefined` otherwise.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {string} model
+ * @param {string} method
+ * @param {any[]} args
+ * @returns {{key: string, value: Object}|undefined}
+ */
+function rewrittenReplayEntry(plugin, model, method, args) {
+    const key = crmRewrittenReplayArgs.get(toRaw(plugin))?.get(toRaw(args));
+    const entry = key && plugin._ormToSync()[key];
+    return entry && entry.value.model === model && entry.value.method === method
+        ? entry
+        : undefined;
+}
+
+/**
  * Sends a call of the framework replay, which takes the cross-tab replay lock,
  * sends each queued call through its plugin's silent ORM and only starts the
  * removal of a delivered one from the offline store. When the last call is
@@ -1353,6 +1563,15 @@ async function removeReplayedFromStore(plugin, key) {
  * read that call and send it again. So a delivered call of `CRM_REPLAY_MODELS`
  * (found by its `args`, the very array the replay sends) resolves only once it
  * has left the offline store, before the replay can release the lock.
+ *
+ * The arguments a call is sent with are recorded until it fails
+ * (`isCrmReplaySent`), and, for a delivered lead save holding x2many commands, for
+ * the lifetime of the page (`crmDeliveredArgs`). A call rewritten since the replay
+ * read it (`rewriteCrmQueuedCall`), found by the arguments it held then, is sent
+ * with the arguments and keyword arguments its entry holds now, and is then handled
+ * as a call found by its arguments: delivered, it leaves the offline store; refused,
+ * it is parked with them (`scheduleORM`); with the connection lost, its entry stays
+ * as it is.
  *
  * Every other outcome is the framework's: the call is sent unchanged, a lost
  * connection stops the replay and keeps the entry, and any other error parks it.
@@ -1363,6 +1582,20 @@ async function removeReplayedFromStore(plugin, key) {
  * unless the create is flagged as a later save of the lead
  * (`CRM_OFFLINE_CREATE_WRITE`).
  *
+ * One exception keeps a lead form's later values: the replay sends each call as it
+ * read it when it started, then removes or parks the entry under its key, whatever
+ * that entry holds by then. A lead form whose save of its still-new lead is queued
+ * into the lead's pending create (same key, same delivery key) while the replay
+ * sends that create would lose the save's values. So for a keyed lead create
+ * (`leadCreateDeliveryKey`) whose entry holds other values by the time its delivery
+ * ends (found by its delivery key when it was rewritten before it was sent), the
+ * entry is kept as it is, with those values (`keepRewrittenCreate`): delivered, it
+ * stays queued and stored, and the next replay sends it again, flagged as the later
+ * save of the lead it is (`CRM_OFFLINE_CREATE_WRITE`, which a lead record sends with
+ * every save of its still-new lead once its create was queued), which the server
+ * answers by writing those values on the lead it created; refused, it is parked
+ * with those values. Calls of any other kind are never kept.
+ *
  * @param {OfflinePlugin} plugin
  * @param {Object} silentOrm the plugin's silent ORM, with the settings of the ORM
  *  the call is made on
@@ -1372,17 +1605,156 @@ async function removeReplayedFromStore(plugin, key) {
  * @param {Object} kwargs
  */
 async function crmReplayCall(plugin, silentOrm, model, method, args, kwargs) {
-    const entry =
-        CRM_REPLAY_MODELS.has(model) &&
-        Object.values(plugin._ormToSync()).find(
+    if (!CRM_REPLAY_MODELS.has(model)) {
+        return silentOrm.call(model, method, args, kwargs);
+    }
+    const entries = Object.values(plugin._ormToSync());
+    const deliveryKey = leadCreateDeliveryKey({ model, method, args, kwargs });
+    let entry =
+        entries.find(
             ({ value }) => value.args === args && value.model === model && value.method === method
-        );
+        ) ||
+        (deliveryKey && entries.find(({ value }) => leadCreateDeliveryKey(value) === deliveryKey));
+    if (!entry) {
+        entry = rewrittenReplayEntry(plugin, model, method, args);
+        if (entry) {
+            ({ args, kwargs } = entry.value);
+        }
+    }
     if (!entry) {
         return silentOrm.call(model, method, args, kwargs);
     }
-    const result = await silentOrm.call(model, method, args, kwargs);
-    await removeReplayedFromStore(plugin, entry.key);
+    /** Whether the entry now holds other values than the call sent (keyed creates only). */
+    const isRewritten = () => {
+        const stored = deliveryKey && plugin._ormToSync()[entry.key];
+        return (
+            Boolean(stored) &&
+            stored.value.args !== args &&
+            leadCreateDeliveryKey(stored.value) === deliveryKey
+        );
+    };
+    let sent = crmSentReplayArgs.get(toRaw(plugin));
+    if (!sent) {
+        sent = new WeakSet();
+        crmSentReplayArgs.set(toRaw(plugin), sent);
+    }
+    sent.add(toRaw(args));
+    let result;
+    try {
+        result = await silentOrm.call(model, method, args, kwargs);
+    } catch (error) {
+        sent.delete(toRaw(args));
+        if (!(error instanceof ConnectionLostError) && isRewritten()) {
+            keepRewrittenCreate(plugin, entry.key, "refused");
+        }
+        throw error;
+    }
+    recordDeliveredArgs(plugin, entry.key, model, method, args);
+    if (isRewritten()) {
+        keepRewrittenCreate(plugin, entry.key, "delivered");
+    } else {
+        await removeReplayedFromStore(plugin, entry.key);
+    }
     return result;
+}
+
+/**
+ * The delivery key (`CRM_OFFLINE_CREATE_KEY`) of a lead create (`isCrmLeadCreate`,
+ * the calls the CRM `OfflinePlugin.scheduleORM` keys) whose context carries one in
+ * the format the server accepts (`isCrmOfflineCreateKey`); `undefined` for any other
+ * call.
+ *
+ * @param {{model?: string, method?: string, args?: any, kwargs?: Object}} value
+ * @returns {string|undefined}
+ */
+function leadCreateDeliveryKey(value) {
+    const key = value?.kwargs?.context?.[CRM_OFFLINE_CREATE_KEY];
+    return isCrmLeadCreate(value?.model, value?.method, value?.args) && isCrmOfflineCreateKey(key)
+        ? key
+        : undefined;
+}
+
+/**
+ * Keyed lead creates whose queued entry the running replay must keep as it is
+ * (`crmReplayCall`), per offline plugin: queue key → outcome of the delivery that
+ * read older values. The framework's next step on that key consumes it: the removal
+ * of a delivered call (`removeScheduledORM`), or the parking of a refused one
+ * (`scheduleORM` with the error). Cleared when the replay ends.
+ *
+ * @type {WeakMap<OfflinePlugin, Map<string, "delivered"|"refused">>}
+ */
+const keptRewrittenCreates = new WeakMap();
+
+/**
+ * @param {OfflinePlugin} plugin
+ * @param {string} key
+ * @param {"delivered"|"refused"} outcome
+ */
+function keepRewrittenCreate(plugin, key, outcome) {
+    let kept = keptRewrittenCreates.get(plugin);
+    if (!kept) {
+        kept = new Map();
+        keptRewrittenCreates.set(plugin, kept);
+    }
+    kept.set(key, outcome);
+}
+
+/**
+ * Consumes the mark `keepRewrittenCreate` set on `key` for `outcome`.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {string} key
+ * @param {"delivered"|"refused"} outcome
+ * @returns {boolean} whether `key` was marked so
+ */
+function takeRewrittenCreate(plugin, key, outcome) {
+    const kept = keptRewrittenCreates.get(plugin);
+    if (kept?.get(key) !== outcome) {
+        return false;
+    }
+    kept.delete(key);
+    return true;
+}
+
+/**
+ * Whether the queue of `plugin` holds a pending (not parked) call of
+ * `CRM_REPLAY_MODELS`.
+ *
+ * @param {OfflinePlugin} plugin
+ * @returns {boolean}
+ */
+function hasPendingCrmCall(plugin) {
+    return Object.values(plugin._ormToSync()).some(
+        (entry) => CRM_REPLAY_MODELS.has(entry.value?.model) && !isParked(entry)
+    );
+}
+
+/**
+ * Resolved once no replay of `plugin` runs (`syncingORM` unset), at once when none
+ * does. The replay runs inside a lock request, whose promise may resolve before the
+ * replay has finished (a lock manager that grants the lock without awaiting its
+ * holder), so the end of a replay is read from the plugin's own replay state rather
+ * than from that promise.
+ *
+ * @param {OfflinePlugin} plugin
+ * @returns {Promise<void>}
+ */
+function crmReplayEnded(plugin) {
+    if (!untrack(() => plugin.syncingORM())) {
+        return Promise.resolve();
+    }
+    let stop;
+    const ended = new Promise((resolve) => {
+        // Created outside any computation, so that only `stop` disposes of it.
+        stop = untrack(() =>
+            effect(() => {
+                if (!plugin.syncingORM()) {
+                    resolve();
+                }
+            })
+        );
+    });
+    return ended.then(() => stop());
 }
 
 /**
@@ -1487,6 +1859,13 @@ patch(OfflinePlugin.prototype, {
      * and calls of other models get none. Its model, method and args are queued,
      * and replayed, unchanged; the caller's kwargs and options are not modified.
      *
+     * The replay parks a refused call with the values it read when it started. A
+     * keyed lead create whose entry was rewritten with a lead form's later values
+     * meanwhile (`crmReplayCall`), and a call rewritten before its turn came
+     * (`rewriteCrmQueuedCall`: the replay parks it with the arguments it held before),
+     * are parked with the values their entry holds instead, so that retrying them from
+     * the offline systray sends the user's last values.
+     *
      * @param {string} model
      * @param {string} method
      * @param {any[]} args
@@ -1495,6 +1874,18 @@ patch(OfflinePlugin.prototype, {
      * @returns {string} the queue key
      */
     scheduleORM(model, method, args, kwargs, options) {
+        const parksRewritten =
+            Boolean(options?.extras?.error) &&
+            (takeRewrittenCreate(this, options.id, "refused") ||
+                crmRewrittenReplayArgs.get(toRaw(this))?.get(toRaw(args)) === options.id);
+        if (parksRewritten) {
+            const stored = untrack(() => this._ormToSync()[options.id]);
+            if (stored) {
+                ({ model, method, args, kwargs } = stored.value);
+                const { error } = options.extras;
+                options = { ...options, extras: { ...stored.value.extras, error } };
+            }
+        }
         if (CRM_REPLAY_MODELS.has(model)) {
             if (options && !options.extras?.crmOrigin) {
                 options = {
@@ -1557,10 +1948,124 @@ patch(OfflinePlugin.prototype, {
         );
     },
 
-    /** Replays the queue with the CRM delivery guarantees of `crmReplayCall`. */
+    /**
+     * Removes a call from the queue as the framework does, except a keyed lead
+     * create the running replay delivered with older values than its entry now
+     * holds (`crmReplayCall`): that entry stays queued and stored, and the next
+     * replay sends it.
+     *
+     * @param {string} key
+     */
+    removeScheduledORM(key) {
+        if (takeRewrittenCreate(this, key, "delivered")) {
+            return;
+        }
+        return super.removeScheduledORM(...arguments);
+    },
+
+    /**
+     * Replays the queue with the CRM delivery guarantees of `crmReplayCall`.
+     *
+     * The replay sends the calls it read when it started. A CRM call queued after
+     * that (a write released "queue only" during the replay, `crmLeadWriteTurn`), or
+     * kept by it (`crmReplayCall`), is therefore not sent by it, and no other replay
+     * starts while the connection stays up. So when the replay ends online with such
+     * a call pending (not parked) and no other replay running, the next one starts
+     * at once. This ends: each replay removes or parks every call it sends, and stops
+     * with the connection lost. The replay has ended once the plugin no longer
+     * reports one running (`crmReplayEnded`).
+     */
     async _syncORM() {
         installCrmReplay(this);
-        return super._syncORM(...arguments);
+        try {
+            await super._syncORM(...arguments);
+            await crmReplayEnded(this);
+        } finally {
+            keptRewrittenCreates.delete(this);
+        }
+        if (
+            isCrmOfflineQueueUsable() &&
+            !this.isOffline() &&
+            !this.syncingORM() &&
+            hasPendingCrmCall(this)
+        ) {
+            crmOwnEffectPromise(this._syncORM());
+        }
+    },
+});
+
+// -----------------------------------------------------------------------------
+// Queued lead deletes (replayed after every queued call of the leads they delete)
+// -----------------------------------------------------------------------------
+
+/**
+ * Time stamp of a `crm.lead` `unlink` of the ids `resIds` (its `args[0]`) about to be
+ * queued with the time stamp `timeStamp`: one more than the latest time stamp of the
+ * queued calls of any of those leads (pending or parked: every `crm.lead` call whose
+ * `args[0]` array targets one of them), when that is not before `timeStamp`; else
+ * `timeStamp`. Reads the queue without subscribing the running computation, if any.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {any} resIds
+ * @param {number} timeStamp
+ * @returns {number}
+ */
+function leadUnlinkTimeStamp(plugin, resIds, timeStamp) {
+    if (!Array.isArray(resIds) || !resIds.length) {
+        return timeStamp;
+    }
+    const ids = new Set(resIds);
+    let leadUnlinkStamp = timeStamp;
+    for (const { value } of Object.values(untrack(() => plugin._ormToSync()))) {
+        const targets = value?.model === "crm.lead" ? value.args?.[0] : undefined;
+        if (Array.isArray(targets) && targets.some((id) => ids.has(id))) {
+            leadUnlinkStamp = Math.max(leadUnlinkStamp, (value.extras?.timeStamp || 0) + 1);
+        }
+    }
+    return leadUnlinkStamp;
+}
+
+patch(OfflinePlugin.prototype, {
+    /**
+     * Queues a call as the framework does, except that a new `crm.lead` `unlink` is
+     * stamped after every queued call, pending or parked, of each lead it deletes
+     * (`leadUnlinkTimeStamp`): a delete from a pipeline card or the kanban selection
+     * (offline, its request lost, or held during a replay then queued without being
+     * sent), from the lead form or from a lead list. The framework stamps it with the
+     * clock, and the replay sends the queue in time-stamp order, while CRM stamps a
+     * lead write after the lead's queued calls when the clock has not passed them (a
+     * form's follow-up write, Won, a card save, a stage chosen on the phone), and a
+     * clock set back leaves earlier writes ahead of it: the delete would then be sent
+     * first, and the lead's older calls would fail on the deleted lead and park. The
+     * delete is stamped as it is queued, so the queue never holds it at an earlier
+     * place, and the replay sends those calls first, whatever time stamps they carry.
+     *
+     * A call queued again under its key (the replay parking a refused delete) keeps
+     * its time stamp, and every other call is queued unchanged: the queue is neither
+     * read for conflicts nor otherwise changed. Online, nothing is queued, so nothing
+     * changes.
+     *
+     * @param {string} model
+     * @param {string} method
+     * @param {any[]} args
+     * @param {Object} kwargs
+     * @param {{id?: string, extras?: Object}} options
+     * @returns {string} the queue key
+     */
+    scheduleORM(model, method, args, kwargs, options) {
+        const extras = options?.extras;
+        if (model === "crm.lead" && method === "unlink" && Number.isFinite(extras?.timeStamp)) {
+            const key = options.id;
+            const requeued =
+                key !== undefined && key !== null && key in untrack(() => this._ormToSync());
+            const timeStamp = requeued
+                ? extras.timeStamp
+                : leadUnlinkTimeStamp(this, args?.[0], extras.timeStamp);
+            if (timeStamp !== extras.timeStamp) {
+                options = { ...options, extras: { ...extras, timeStamp } };
+            }
+        }
+        return super.scheduleORM(model, method, args, kwargs, options);
     },
 });
 
@@ -2367,9 +2872,25 @@ export function useCrmOffline() {
 
         /**
          * Online: the server call's result. Offline (or when the connection drops
-         * during the call): the framework queue key.
+         * during the call): the framework queue key. With `queueOnly` (a write whose
+         * turn in the replay ended without its writes ahead being sent,
+         * `crmLeadWriteTurn`), the call is queued without being sent, whatever the
+         * connection state, and the replay is asked to deliver it
+         * (`crmReplayQueued`): the queue key.
+         *
+         * @param {string} model
+         * @param {string} method
+         * @param {any[]} args
+         * @param {Object} kwargs
+         * @param {Object} extras
+         * @param {{queueOnly?: boolean}} [options]
          */
-        async schedule(model, method, args, kwargs, extras) {
+        async schedule(model, method, args, kwargs, extras, { queueOnly = false } = {}) {
+            if (queueOnly) {
+                const key = queue(model, method, args, kwargs, extras);
+                crmReplayQueued(plugin);
+                return key;
+            }
             return (await run(model, method, args, kwargs, extras)).result;
         },
 

@@ -2368,11 +2368,13 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * do, the display values of the change (`changes`, which `projectLead` reads)
      * and of the stage the lead showed before it (`originalValues`, which the
      * offline systray reads with `changes` for an edit). Online, during a replay
-     * that has still to send queued stage writes of the lead, the write is sent
-     * after them (`crmWriteInTurn`, as a card's save is); its time stamp is then
-     * read when it is sent, and its context names the user who made it and the
-     * database of their session (`crmContextWithOrigin`), so that the server refuses
-     * it once the browser's session belongs to another user or to another database.
+     * that has still to send queued writes of the lead, the write is sent after them
+     * (`crmWriteInTurn`, as a card's save is), with a context naming the user who
+     * made it and the database of their session (`crmContextWithOrigin`), so that the
+     * server refuses it once the browser's session belongs to another user or to
+     * another database; or it is queued after them without being sent when its turn
+     * ends "queue only" (a connection reported lost, or the end of the view, while it
+     * waits). Its time stamp is then read at its turn.
      *
      * @param {Object} record
      * @param {{id: number, display_name: string}} stageValue
@@ -2389,23 +2391,30 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                 this.stages.find((stage) => stage.id === shownStageId)?.display_name ??
                 "",
         };
-        const result = await record.model.crmWriteInTurn(record, ["stage_id"], (origin) => {
+        const result = await record.model.crmWriteInTurn(record, ["stage_id"], (turn) => {
+            const queueOnly = Boolean(turn?.queueOnly);
             const extras = getScheduleORMExtras(record.model, [record]);
             // Replay follows `extras.timeStamp`: after the writes it overrides, even
             // when the clock has not moved since they were queued.
             for (const { value } of this.crmOffline.queuedEntries("crm.lead")) {
                 extras.timeStamp = Math.max(extras.timeStamp, (value.extras?.timeStamp || 0) + 1);
             }
+            // Queued only, it is never sent now: it carries the identity of every
+            // queued CRM call instead of its origin.
+            const context = queueOnly
+                ? record.context
+                : crmContextWithOrigin(record.context, turn?.origin);
             return this.crmOffline.schedule(
                 "crm.lead",
                 "web_save",
                 [[record.resId], { stage_id: stageValue.id }],
-                { context: crmContextWithOrigin(record.context, origin), specification: {} },
+                { context, specification: {} },
                 {
                     ...extras,
                     changes: { stage_id: stageValue },
                     originalValues: { stage_id: originalStage },
-                }
+                },
+                { queueOnly }
             );
         });
         if (!this.crmOffline.isQueued(result)) {

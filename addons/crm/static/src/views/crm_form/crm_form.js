@@ -10,6 +10,7 @@ import {
     markRaw,
     onMounted,
     onWillDestroy,
+    signal,
     status,
     toRaw,
     untrack,
@@ -20,12 +21,14 @@ import {
 import { _t } from "@web/core/l10n/translation";
 import { ConnectionLostError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
+import { x2ManyCommands } from "@web/core/orm_plugin";
 import { usePopover } from "@web/core/popover/popover_hook";
 import { pick } from "@web/core/utils/objects";
 import { patch } from "@web/core/utils/patch";
 import { Record } from "@web/model/relational_model/record";
 import {
     addFieldDependencies,
+    getOfflineDisplayName,
     getScheduleORMExtras,
     makeActiveField,
 } from "@web/model/relational_model/utils";
@@ -44,13 +47,18 @@ import {
     CRM_MOBILE_ACTIVITY_LIMIT,
     CRM_OFFLINE_CREATE_KEY,
     CRM_OFFLINE_CREATE_WRITE,
+    crmDeliveredArgs,
+    crmPendingLeadWrites,
+    crmReplayQueued,
     crmReportError,
     crmReturnFocusFromSheet,
     getCrmActivitySubfields,
     isCrmOfflineCreateKey,
     isCrmOfflineQueueBlocked,
+    isCrmReplaySent,
     isFieldMapping,
     newCrmOfflineCreateKey,
+    rewriteCrmQueuedCall,
     useCrmOffline,
 } from "@crm/mobile/crm_offline_hooks";
 import { CrmMobileLeadActivities } from "@crm/mobile/crm_mobile_lead_card/crm_mobile_lead_card";
@@ -111,6 +119,134 @@ function crmWrittenLeadFields(value) {
         default:
             return [];
     }
+}
+
+/** x2many commands naming one related record by its id (virtual for a creation). */
+const RECORD_COMMANDS = Object.freeze([
+    x2ManyCommands.CREATE,
+    x2ManyCommands.UPDATE,
+    x2ManyCommands.DELETE,
+    x2ManyCommands.UNLINK,
+]);
+
+/**
+ * Comparable form of an x2many command or of a value (`undefined` reads as `null`).
+ *
+ * @param {any} value
+ * @returns {string}
+ */
+function crmJson(value) {
+    return JSON.stringify(value === undefined ? null : value);
+}
+
+/** Whether `command` is an x2many record creation (`[0, virtualId, values]`). */
+function isCreateCommand(command) {
+    return Array.isArray(command) && command[0] === x2ManyCommands.CREATE;
+}
+
+/**
+ * Index, in `commands` (a queued save's commands of one x2many field), of the record
+ * creation `target` names: its index when the creation there still carries its
+ * virtual id, else the only creation carrying that id; -1 when there is none.
+ *
+ * @param {any[]|undefined} commands
+ * @param {{id: any, index: number}} target
+ * @returns {number}
+ */
+function crmQueuedCreateIndex(commands, target) {
+    if (!Array.isArray(commands)) {
+        return -1;
+    }
+    const command = commands[target.index];
+    if (isCreateCommand(command) && command[1] === target.id) {
+        return target.index;
+    }
+    if (!target.id) {
+        return -1;
+    }
+    const indexes = [];
+    commands.forEach((other, index) => {
+        if (isCreateCommand(other) && other[1] === target.id) {
+            indexes.push(index);
+        }
+    });
+    return indexes.length === 1 ? indexes[0] : -1;
+}
+
+/**
+ * The record creations a restoration of a queued save put in an x2many list
+ * (`restored`, `[0, virtualId, values]` as the list holds them right after it, in
+ * order), each mapped to the creation of the queued save it stands for (`queued`,
+ * that save's commands of the field): the restoration applies them in order, each
+ * under a new virtual id, so the k-th restored creation is the k-th queued one. When
+ * their counts differ (display values out of step with the save's arguments), a
+ * restored creation is mapped to the first queued one, not mapped yet, with the same
+ * values; one without such a creation is not mapped.
+ *
+ * @param {any[][]} restored
+ * @param {any[]|undefined} queued
+ * @returns {Map<string, {id: any, index: number, values: Object}>} restored virtual id →
+ *   the queued creation (its virtual id and index) and the values it was restored with
+ */
+function crmAlignRestoredCreates(restored, queued) {
+    const creates = [];
+    (Array.isArray(queued) ? queued : []).forEach((command, index) => {
+        if (isCreateCommand(command)) {
+            creates.push({ id: command[1], index, values: command[2] });
+        }
+    });
+    const aligned = new Map();
+    const target = ({ id, index }, command) => ({ id, index, values: command[2] || {} });
+    if (creates.length === restored.length) {
+        restored.forEach((command, k) => aligned.set(command[1], target(creates[k], command)));
+        return aligned;
+    }
+    const remaining = [...creates];
+    for (const command of restored) {
+        const k = remaining.findIndex(({ values }) => crmJson(values) === crmJson(command[2]));
+        if (k >= 0) {
+            aligned.set(command[1], target(remaining[k], command));
+            remaining.splice(k, 1);
+        }
+    }
+    return aligned;
+}
+
+/**
+ * `commands`, a queued save's commands of one x2many field, with its record
+ * creations rewritten as `children` (the form's records standing for them,
+ * `CrmFormRecord._crmSplitCommands`) require: a creation none of whose records is
+ * still in the list is dropped; one whose records were edited takes their edited
+ * values over its own, at its place and with its own virtual id. Every other
+ * command is kept as it is.
+ *
+ * @param {any[]} commands
+ * @param {{index: number, present: boolean, values: Object}[]} children
+ * @returns {any[]|null} the rewritten commands, `null` when nothing changes
+ */
+function crmRewrittenCreates(commands, children) {
+    let changed = false;
+    const rewritten = [];
+    commands.forEach((command, index) => {
+        const records = children.filter((child) => child.index === index);
+        if (!records.length || !isCreateCommand(command)) {
+            rewritten.push(command);
+            return;
+        }
+        const present = records.filter((child) => child.present);
+        if (!present.length) {
+            changed = true;
+            return;
+        }
+        const values = Object.assign({}, command[2], ...present.map((child) => child.values));
+        if (crmJson(values) === crmJson(command[2] || {})) {
+            rewritten.push(command);
+            return;
+        }
+        changed = true;
+        rewritten.push([command[0], command[1], values]);
+    });
+    return changed ? rewritten : null;
 }
 
 /**
@@ -360,14 +496,44 @@ class CrmFormRecord extends formView.Model.Record {
         if (this.resModel !== "crm.lead") {
             return super._save(...arguments);
         }
-        // While the running replay has still to send a queued write of the lead, or the
-        // queued create of the still-new lead, the save waits for it
-        // (`_crmAwaitLeadReplay`). While the connection is still reported lost, a save
-        // of a lead with such a write is then queued after that write instead of being
-        // sent (`_crmQueuesSave`). Any other save starts at once.
-        const leadReplay = this._crmAwaitLeadReplay();
-        if (leadReplay) {
-            await leadReplay;
+        // A save whose x2many lists name records or commands of a queued save of the
+        // lead that no replay sent (pending, or parked) is queued at once, whatever the
+        // connection state: that save is rewritten as the form leaves them, and the
+        // rest of the save follows it (`_crmRoutesSave`). While the running replay has
+        // still to send a queued write of the lead, or the queued create of the
+        // still-new lead, any other save waits for it (`_crmAwaitLeadReplay`). A wait
+        // ended by a connection reported lost, or by the end of the form, with that
+        // write still pending, ends "queue only": the save is then queued after it,
+        // never sent. As the replay may have failed to send, or parked, the queued
+        // save the lists name meanwhile, the routing is decided again once the wait
+        // ends. While the connection is reported lost, a save of a lead with such a
+        // write is queued after it as well (`_crmQueuesSave`). Any other save starts
+        // at once.
+        let routes = untrack(() => this._crmRoutesSave());
+        let queueOnly = false;
+        if (!routes) {
+            const leadReplay = this._crmAwaitLeadReplay();
+            if (leadReplay) {
+                queueOnly = await leadReplay;
+                routes = untrack(() => this._crmRoutesSave());
+            }
+        }
+        // A queued save whose only edits undo commands restored from the lead's queued
+        // save writes no change the framework sees: it is queued by the CRM offline
+        // save (`_crmSavesUndoneRestoredCommandsOnly`), and the replay is then asked
+        // to deliver it when the save is routed or released "queue only", or the lead
+        // has a pending queued write, as for any save queued while the connection is
+        // reported lost (`_crmQueueSave`).
+        if (untrack(() => this._crmSavesUndoneRestoredCommandsOnly(routes || queueOnly))) {
+            if (!this._checkValidity({ displayNotification: true })) {
+                return false;
+            }
+            const asksReplay = routes || queueOnly || untrack(() => this._crmQueuesSave());
+            const result = this._offlineSave();
+            if (asksReplay) {
+                crmReplayQueued(this.model.offlinePlugin);
+            }
+            return result;
         }
         // Runs before the force-save statements below, which stay as they are: after a
         // partner change whose onchange was lost, the email and phone it superseded
@@ -398,15 +564,19 @@ class CrmFormRecord extends formView.Model.Record {
             changeStage = this._values.stage_id !== this.data.stage_id;
         }
 
-        // Read after the replay hold above, which the end of the replay releases, also
-        // when the replay stopped on a lost connection. A save queued this way needs a
-        // lead id, and only a save of a still-new lead sends its delivery key (the
-        // parent's `_save`, through `_crmSaveSendingCreateKey`), so at most one of the
-        // two changes the save.
-        const queues = untrack(() => this._crmQueuesSave());
+        // Read after the replay hold above, which ends with the replay, with the
+        // sending of the lead's writes ahead, or "queue only". A save queued this way
+        // needs a lead id, and only a save of a still-new lead sends its delivery key
+        // (the parent's `_save`, through `_crmSaveSendingCreateKey`; a new lead
+        // released "queue only" is queued into its own pending create there), so at
+        // most one of the two paths changes the save. A save that is sent (its
+        // request, or its page-close beacon) leaves out the x2many commands a queued
+        // save of the lead does, sent or delivered by a replay
+        // (`_crmSaveLeavingQueuedCommands`).
+        const queues = routes || untrack(() => this._crmQueuesSave(queueOnly));
         const res = queues
             ? await this._crmQueueSave(() => super._save(...arguments))
-            : await super._save(...arguments);
+            : await this._crmSaveLeavingQueuedCommands(() => super._save(...arguments));
         // The rainbowman lookup is decorative: offline it is neither issued nor queued.
         // The signal is read after the save, because a connection lost during the save
         // turns the plugin offline before the queued (offline) save resolves. A save
@@ -426,16 +596,23 @@ class CrmFormRecord extends formView.Model.Record {
      * write of the lead is still to be replayed reaches the server first and is then
      * overwritten by it, although the user made it last.
      *
-     * The save is released once no pending (not parked) queued `crm.lead` call
-     * writing a field of the lead remains (`crmWrittenLeadFields`), or once the
-     * replay ends. A connection reported lost during the replay does not release it:
-     * the replay goes on until a call of it is lost, so a save sent, or merged into
-     * the record's queued save, before then would still be overwritten by that save's
-     * replay if the connection is in fact back. Once the replay stopped on a lost
-     * call, the save is queued without being sent, merged into the record's
-     * still-queued save (`_crmQueuesSave`). It waits in the model mutex, as any save
-     * does: edits made meanwhile apply after it, and the form's buttons stay
-     * disabled. The queue is left as it is.
+     * The save is released, to be sent, once no pending (not parked) queued
+     * `crm.lead` call writing a field of the lead remains (`_crmHasPendingLeadWrite`),
+     * or once the replay ends; when the replay stopped on a lost call, the save is
+     * then queued after that call instead of being sent (`_crmQueuesSave`).
+     *
+     * It is also released, "queue only", as soon as the plugin reports the
+     * connection lost or the form owning the record is destroyed (`crmDestroyed` of
+     * the model) while such a call is still pending. The replay's request may then
+     * never be answered (a request has no time-out, and a connection reported lost
+     * does not stop the replay), and the save would otherwise keep the model mutex
+     * forever. Sending the save then could still let the running replay, which may be
+     * up, overwrite it with that call, so it is queued instead, after the lead's
+     * queued writes, and the record's queued save the replay may still send is left
+     * as it is (`_offlineSave`): the replay that follows sends the user's values last.
+     * While it waits, the save holds the model mutex, as any save does: edits made
+     * meanwhile apply after it, and the form's buttons stay disabled. The queue is left
+     * as it is.
      *
      * A new lead (no id, so no queued write targets it) is held the same way while
      * its own queued create (`offlineId`) is pending: saving it before that create's
@@ -443,59 +620,115 @@ class CrmFormRecord extends formView.Model.Record {
      * the save, which carries the create's delivery key flagged as a later save of
      * the lead (`_crmSaveSendingCreateKey`), reaches the server after it and writes
      * its values on the lead it created; when the replay ends with the create still
-     * queued, the save is queued into it.
+     * queued, or the save is released "queue only", the save is queued into it, which
+     * the replay keeps if it is sending that create meanwhile (`crmReplayCall`).
      *
      * Nothing is held for an urgent save (the page is being left, and its beacon
      * cannot wait), when no replay runs, or for a save without an edit of the user
      * (`_crmHasOwnEdits`); a record without an id is held only for its own pending
      * queued create. While the connection is reported lost and no replay runs, a save
      * of a lead with an id and a pending queued write is queued after that write
-     * instead (`_crmQueuesSave`).
+     * instead (`_crmQueuesSave`). `_save` does not ask for the hold of a save naming
+     * records or commands of a queued save that no replay sent: that save is queued
+     * at once (`_crmRoutesSave`).
      *
-     * @returns {Promise<void>|undefined} resolved once the save may be sent;
-     *   `undefined` when it may be sent at once
+     * @returns {Promise<boolean>|undefined} resolved once the save may proceed:
+     *   `true` when it is to be queued only, `false` when it may be sent; `undefined`
+     *   when it may be sent at once
      */
     _crmAwaitLeadReplay() {
         if (!untrack(() => this._crmIsLeadReplayPending() && this._crmHasOwnEdits())) {
             return undefined;
         }
+        const plugin = this.model.offlinePlugin;
+        const destroyed = this.model.crmDestroyed;
         let stop;
         const released = new Promise((resolve) => {
             // Created outside any computation, so that only `stop` disposes of it. Its
-            // first run is synchronous, and it runs again on every change of the
-            // connection, sync or queue signals it reads.
+            // first run is synchronous; it runs again on every change of the signals
+            // it reads: the sync and queue signals (`_crmIsLeadReplayPending`), then,
+            // while the save is still held, the connection and the model's lifetime.
             stop = untrack(() =>
                 effect(() => {
                     if (!this._crmIsLeadReplayPending()) {
-                        resolve();
+                        resolve(false);
+                    } else if (plugin.isOffline() || destroyed?.()) {
+                        resolve(true);
                     }
                 })
             );
         });
-        return released.then(() => stop());
+        return released.then((queueOnly) => {
+            stop();
+            return queueOnly;
+        });
     }
 
     /**
      * Whether the save writes an edit of the user: a change other than a value
      * restored from the record's queued save and unmodified since
-     * (`crmRestoredUnmodifiedFields`). Such a value is the one its queued save sends,
-     * so writing it before that save's replay overwrites nothing (a form left during
-     * the replay saves it at once).
+     * (`crmRestoredUnmodifiedFields`). An x2many list the user changed counts even
+     * when it is left without commands (`_crmTrackedX2ManyFields`: the user undid a
+     * command restored from that save, or removed a record a queued save creates),
+     * as the save still writes what the user did there (`_crmSplitCommands`). An
+     * unmodified restored value is the one its queued save sends, so writing it
+     * before that save's replay overwrites nothing (a form left during the replay
+     * saves it at once).
      *
      * @returns {boolean}
      */
     _crmHasOwnEdits() {
         const restored = this.crmRestoredUnmodifiedFields();
-        return Object.keys(this._getChanges()).some(
-            (fieldName) => fieldName !== "id" && !restored.includes(fieldName)
+        const isEdit = (fieldName) => fieldName !== "id" && !restored.includes(fieldName);
+        return (
+            Object.keys(this._getChanges()).some(isEdit) ||
+            this._crmTrackedX2ManyFields().some(isEdit)
         );
     }
 
     /**
-     * Whether a save of the lead waits for the running replay
-     * (`_crmAwaitLeadReplay`), whatever the connection state the plugin reports. It
-     * reads the plugin's sync and queue signals, so that an effect calling it
-     * follows them.
+     * Whether this save of a lead with an id (not urgent), with the lead's own queued
+     * save still queued, writes no change while the user undid commands restored from
+     * that save: removed a record it creates, removed a record it links, or added
+     * back one it unlinks (`_crmSplitCommands`), and the save is queued: offline, or
+     * `force` (`_save`: the save names records or commands of a queued save of the
+     * lead that no replay sent, `_crmRoutesSave`, or the replay hold released it
+     * "queue only"). Such a list is left without commands, so it is not among the
+     * changes (`_getChanges`): the framework would save nothing, and the queued save
+     * would still send those commands. The save is then queued by the CRM offline
+     * save (`_offlineSave`), which rewrites that save and queues the inverse commands
+     * after it.
+     *
+     * @param {boolean} [force] the save is queued whatever the connection state
+     * @returns {boolean}
+     */
+    _crmSavesUndoneRestoredCommandsOnly(force = false) {
+        if (
+            !this.resId ||
+            this.model._urgentSave ||
+            !(force || this.model.offlinePlugin.isOffline()) ||
+            !this._crmIsOwnSaveQueued()
+        ) {
+            return false;
+        }
+        const changes = this._getChanges();
+        delete changes.id;
+        if (Object.keys(changes).length) {
+            return false;
+        }
+        return this._crmTrackedX2ManyFields().some((fieldName) => {
+            const { commands, children } = this._crmSplitCommands(fieldName, []);
+            return commands.length > 0 || children.some((child) => !child.present);
+        });
+    }
+
+    /**
+     * Whether the running replay has still to send a queued write the save of the
+     * lead must follow (`_crmAwaitLeadReplay`): a pending queued write of a field of
+     * the lead (`_crmHasPendingLeadWrite`), or the pending queued create of the
+     * still-new lead. The connection state the plugin reports plays no part here; it
+     * only decides how the save proceeds once released. It reads the plugin's sync
+     * and queue signals, so that an effect calling it follows them.
      *
      * @returns {boolean}
      */
@@ -512,14 +745,18 @@ class CrmFormRecord extends formView.Model.Record {
 
     /**
      * Whether a pending (not parked) queued `crm.lead` call writes a field of the
-     * lead (`crmWrittenLeadFields`): its replay, still to come, would overwrite the
-     * same fields of a save sent now. A parked call is not replayed.
+     * lead (`crmPendingLeadWrites`): its replay, still to come, could overwrite a
+     * save sent now, whatever fields each names, as the server recomputes fields a
+     * call does not name. A parked call is not replayed, and an `unlink` writes no
+     * field. Read from the shared per-lead index of the queue, not by going through
+     * every queued call; it reads the queue signal.
      *
      * @returns {boolean}
      */
     _crmHasPendingLeadWrite() {
-        return this._crmLeadQueuedCalls().some(
-            ({ value }) => !value.extras?.error && crmWrittenLeadFields(value).length > 0
+        return (
+            crmPendingLeadWrites(this.model.offlinePlugin, this, Object.keys(this._changes))
+                .length > 0
         );
     }
 
@@ -536,7 +773,8 @@ class CrmFormRecord extends formView.Model.Record {
      * (`_crmHasPendingLeadWrite`), the save is queued as the framework queues a save
      * whose request is lost (`_offlineSave`), which orders it after every queued
      * call of the lead: the replay sends the older writes first, and the user's
-     * values last.
+     * values last. A save the replay hold released "queue only" (`force`) is queued
+     * so whatever the connection state, while such a write is still pending.
      *
      * Every other save is sent as before: online (the replay hold applies), for a
      * record without an id (no queued write targets it; a still-new lead's save is
@@ -545,13 +783,15 @@ class CrmFormRecord extends formView.Model.Record {
      * an urgent save (its beacon cannot wait, and a queue entry could not be stored
      * before the page is left), and while no pending queued call writes the lead.
      *
+     * @param {boolean} [force] the save was released "queue only"
+     *   (`_crmAwaitLeadReplay`)
      * @returns {boolean}
      */
-    _crmQueuesSave() {
+    _crmQueuesSave(force = false) {
         return (
             Boolean(this.resId) &&
             !this.model._urgentSave &&
-            this.model.offlinePlugin.isOffline() &&
+            (force || this.model.offlinePlugin.isOffline()) &&
             this._crmHasPendingLeadWrite()
         );
     }
@@ -565,10 +805,12 @@ class CrmFormRecord extends formView.Model.Record {
      * of the model's ORM is sent unchanged meanwhile.
      *
      * The request the save would have sent was also what told the framework that the
-     * connection is back. Once the save is queued, the plugin checks the connection
-     * (`checkConnection`, the check the offline systray offers) instead: when it is
-     * back, the replay starts and sends the lead's queued writes, this save last;
-     * otherwise nothing changes. The check is not awaited, so the save ends at once.
+     * connection is back. Once the save is queued, the replay is asked to deliver it
+     * instead (`crmReplayQueued`): while the connection is reported lost, the plugin
+     * checks it (`checkConnection`, the check the offline systray offers), and when it
+     * is back the replay starts and sends the lead's queued writes, this save last;
+     * online, the replay starts, or the running one starts the next when it ends.
+     * Nothing is awaited, so the save ends at once.
      *
      * @param {() => Promise<boolean>} save the parent's save
      * @returns {Promise<boolean>} its result
@@ -598,9 +840,134 @@ class CrmFormRecord extends formView.Model.Record {
                 model.orm = orm;
             }
             if (queued) {
-                model.offlinePlugin.checkConnection();
+                crmReplayQueued(model.offlinePlugin);
             }
         }
+    }
+
+    /**
+     * Whether this save of the lead is queued, whatever the connection state, instead
+     * of being sent (`_save`): its x2many lists name records or commands of a queued
+     * save of the lead that no replay sent as that save holds them now
+     * (`isCrmReplaySent`), pending or parked (`_crmSplitCommands`): a record that save
+     * creates (in the list, edited or not, or removed from it), or a command restored
+     * from it (a link, an unlink...), kept or undone. Sent, the save would create or
+     * link those records a second time once that save is replayed (or retried, when
+     * parked), and that save would replay its older values over the user's. Queued
+     * (`_crmQueueSave`, `_offlineSave`), it rewrites that save in place as the form
+     * leaves its records, queues the rest after every queued call of the lead, and
+     * asks the replay to deliver them (`crmReplayQueued`); the record's own parked
+     * save is queued again, as any offline save of the record queues it, so its
+     * replay creates those records once, with the user's last values. A save naming
+     * none of them is not concerned, nor is an urgent save (its beacon cannot wait,
+     * and is never queued) or a record without an id.
+     *
+     * @returns {boolean}
+     */
+    _crmRoutesSave() {
+        if (this.resModel !== "crm.lead" || !this.resId || this.model._urgentSave) {
+            return false;
+        }
+        // Only these fields hold records or commands of a queued save of the lead.
+        const fieldNames = this._crmTrackedX2ManyFields();
+        if (!fieldNames.length) {
+            return false;
+        }
+        const written = this._getChanges();
+        return fieldNames.some((fieldName) => {
+            const { children, restoration } = this._crmSplitCommands(
+                fieldName,
+                written[fieldName] || []
+            );
+            return (
+                children.some((child) => !child.sent) || Boolean(restoration && !restoration.sent)
+            );
+        });
+    }
+
+    /**
+     * Runs `save`, the parent save of this lead, so that the changes it sends (its
+     * request, or its page-close beacon) leave out the x2many commands of the lead's
+     * queued saves (`_crmSentChanges`): the parent reads its changes
+     * (`_getChanges`) synchronously, before its first `await`, while the record says
+     * so (`_crmSplitsSave`). A save whose request is lost is queued by the CRM
+     * offline save, which splits its commands itself (`_offlineSave`).
+     *
+     * @param {() => Promise<boolean>} save
+     * @returns {Promise<boolean>}
+     */
+    _crmSaveLeavingQueuedCommands(save) {
+        const record = toRaw(this);
+        const splits = record._crmSplitsSave;
+        record._crmSplitsSave = true;
+        try {
+            return save();
+        } finally {
+            record._crmSplitsSave = splits;
+        }
+    }
+
+    /**
+     * @override
+     * While the lead's save reads the changes it sends
+     * (`_crmSaveLeavingQueuedCommands`), they leave out the x2many commands of the
+     * lead's queued saves (`_crmSentChanges`). Every other read, of these changes or
+     * of others (the queued ones, an onchange's, a sub-record's), is the parent's.
+     *
+     * @param {Object} [changes]
+     * @param {{withReadonly?: boolean}} [options]
+     */
+    _getChanges(changes = this._changes, options = {}) {
+        const result = super._getChanges(...arguments);
+        if (
+            !toRaw(this)._crmSplitsSave ||
+            toRaw(changes) !== toRaw(this._changes) ||
+            options.withReadonly
+        ) {
+            return result;
+        }
+        return untrack(() => this._crmSentChanges(result));
+    }
+
+    /**
+     * The server values `changes` (`_getChanges`) of a save of the lead that is sent
+     * (online, or by its page-close beacon), with each x2many field naming what a
+     * queued save of the lead does (`_crmSplitCommands`) left with this save's own
+     * commands: a record a queued save creates is created by it only, whether that
+     * save is still queued or was sent or delivered by a replay, and a command
+     * restored from the record's queued save is left to it. The inverse of a restored
+     * link or unlink the user undid is added once a replay sent or delivered that save
+     * (the server has, or receives, that command first), not while it waits: sent
+     * first, it would be undone by that save's replay. A field left without commands
+     * is not sent. A field naming nothing of a queued save keeps its commands.
+     *
+     * The edits of a record a queued save creates do not reach it once a replay sent
+     * that save: the server created it with the values the replay sent, under an id
+     * the form does not know. While that save waits, a save naming its records is
+     * queued instead (`_crmRoutesSave`), and rewrites it with them; only an urgent save
+     * (never queued) leaves them unsent then.
+     *
+     * @param {Object} changes modified in place
+     * @returns {Object} `changes`
+     */
+    _crmSentChanges(changes) {
+        if (this.resModel !== "crm.lead" || !this.resId) {
+            return changes;
+        }
+        // Only these fields hold records or commands of a queued save of the lead.
+        for (const fieldName of this._crmTrackedX2ManyFields()) {
+            const split = this._crmSplitCommands(fieldName, changes[fieldName] || []);
+            if (!split.named) {
+                continue;
+            }
+            const commands = split.restoration?.sent ? split.commands : split.own;
+            if (commands.length) {
+                changes[fieldName] = commands;
+            } else {
+                delete changes[fieldName];
+            }
+        }
+        return changes;
     }
 
     /**
@@ -889,6 +1256,7 @@ class CrmFormRecord extends formView.Model.Record {
      */
     crmAdoptRestoredChanges() {
         this._crmRestored = null;
+        this._crmChildren = null;
         if (Object.keys(this._changes).length) {
             this.dirty = true;
         }
@@ -899,6 +1267,21 @@ class CrmFormRecord extends formView.Model.Record {
      * Remembers the changes the restoration of the lead's queued save put in the
      * form (with the values an onchange derived from them), so a reconciliation
      * can tell them from edits made afterwards.
+     *
+     * It also remembers, for each many2many field of a lead with an id, the commands
+     * the restoration put in the field's list, which are that queued save's:
+     * - each record creation, under the new virtual id the list gives it, is mapped
+     *   to the creation of the queued save it stands for, with the values it was
+     *   restored with (`crmAlignRestoredCreates`), in the registry of the records the
+     *   lead's queued saves create (`_crmChildren`, which it starts anew): that
+     *   record stays that creation for as long as the save stays queued, through
+     *   later saves of the form (`_crmSplitCommands`);
+     * - the other commands (links, unlinks, updates, a set or a clear), in
+     *   `_crmRestored.commands`, for as long as the form holds the restored changes,
+     *   with the save's key (`_crmRestored.key`) and the number of its deliveries the
+     *   replay had made when it was restored (`_crmRestored.delivered`,
+     *   `crmDeliveredArgs`), so that a later save tells whether that save is still
+     *   queued, was delivered since, or left the queue undelivered (`_crmRestoration`).
      *
      * Opened without a queue key, the form restores the record's own queued save
      * (`_crmOwnQueuedSaveKey`), never a follow-up write of it (`_offlineSave`), which
@@ -911,19 +1294,225 @@ class CrmFormRecord extends formView.Model.Record {
      * @param {string} [id] queue key of the save to restore (offline systray)
      */
     setOfflineChanges(id) {
+        const listedBefore = this._crmListedCommands();
         const restoration = super.setOfflineChanges(id || this._crmOwnQueuedSaveKey());
         if (!restoration) {
             return restoration;
         }
         this._crmAdoptCreateKey();
+        const key = this._offlineId;
+        const delivered = crmDeliveredArgs(this.model.offlinePlugin, key).length;
         return restoration.then((result) => {
             const signatures = {};
             for (const fieldName in this._changes) {
                 signatures[fieldName] = this._crmChangeSignature(fieldName);
             }
-            this._crmRestored = markRaw({ changes: this._changes, signatures });
+            const commands = this._crmRememberRestoredCommands(key, listedBefore);
+            this._crmRestored = markRaw({
+                changes: this._changes,
+                signatures,
+                commands,
+                key,
+                delivered,
+            });
             return result;
         });
+    }
+
+    /**
+     * The commands each many2many list of the record holds, in comparable form
+     * (`crmJson`), by field.
+     *
+     * @returns {Object<string, string[]>}
+     */
+    _crmListedCommands() {
+        const listed = {};
+        for (const fieldName in this.activeFields) {
+            if (this.fields[fieldName]?.type === "many2many" && this.data[fieldName]) {
+                listed[fieldName] = this.data[fieldName]._getCommands().map(crmJson);
+            }
+        }
+        return listed;
+    }
+
+    /**
+     * Remembers the commands the restoration of the queued save `key` put in the
+     * many2many lists of the lead (those the lists hold now and did not hold before,
+     * `listedBefore`), for the fields that save writes (`setOfflineChanges`). A record
+     * without an id, or a save that is not queued, leaves nothing to remember.
+     *
+     * @param {string} key
+     * @param {Object<string, string[]>} listedBefore `_crmListedCommands` before it
+     * @returns {Object<string, any[][]>} the restored commands other than creations,
+     *   by field
+     */
+    _crmRememberRestoredCommands(key, listedBefore) {
+        this._crmChildren = null;
+        const queuedValues = this.model.offlinePlugin._ormToSync()[key]?.value.args?.[1];
+        if (this.resModel !== "crm.lead" || !this.resId || !isFieldMapping(queuedValues)) {
+            return {};
+        }
+        const commands = {};
+        const children = markRaw(new Map());
+        for (const fieldName in this._changes) {
+            const field = this.fields[fieldName];
+            if (field?.type !== "many2many" || !Array.isArray(queuedValues[fieldName])) {
+                continue;
+            }
+            const before = [...(listedBefore[fieldName] || [])];
+            const added = this._changes[fieldName]._getCommands().filter((command) => {
+                const index = before.indexOf(crmJson(command));
+                if (index < 0) {
+                    return true;
+                }
+                before.splice(index, 1);
+                return false;
+            });
+            commands[fieldName] = added.filter((command) => !isCreateCommand(command));
+            const aligned = crmAlignRestoredCreates(
+                added.filter(isCreateCommand),
+                queuedValues[fieldName]
+            );
+            const registered = new Map();
+            for (const [virtualId, target] of aligned) {
+                registered.set(virtualId, { key, ...target });
+            }
+            children.set(fieldName, registered);
+        }
+        this._crmChildren = children;
+        return commands;
+    }
+
+    /**
+     * Records the creations of the record's x2many lists that the queued save `key`
+     * holds, just written by this save, in the registry of the records the lead's
+     * queued saves create (`_crmChildren`): those whose virtual id is one of
+     * `created` (the creations the lists held for this save, `_crmListedCreations`),
+     * with their index in that save and the values written. A record without an id,
+     * or a save that is not queued, records nothing.
+     *
+     * @param {string|undefined} key
+     * @param {Map<string, Set<string>>} created virtual ids of the creations, by field
+     */
+    _crmRegisterQueuedChildren(key, created) {
+        const values = key && this.model.offlinePlugin._ormToSync()[key]?.value.args?.[1];
+        if (this.resModel !== "crm.lead" || !this.resId || !isFieldMapping(values)) {
+            return;
+        }
+        for (const [fieldName, virtualIds] of created) {
+            const commands = values[fieldName];
+            if (!Array.isArray(commands)) {
+                continue;
+            }
+            commands.forEach((command, index) => {
+                if (!isCreateCommand(command) || !virtualIds.has(command[1])) {
+                    return;
+                }
+                if (!this._crmChildren) {
+                    this._crmChildren = markRaw(new Map());
+                }
+                if (!this._crmChildren.has(fieldName)) {
+                    this._crmChildren.set(fieldName, new Map());
+                }
+                this._crmChildren
+                    .get(fieldName)
+                    .set(command[1], { key, id: command[1], index, values: command[2] || {} });
+            });
+        }
+    }
+
+    /**
+     * Virtual ids of the record creations each x2many list of the record holds, by
+     * field: the creations a save writes now.
+     *
+     * @returns {Map<string, Set<string>>}
+     */
+    _crmListedCreations() {
+        const created = new Map();
+        for (const fieldName in this.activeFields) {
+            const list = this.data[fieldName];
+            if (!X2MANY_TYPES.includes(this.fields[fieldName]?.type) || !list) {
+                continue;
+            }
+            const virtualIds = list
+                ._getCommands()
+                .filter(isCreateCommand)
+                .map((command) => command[1]);
+            if (virtualIds.length) {
+                created.set(fieldName, new Set(virtualIds));
+            }
+        }
+        return created;
+    }
+
+    /**
+     * Records of the x2many list `fieldName` that a queued save of the lead creates,
+     * by virtual id (`children`): each record of the registry (`_crmChildren`) whose
+     * creation the save it names still holds, with that save (`key`), the creation's
+     * index there (`index`), the values the record had when the creation was last
+     * written or restored (`values`), and whether a replay sent that save as it holds
+     * it now (`sent`: in flight, or delivered and about to leave the queue,
+     * `isCrmReplaySent`). The registered records whose creation left the queue are
+     * the `delivered` ones when the replay delivered a save of that key holding it
+     * (`crmDeliveredArgs`): the server created them; the others (discarded) are the
+     * `gone` ones, which the server never created.
+     *
+     * @param {string} fieldName
+     * @returns {{children: Map<string, {key: string, index: number, values: Object, sent: boolean}>, delivered: Set<string>, gone: Set<string>}}
+     */
+    _crmQueuedChildren(fieldName) {
+        const children = new Map();
+        const delivered = new Set();
+        const gone = new Set();
+        const registered = this._crmChildren?.get(fieldName);
+        if (!registered) {
+            return { children, delivered, gone };
+        }
+        const plugin = this.model.offlinePlugin;
+        const queue = plugin._ormToSync();
+        const createIndex = (args, target) =>
+            crmQueuedCreateIndex(
+                isFieldMapping(args?.[1]) ? args[1][fieldName] : undefined,
+                target
+            );
+        for (const [virtualId, target] of registered) {
+            const entry = queue[target.key];
+            const index = createIndex(entry?.value.args, target);
+            if (index >= 0) {
+                children.set(virtualId, {
+                    key: target.key,
+                    index,
+                    values: target.values,
+                    sent: isCrmReplaySent(plugin, entry),
+                });
+            } else if (
+                crmDeliveredArgs(plugin, target.key).some((args) => createIndex(args, target) >= 0)
+            ) {
+                delivered.add(virtualId);
+            } else {
+                gone.add(virtualId);
+            }
+        }
+        return { children, delivered, gone };
+    }
+
+    /**
+     * x2many fields whose commands a save splits even when its changes leave them out
+     * (a list without commands, `_getChanges`): those holding commands restored from
+     * the record's queued save, while the form holds them, and those with records a
+     * queued save of the lead creates (`_crmChildren`).
+     *
+     * @returns {string[]}
+     */
+    _crmTrackedX2ManyFields() {
+        const restoration = this._crmRestored;
+        const fieldNames = new Set(this._crmChildren?.keys() || []);
+        if (restoration && restoration.changes === this._changes) {
+            for (const fieldName in restoration.commands || {}) {
+                fieldNames.add(fieldName);
+            }
+        }
+        return [...fieldNames].filter((fieldName) => fieldName in this._changes);
     }
 
     /**
@@ -933,21 +1522,39 @@ class CrmFormRecord extends formView.Model.Record {
      * email and phone forced for a partner the lead no longer has, or superseded by
      * a partner change, are not queued (`_crmDropStaleForcedContacts`).
      *
-     * The framework queues every offline save of a record under its first queued
-     * save's key and time stamp, and replays the queue in time-stamp order. A field
-     * of a lead that this save writes, and that a call queued since (through another
-     * record of the lead, such as its pipeline card, or "Won") also writes, would
-     * then replay before that call and lose to it, although the user wrote it last.
-     * Such a save is ordered after every queued call of the lead
-     * (`_crmPlanOfflineSave`):
-     * - the record's queued save moves to that time when no later call writes any
-     *   other value it already held (moving it then changes no other outcome);
-     * - otherwise it keeps its time, so the values it already held stay before the
-     *   calls that write them, and the fields of this save are queued again in a
-     *   follow-up `web_save` (`crmFollowUp` extra) after every queued call of the
-     *   lead (`_crmQueueFollowUpWrite`).
-     * Every other save (no such field, a creation, another model) is the
-     * framework's.
+     * The record's own pending queued save keeps its values, its commands and its
+     * time, and this save's edits are queued in a follow-up `web_save` (`crmFollowUp`
+     * extra) after every queued call of the lead instead (`_crmQueueFollowUpWrite`),
+     * while a replay runs (it may have read that save, and would then lose values
+     * merged into it), or when this save or that one holds x2many commands (merged,
+     * earlier commands would be dropped, or replayed too early):
+     * `_crmKeepsOwnQueuedSave`. The x2many records a queued save of the lead creates
+     * keep being created by it, once: their edits and removals rewrite that save
+     * instead of reaching the follow-up (`_crmOwnSaveFollowUp`,
+     * `_crmRewriteQueuedChildren`).
+     *
+     * Otherwise the framework queues every offline save of a record under its first
+     * queued save's key and time stamp, and replays the queue in time-stamp order.
+     * This save would then replay before a call of the lead queued since (through
+     * another record of the lead, such as its pipeline card, or "Won") that writes a
+     * field of the lead, and lose to it, although the user made it last: to its
+     * values, or to the fields the server recomputes from them. Such a save is
+     * ordered after every queued call of the lead (`_crmPlanOfflineSave`):
+     * - the record's queued save moves to that time when it holds no other value
+     *   than this save's and no x2many command (moving it then changes no older
+     *   value);
+     * - otherwise it keeps its time, so the values and commands it already held stay
+     *   before the later calls, and the fields of this save are queued again in a
+     *   follow-up `web_save` after every queued call of the lead; its x2many fields
+     *   keep the commands they held, with the record creations rewritten as the form
+     *   left them, and display values matching them (`_crmKeepQueuedCommands`).
+     * A save merged by the framework into the record's queued save holding x2many
+     * commands (no later call of the lead) keeps those commands, rewritten the same
+     * way, followed by this save's own (`_crmKeepQueuedCommands`). A save whose list
+     * commands the framework queues as they are (no queued save holding x2many
+     * commands, such as once the record's queued save was replayed) leaves those
+     * naming what a queued save of the lead does to that save (`_crmLeftOutX2Many`).
+     * Every other save (a creation, another model) is the framework's.
      *
      * The queued create of a new lead carries the lead's delivery key in its context
      * (`CRM_OFFLINE_CREATE_KEY`), through the parent's `_offlineSave`, so the server
@@ -956,15 +1563,503 @@ class CrmFormRecord extends formView.Model.Record {
     _offlineSave() {
         this._crmForgetUnqueuedOfflineSave();
         this._crmDropStaleForcedContacts();
+        const created = this._crmListedCreations();
+        if (untrack(() => this._crmKeepsOwnQueuedSave())) {
+            const { followUp, children } = untrack(() => this._crmOwnSaveFollowUp());
+            untrack(() => this._crmRewriteQueuedChildren(children));
+            if (followUp) {
+                const key = this._crmQueueFollowUpWrite(followUp);
+                untrack(() => this._crmRegisterQueuedChildren(key, created));
+            }
+            this._commitSave();
+            return true;
+        }
         const plan = this._crmPlanOfflineSave();
         if (plan.timeStamp) {
             this._offlineTimeStamp = plan.timeStamp;
         }
         const result = super._offlineSave(...arguments);
+        if (plan.queuedX2Many) {
+            untrack(() => this._crmKeepQueuedCommands(plan.queuedX2Many, plan.ownChildren));
+        }
+        untrack(() => this._crmRegisterQueuedChildren(this._offlineId, created));
+        if (plan.otherChildren) {
+            untrack(() => this._crmRewriteQueuedChildren(plan.otherChildren));
+        }
         if (plan.followUp) {
-            this._crmQueueFollowUpWrite(plan.followUp);
+            const key = this._crmQueueFollowUpWrite(plan.followUp);
+            untrack(() => this._crmRegisterQueuedChildren(key, created));
         }
         return result;
+    }
+
+    /**
+     * Whether this offline save of the lead leaves the record's own queued save
+     * (`offlineId`, pending: queued, not parked) exactly as it is, and queues its
+     * edits in a follow-up write after every queued call of the lead instead
+     * (`_offlineSave`). So:
+     * - while a replay runs: the replay may have read that save already, and it then
+     *   sends the values it read and removes or parks the entry under its key,
+     *   whatever the entry holds by then, so values merged into it would be lost;
+     * - when this save writes an x2many field: merged, its commands would replay at
+     *   the queued save's time, before a later queued write of the lead, and lose to
+     *   it, while moving that save to a later time would reorder its older values;
+     * - when that save holds x2many commands: the framework's merge rebuilds them
+     *   from the lists' current commands, which hold this save's only (the earlier
+     *   ones were cleared once queued), so the earlier ones would never be sent.
+     * The follow-up holds this save's own commands only, never one of that save's
+     * (restored into the form) nor one naming a record a queued save creates
+     * (`_crmOwnSaveFollowUp`), so no command is sent twice; the edits and removals of
+     * such records rewrite the save creating them while it is not sent
+     * (`_crmRewriteQueuedChildren`). A record without an id, or without such a save,
+     * is the framework's. It reads the plugin's queue and sync signals.
+     *
+     * @returns {boolean}
+     */
+    _crmKeepsOwnQueuedSave() {
+        if (this.resModel !== "crm.lead" || !this.resId || !this._offlineId) {
+            return false;
+        }
+        const plugin = this.model.offlinePlugin;
+        const own = plugin._ormToSync()[this._offlineId];
+        if (!own || own.value.extras?.error) {
+            return false;
+        }
+        const isX2Many = (fieldName) => X2MANY_TYPES.includes(this.fields[fieldName]?.type);
+        const queuedValues = own.value.args?.[1];
+        return (
+            plugin.syncingORM() ||
+            Object.keys(this._getChanges()).some(isX2Many) ||
+            (isFieldMapping(queuedValues) && Object.keys(queuedValues).some(isX2Many))
+        );
+    }
+
+    /**
+     * @typedef {Object} CrmQueuedChild a record of an x2many list of the form that a
+     *  queued save of the lead creates (`_crmSplitCommands`)
+     * @property {string} fieldName
+     * @property {string} virtualId its virtual id in the list
+     * @property {string} key the queued save creating it
+     * @property {number} index the creation's index in that save's commands of the field
+     * @property {boolean} present whether the list still holds it
+     * @property {boolean} sent whether a replay sent that save as it holds it now
+     *  (`isCrmReplaySent`)
+     * @property {Object} values the values the user changed since the creation was
+     *  last written or restored
+     * @property {Object|undefined} current its values in the list, when it holds a
+     *  command of it
+     */
+
+    /**
+     * The follow-up write of this save when it leaves the record's own queued save as
+     * it is (`_crmKeepsOwnQueuedSave`), or when that save keeps its time before a later
+     * write of the lead (`_crmPlanOfflineSave`): every field it writes (`_getChanges`,
+     * x2many commands included), except values restored from that save and unmodified
+     * since (`crmRestoredUnmodifiedFields`), which that save still sends. The commands
+     * of each x2many field are split (`_crmSplitCommands`, for the fields whose
+     * list holds no command as well, `_crmTrackedX2ManyFields`): the follow-up holds
+     * this save's own commands, and the inverse of each link or unlink restored from
+     * that save that the user undid; the commands that save holds, and those naming a
+     * record a queued save of the lead creates, are left out, so that no command, a
+     * record creation included, is sent twice. Those records are returned (`children`),
+     * for the save creating each to be rewritten as the form leaves them
+     * (`_crmRewriteQueuedChildren`). The follow-up is `null` when nothing is left to
+     * write.
+     *
+     * @returns {{followUp: {values: Object, changes: Object, originalValues: Object}|null, children: CrmQueuedChild[]}}
+     */
+    _crmOwnSaveFollowUp() {
+        const written = this._getChanges();
+        delete written.id;
+        const restored = this.crmRestoredUnmodifiedFields();
+        const fieldNames = new Set([...Object.keys(written), ...this._crmTrackedX2ManyFields()]);
+        const children = [];
+        const edits = [...fieldNames].filter((fieldName) => {
+            if (restored.includes(fieldName)) {
+                return false;
+            }
+            if (!X2MANY_TYPES.includes(this.fields[fieldName].type)) {
+                return true;
+            }
+            const split = this._crmSplitCommands(fieldName, written[fieldName] || []);
+            children.push(...split.children);
+            written[fieldName] = split.commands;
+            return split.commands.length > 0;
+        });
+        return {
+            followUp: edits.length ? this._crmFollowUpWrite(written, edits) : null,
+            children,
+        };
+    }
+
+    /**
+     * Splits the commands `commands` of the x2many field `fieldName` (its list's,
+     * `_getChanges`) between this save's own commands and the lead's queued saves:
+     * - a command naming a record a queued save of the lead creates
+     *   (`_crmQueuedChildren`: its creation, an update or a removal of it) is that
+     *   save's, whatever its values: it is left out, and the record is returned in
+     *   `children`, still in the list or not, with the values the user changed since
+     *   its creation was last written or restored;
+     * - a command naming a record whose creation the replay delivered (the server
+     *   created it, under an id the form does not know) is left out, its creation
+     *   included: the record is created once, by that save;
+     * - an update or a removal of a record whose creation left the queue undelivered
+     *   names no record the server knows: it is left out; its creation is this
+     *   save's own, the server never made it;
+     * - while the form holds the changes restored from the record's queued save, and
+     *   that save is still queued or was delivered since (`_crmRestoration`), each
+     *   command the restoration put in the list (`_crmRestored.commands`, a link, an
+     *   unlink, an update...) equal to one of them is that save's, and is left out once;
+     *   a restored link whose record the user removed, or a restored unlink whose record
+     *   the user added back, gets its inverse ahead of this save's commands, unless
+     *   those already name that record or set the whole list. Once that save left the
+     *   queue undelivered (discarded), its commands are this save's own;
+     * - every other command is this save's own, in its order.
+     *
+     * Besides `commands` (the inverses, then this save's own commands), the split
+     * returns them apart (`inverses`, `own`), the restoration whose commands took part
+     * (`restoration`: one was left out, or an inverse added; `null` otherwise), and
+     * whether anything of a queued save took part at all (`named`: a command was left
+     * out, an inverse added, or the field holds records a queued save creates).
+     *
+     * @param {string} fieldName
+     * @param {any[]} commands
+     * @returns {{commands: any[], own: any[], inverses: any[], children: CrmQueuedChild[], restoration: {key: string, sent: boolean}|null, named: boolean}}
+     */
+    _crmSplitCommands(fieldName, commands) {
+        const { CREATE, UPDATE, DELETE, UNLINK, LINK, CLEAR, SET } = x2ManyCommands;
+        const currentIds = this.data[fieldName]?.currentIds || [];
+        const { children: queuedChildren, delivered, gone } = this._crmQueuedChildren(fieldName);
+        const restoration = this._crmRestoration();
+        const restored = restoration?.commands[fieldName] || [];
+        const pool = restored.map(crmJson);
+        const currentValues = new Map();
+        const own = [];
+        let leftOut = 0;
+        let restoredLeftOut = false;
+        for (const command of commands) {
+            if (RECORD_COMMANDS.includes(command[0]) && queuedChildren.has(command[1])) {
+                if (command[0] === CREATE || command[0] === UPDATE) {
+                    currentValues.set(command[1], command[2] || {});
+                }
+                leftOut++;
+                continue;
+            }
+            if (
+                RECORD_COMMANDS.includes(command[0]) &&
+                (delivered.has(command[1]) || (command[0] !== CREATE && gone.has(command[1])))
+            ) {
+                leftOut++;
+                continue;
+            }
+            const index = pool.indexOf(crmJson(command));
+            if (index >= 0) {
+                pool.splice(index, 1);
+                leftOut++;
+                restoredLeftOut = true;
+                continue;
+            }
+            own.push(command);
+        }
+        const inverses = [];
+        if (!own.some(([type]) => type === SET || type === CLEAR)) {
+            const ownNames = (id, types) =>
+                own.some((command) => types.includes(command[0]) && command[1] === id);
+            for (const [type, id] of restored) {
+                if (type === LINK && !currentIds.includes(id) && !ownNames(id, [UNLINK, DELETE])) {
+                    inverses.push([UNLINK, id]);
+                } else if (type === UNLINK && currentIds.includes(id) && !ownNames(id, [LINK])) {
+                    inverses.push([LINK, id]);
+                }
+            }
+        }
+        const children = [];
+        for (const [virtualId, child] of queuedChildren) {
+            const present = currentIds.includes(virtualId);
+            const current = present ? currentValues.get(virtualId) : undefined;
+            const edited = Object.keys(current || {}).filter(
+                (name) => crmJson(current[name]) !== crmJson(child.values[name])
+            );
+            children.push({
+                fieldName,
+                virtualId,
+                key: child.key,
+                index: child.index,
+                present,
+                sent: child.sent,
+                values: pick(current || {}, ...edited),
+                current,
+            });
+        }
+        return {
+            commands: [...inverses, ...own],
+            own,
+            inverses,
+            children,
+            restoration:
+                restoredLeftOut || inverses.length
+                    ? { key: restoration.key, sent: restoration.sent }
+                    : null,
+            named: leftOut > 0 || inverses.length > 0 || children.length > 0,
+        };
+    }
+
+    /**
+     * The changes restored from the record's queued save (`_crmRestored`, set by
+     * `setOfflineChanges`) while the form holds them and that save still stands: it
+     * is queued under its key, or the replay delivered it under that key since it
+     * was restored (`crmDeliveredArgs`). With `sent`, whether the server has those
+     * changes or receives them (a replay sent the queued save as it holds it now, in
+     * flight or delivered: `isCrmReplaySent`; or delivered it since) rather than
+     * still waiting for them (pending, or parked). `null` when the form holds no such
+     * changes, or once that save left the queue undelivered (discarded): the
+     * restored commands are then the form's own. A save holding no x2many command
+     * restored none, and its delivery is not recorded: it reads as `null` once
+     * delivered.
+     *
+     * @returns {{key: string, commands: Object<string, any[][]>, sent: boolean}|null}
+     */
+    _crmRestoration() {
+        const restoration = this._crmRestored;
+        if (!restoration || restoration.changes !== this._changes || !restoration.key) {
+            return null;
+        }
+        const plugin = this.model.offlinePlugin;
+        const entry = plugin._ormToSync()[restoration.key];
+        let sent;
+        if (entry) {
+            sent = isCrmReplaySent(plugin, entry);
+        } else if (crmDeliveredArgs(plugin, restoration.key).length > restoration.delivered) {
+            sent = true;
+        } else {
+            return null;
+        }
+        return { key: restoration.key, commands: restoration.commands || {}, sent };
+    }
+
+    /**
+     * Rewrites each queued save creating one of `children` (`_crmSplitCommands`) as
+     * the form leaves those records: a creation none of whose records is still in the
+     * list is dropped, one whose records were edited takes their edited values over
+     * its own, at its place and with its own virtual id (`crmRewrittenCreates`), and
+     * the display values of the field (`extras.changes`) match the new commands
+     * (`_crmQueuedDisplayValue`). The save keeps its other values, its keyword
+     * arguments, its key, its time stamp and its other extras, an error included; a
+     * running replay that has not reached it yet sends it as rewritten
+     * (`rewriteCrmQueuedCall`).
+     *
+     * A save that a replay is sending, or has delivered (`isCrmReplaySent`), is left
+     * as it is: its records are created once, by it, with the values it was sent with,
+     * and the later edits and removals of those records are not written.
+     *
+     * @param {CrmQueuedChild[]} children
+     */
+    _crmRewriteQueuedChildren(children) {
+        const plugin = this.model.offlinePlugin;
+        for (const key of new Set(children.map((child) => child.key))) {
+            const entry = plugin._ormToSync()[key];
+            const values = entry?.value.args?.[1];
+            if (!isFieldMapping(values) || isCrmReplaySent(plugin, entry)) {
+                continue;
+            }
+            const ofEntry = children.filter((child) => child.key === key);
+            const rewritten = {};
+            const changes = { ...entry.value.extras?.changes };
+            for (const fieldName of new Set(ofEntry.map((child) => child.fieldName))) {
+                const commands = crmRewrittenCreates(
+                    Array.isArray(values[fieldName]) ? values[fieldName] : [],
+                    ofEntry.filter((child) => child.fieldName === fieldName)
+                );
+                if (commands) {
+                    rewritten[fieldName] = commands;
+                    changes[fieldName] = this._crmQueuedDisplayValue(
+                        fieldName,
+                        commands,
+                        changes[fieldName]
+                    );
+                }
+            }
+            if (!Object.keys(rewritten).length) {
+                continue;
+            }
+            const args = [entry.value.args[0], { ...values, ...rewritten }];
+            if (rewriteCrmQueuedCall(plugin, key, args, { ...entry.value.extras, changes })) {
+                this._crmChildrenWritten(ofEntry);
+            }
+        }
+    }
+
+    /**
+     * Updates the registry of the records the lead's queued saves create
+     * (`_crmChildren`) once the saves creating `children` were rewritten as the form
+     * leaves them: a removed record leaves it, an edited one is known by its new
+     * values.
+     *
+     * @param {CrmQueuedChild[]} children
+     */
+    _crmChildrenWritten(children) {
+        for (const child of children) {
+            const registered = this._crmChildren?.get(child.fieldName);
+            const target = registered?.get(child.virtualId);
+            if (!target) {
+                continue;
+            }
+            if (!child.present) {
+                registered.delete(child.virtualId);
+            } else if (child.current) {
+                target.values = { ...child.current };
+            }
+        }
+    }
+
+    /**
+     * Display value (`extras.changes`) of a queued save's commands `commands` of the
+     * x2many field `fieldName`, as the framework formats a many2many list's
+     * (`_formatOfflineValues`): the commands, and the display names, joined, of the
+     * records the field holds once they apply to those it held as loaded (`resIds`),
+     * a creation shown by its values, another record by its copy in the list (a
+     * record the list never loaded is not named). Another x2many field keeps its
+     * display value (`previous`).
+     *
+     * @param {string} fieldName
+     * @param {any[]} commands
+     * @param {any} previous
+     * @returns {any}
+     */
+    _crmQueuedDisplayValue(fieldName, commands, previous) {
+        if (this.fields[fieldName]?.type !== "many2many") {
+            return previous;
+        }
+        const { CREATE, DELETE, UNLINK, LINK, CLEAR, SET } = x2ManyCommands;
+        const list = this.data[fieldName];
+        let held = (list?.resIds || []).map((id) => ({ id }));
+        for (const command of commands) {
+            switch (command[0]) {
+                case CREATE:
+                    held.push({ values: command[2] || {} });
+                    break;
+                case LINK:
+                    if (!held.some(({ id }) => id === command[1])) {
+                        held.push({ id: command[1] });
+                    }
+                    break;
+                case DELETE:
+                case UNLINK:
+                    held = held.filter(({ id }) => id !== command[1]);
+                    break;
+                case CLEAR:
+                    held = [];
+                    break;
+                case SET:
+                    held = (command[2] || []).map((id) => ({ id }));
+                    break;
+            }
+        }
+        const names = held.map(({ id, values }) => {
+            if (values) {
+                return getOfflineDisplayName({ data: values });
+            }
+            const record = list?._cache[id];
+            return record ? getOfflineDisplayName(record) : null;
+        });
+        return { commands, display_name: names.filter(Boolean).join(", ") };
+    }
+
+    /**
+     * Writes into the record's own queued save, just written by the framework's
+     * offline save (`_offlineSave`), the x2many commands `kept` gives
+     * (`_crmPlanOfflineSave`). The framework rebuilds that save's x2many commands from
+     * the lists' current commands: once a save is queued they are cleared, so the
+     * commands that save held earlier would be dropped, and the restoration of that
+     * save gives its record creations new virtual ids and only the values the list
+     * shows. So each x2many field `kept` names sends the commands it gives, at that
+     * save's time: the commands the save held, with their record creations rewritten
+     * as the form leaves them, followed by this save's own ones when they are merged
+     * into it. Every other x2many field of that save is dropped from it (this save's
+     * commands of it are queued in a follow-up write). Its display values follow
+     * (`extras.changes`: the one `kept` gives, else the framework's display names with
+     * the kept commands), as do the values it replaces (`extras.originalValues`: the
+     * ones that save held before, when `kept` gives them). Its other values and its
+     * other extras (time stamp included) stay as the framework wrote them; a field
+     * that is neither a many2many field nor given display values by `kept` keeps the
+     * framework's. The registry of the records the lead's queued saves create then
+     * knows the rewritten ones (`children`, `_crmChildrenWritten`).
+     *
+     * @param {Object<string, {commands: any[], changes?: Object, originalValue?: any}>} kept
+     *  by field
+     * @param {CrmQueuedChild[]} [children] the records of that save it rewrites
+     */
+    _crmKeepQueuedCommands(kept, children = []) {
+        const plugin = this.model.offlinePlugin;
+        const entry = plugin._ormToSync()[this._offlineId];
+        const values = entry?.value.args?.[1];
+        if (!isFieldMapping(values)) {
+            return;
+        }
+        const fieldNames = [...new Set([...Object.keys(values), ...Object.keys(kept)])];
+        const x2ManyFields = fieldNames.filter((fieldName) =>
+            X2MANY_TYPES.includes(this.fields[fieldName]?.type)
+        );
+        if (!x2ManyFields.length) {
+            return;
+        }
+        const args = { ...values };
+        const changes = { ...entry.value.extras?.changes };
+        const originalValues = { ...entry.value.extras?.originalValues };
+        for (const fieldName of x2ManyFields) {
+            if (!(fieldName in kept)) {
+                delete args[fieldName];
+                delete changes[fieldName];
+                delete originalValues[fieldName];
+                continue;
+            }
+            const { commands } = kept[fieldName];
+            args[fieldName] = commands;
+            if (kept[fieldName].changes !== undefined) {
+                changes[fieldName] = kept[fieldName].changes;
+            } else if (this.fields[fieldName].type === "many2many") {
+                changes[fieldName] = isFieldMapping(changes[fieldName])
+                    ? { ...changes[fieldName], commands }
+                    : this._crmQueuedDisplayValue(fieldName, commands, undefined);
+            }
+            if ("originalValue" in kept[fieldName]) {
+                originalValues[fieldName] = kept[fieldName].originalValue;
+            }
+        }
+        plugin.scheduleORM(
+            entry.value.model,
+            entry.value.method,
+            [entry.value.args[0], args],
+            entry.value.kwargs,
+            { id: this._offlineId, extras: { ...entry.value.extras, changes, originalValues } }
+        );
+        this._crmChildrenWritten(children);
+    }
+
+    /**
+     * The follow-up write (`_crmQueueFollowUpWrite`) of the fields `fieldNames` of
+     * this save: their server values (`written`, x2many commands included), and the
+     * display values of the change and of the values it replaces, as the framework
+     * queues them, the commands of a many2many change being those it writes.
+     *
+     * @param {Object} written the save's server values (`_getChanges`)
+     * @param {string[]} fieldNames
+     * @returns {{values: Object, changes: Object, originalValues: Object}}
+     */
+    _crmFollowUpWrite(written, fieldNames) {
+        const changes = this._formatOfflineValues(pick(this._changes, ...fieldNames));
+        for (const fieldName of fieldNames) {
+            if (this.fields[fieldName].type === "many2many" && isFieldMapping(changes[fieldName])) {
+                changes[fieldName].commands = written[fieldName];
+            }
+        }
+        return {
+            values: pick(written, ...fieldNames),
+            changes,
+            originalValues: this._formatOfflineValues(pick(this._values, ...fieldNames), {
+                changes: false,
+            }),
+        };
     }
 
     /**
@@ -1065,9 +2160,13 @@ class CrmFormRecord extends formView.Model.Record {
      * Saves the changes the refresh load kept (`refresh.dropFields` were dropped),
      * through the CRM save, which starts from the refreshed values. It happens while
      * the model still shows this record, the lead has an id (a record without one
-     * would be created again), the connection is still up after the load and at
-     * least one change is written. A save that does not happen (invalid record)
-     * leaves the changes in the form.
+     * would be created again), the connection is still up after the load and the
+     * form holds a change to write: a change the framework sees (`_getChanges`), or
+     * the inverse of a command restored from the record's replayed save that the user
+     * undid, in a list then left without commands (`_crmSentChanges`). The CRM save
+     * leaves out what the replayed save did (`_crmSaveLeavingQueuedCommands`): when
+     * nothing else is left, it sends nothing and the form shows the refreshed values.
+     * A save that does not happen (invalid record) leaves the changes in the form.
      *
      * @param {{dropFields: string[], saving: boolean}} refresh
      * @returns {Promise<void>}
@@ -1082,7 +2181,8 @@ class CrmFormRecord extends formView.Model.Record {
         }
         const toWrite = this._getChanges();
         delete toWrite.id;
-        if (!Object.keys(toWrite).length) {
+        const sent = this._crmSentChanges({ ...toWrite });
+        if (!Object.keys(toWrite).length && !Object.keys(sent).length) {
             return;
         }
         refresh.saving = true;
@@ -1380,20 +2480,43 @@ class CrmFormRecord extends formView.Model.Record {
 
     /**
      * Orders the lead's offline save about to be queued (`_offlineSave`), from the
-     * record's state before the framework commits it:
-     * - its edits: the fields it writes (`_getChanges`), except values restored from
-     *   the record's queued save and unmodified since, and x2many fields (their
-     *   commands are sent once, with the record's save);
+     * record's state before the framework commits it, when it does not leave the
+     * record's own queued save as it is (`_crmKeepsOwnQueuedSave`: then there is no
+     * pending own queued save holding x2many commands, and none of its edits is an
+     * x2many field while there is one):
+     * - its edits: the fields it writes (`_getChanges`, x2many fields included),
+     *   except values restored from the record's queued save and unmodified since;
      * - the later calls: the lead's other queued calls replaying with or after the
-     *   record's queued save, all of them when it has none;
-     * - the overridden edits, those a later call writes. None: the framework's
-     *   save applies (`{}`). Otherwise, when no other value of the record's queued
-     *   save is written by a later call, that save gets a time stamp after every
-     *   queued call of the lead (`timeStamp`); else the overridden edits are a
-     *   follow-up write (`followUp`: their server values, and the display values
-     *   of the change and of the values it replaces, as the framework queues them).
+     *   record's queued save, all of them when it has none. One writing any field of
+     *   the lead (`crmWrittenLeadFields`) overrides every edit: the fields a call
+     *   names are not all the fields its replay changes, as the server recomputes
+     *   fields it does not name (a team change recomputes the stage).
+     * No later call: the framework's save applies (`{}`), merging the save into the
+     * record's queued save; when that save holds x2many commands, it keeps them, with
+     * their record creations rewritten as the form leaves them, followed by this
+     * save's own commands (`queuedX2Many`, `_crmMergedQueuedX2Many`). Otherwise, when
+     * the record's queued save holds no other field than the edits and no x2many
+     * command (or there is none), that save gets a time stamp after every queued call
+     * of the lead (`timeStamp`): moving it changes no older value or command. Else it
+     * keeps its time, so the values and commands it already held stay before the
+     * later calls, and the edits are queued again in a follow-up write after them
+     * (`followUp`, `_crmOwnSaveFollowUp`: their server values, this save's own x2many
+     * commands, and the display values of the change and of the values it replaces,
+     * as the framework queues them; `null` when nothing is left to write). That save
+     * then gets back the x2many commands it held, with their record creations
+     * rewritten as the form leaves them, and the display values and replaced values
+     * matching them (`queuedX2Many`, `_crmKeptQueuedX2Many`), so that every command is
+     * sent once, at its own place. The records of the form those x2many commands
+     * create are returned too: those of the record's queued save (`ownChildren`), for
+     * the registry once it is rewritten, and those other queued saves of the lead
+     * create (`otherChildren`), for these saves to be rewritten
+     * (`_crmRewriteQueuedChildren`). When the record's queued save holds no x2many
+     * command, or there is none (such as once it was replayed), the framework queues
+     * the lists' commands: those naming what a queued save of the lead does, sent or
+     * delivered ones included, are then left to it (`queuedX2Many`, `otherChildren`:
+     * `_crmLeftOutX2Many`), so that no record is created twice.
      *
-     * @returns {{timeStamp?: number, followUp?: {values: Object, changes: Object, originalValues: Object}}}
+     * @returns {{timeStamp?: number, followUp?: {values: Object, changes: Object, originalValues: Object}|null, queuedX2Many?: Object, ownChildren?: CrmQueuedChild[], otherChildren?: CrmQueuedChild[]}}
      */
     _crmPlanOfflineSave() {
         if (this.resModel !== "crm.lead" || !this.resId) {
@@ -1402,51 +2525,175 @@ class CrmFormRecord extends formView.Model.Record {
         const written = this._getChanges();
         delete written.id;
         const restored = this.crmRestoredUnmodifiedFields();
-        const edits = Object.keys(written).filter(
-            (fieldName) =>
-                !restored.includes(fieldName) && !X2MANY_TYPES.includes(this.fields[fieldName].type)
-        );
-        if (!edits.length) {
-            return {};
-        }
+        const edits = Object.keys(written).filter((fieldName) => !restored.includes(fieldName));
         const ownEntry = this._crmIsOwnSaveQueued()
             ? this.model.offlinePlugin._ormToSync()[this._offlineId]
             : null;
+        const queuedValues = ownEntry?.value.args?.[1];
+        const queuedX2ManyFields = isFieldMapping(queuedValues)
+            ? Object.keys(queuedValues).filter((fieldName) =>
+                  X2MANY_TYPES.includes(this.fields[fieldName]?.type)
+              )
+            : [];
+        // The framework queues the lists' commands as they are when the record's queued
+        // save holds no x2many command: those naming what a queued save of the lead does
+        // are left to it first.
+        const leftOut = queuedX2ManyFields.length ? {} : this._crmLeftOutX2Many(written);
+        if (!edits.length && !queuedX2ManyFields.length) {
+            return leftOut;
+        }
         const ownTimeStamp = ownEntry?.value.extras?.timeStamp || 0;
         const others = this._crmLeadQueuedCalls().filter(({ key }) => key !== this._offlineId);
-        const laterFields = new Set();
-        for (const { value } of others) {
-            if (!ownEntry || (value.extras?.timeStamp || 0) >= ownTimeStamp) {
-                for (const fieldName of crmWrittenLeadFields(value)) {
-                    laterFields.add(fieldName);
-                }
-            }
-        }
-        const overridden = edits.filter((fieldName) => laterFields.has(fieldName));
-        if (!overridden.length) {
-            return {};
-        }
-        const heldOverridden =
-            Boolean(ownEntry) &&
-            Object.keys(this._offlineChanges || {}).some(
-                (fieldName) =>
-                    fieldName !== "id" && !edits.includes(fieldName) && laterFields.has(fieldName)
+        const overridden =
+            edits.length > 0 &&
+            others.some(
+                ({ value }) =>
+                    (!ownEntry || (value.extras?.timeStamp || 0) >= ownTimeStamp) &&
+                    crmWrittenLeadFields(value).length > 0
             );
-        if (!heldOverridden) {
+        if (!overridden) {
+            return queuedX2ManyFields.length ? this._crmMergedQueuedX2Many(ownEntry) : leftOut;
+        }
+        const holdsOtherFields =
+            Boolean(ownEntry) &&
+            (queuedX2ManyFields.length > 0 ||
+                Object.keys(this._offlineChanges || {}).some(
+                    (fieldName) => fieldName !== "id" && !edits.includes(fieldName)
+                ));
+        if (!holdsOtherFields) {
             let timeStamp = Date.now();
             for (const { value } of others) {
                 timeStamp = Math.max(timeStamp, (value.extras?.timeStamp || 0) + 1);
             }
-            return { timeStamp };
+            return { timeStamp, ...leftOut };
+        }
+        const { followUp, children } = this._crmOwnSaveFollowUp();
+        return { followUp, ...this._crmKeptQueuedX2Many(ownEntry, queuedX2ManyFields, children) };
+    }
+
+    /**
+     * The x2many commands of this save, which the framework queues as the lists hold
+     * them when the record's queued save holds no x2many command or there is none
+     * (`_crmPlanOfflineSave`), once those naming what a queued save of the lead does
+     * are left to that save (`_crmSplitCommands`), for `_crmKeepQueuedCommands`: each
+     * x2many field with this save's own commands, the inverses of undone restored
+     * commands first, and display values matching them (`_crmQueuedDisplayValue`), a
+     * field left without commands being dropped from the queued save. The records of
+     * the form a queued save creates are returned as well (`otherChildren`), for that
+     * save to be rewritten as the form leaves them (`_crmRewriteQueuedChildren`). So a
+     * record a delivered save created (the record's own queued save, replayed before
+     * this save's request was lost) is not created again. `{}` when the save names
+     * nothing of a queued save: the framework's commands are queued as they are.
+     *
+     * @param {Object} written the save's server values (`_getChanges`)
+     * @returns {{queuedX2Many?: Object, otherChildren?: CrmQueuedChild[]}}
+     */
+    _crmLeftOutX2Many(written) {
+        const isX2Many = (fieldName) => X2MANY_TYPES.includes(this.fields[fieldName]?.type);
+        const fieldNames = new Set([
+            ...Object.keys(written).filter(isX2Many),
+            ...this._crmTrackedX2ManyFields(),
+        ]);
+        const queuedX2Many = {};
+        const otherChildren = [];
+        let named = false;
+        for (const fieldName of fieldNames) {
+            const split = this._crmSplitCommands(fieldName, written[fieldName] || []);
+            named ||= split.named;
+            otherChildren.push(...split.children);
+            if (split.commands.length) {
+                queuedX2Many[fieldName] = {
+                    commands: split.commands,
+                    changes: this._crmQueuedDisplayValue(fieldName, split.commands, undefined),
+                };
+            }
+        }
+        return named ? { queuedX2Many, otherChildren } : {};
+    }
+
+    /**
+     * The x2many commands the record's queued save `ownEntry` keeps when the
+     * framework merges this save into it (no later call of the lead,
+     * `_crmPlanOfflineSave`), for `_crmKeepQueuedCommands`: for each x2many field that
+     * save or this save writes, the commands that save held, with their record
+     * creations rewritten as the form leaves them (`crmRewrittenCreates`), followed by
+     * this save's own commands (`_crmOwnSaveFollowUp`, merged at that save's time, as
+     * every value of this save is), and, for a field that save held, the values it
+     * replaces as that save recorded them.
+     *
+     * @param {{key: string, value: Object}} ownEntry
+     * @returns {{queuedX2Many: Object, ownChildren: CrmQueuedChild[], otherChildren: CrmQueuedChild[]}}
+     */
+    _crmMergedQueuedX2Many(ownEntry) {
+        const { followUp, children } = this._crmOwnSaveFollowUp();
+        const queuedValues = ownEntry.value.args[1];
+        const originalValues = ownEntry.value.extras?.originalValues || {};
+        const ownChildren = children.filter((child) => child.key === ownEntry.key);
+        const ownCommands = followUp?.values || {};
+        const queuedX2Many = {};
+        const fieldNames = new Set([...Object.keys(queuedValues), ...Object.keys(ownCommands)]);
+        for (const fieldName of fieldNames) {
+            if (!X2MANY_TYPES.includes(this.fields[fieldName]?.type)) {
+                continue;
+            }
+            const queued = Array.isArray(queuedValues[fieldName]) ? queuedValues[fieldName] : [];
+            const ofField = ownChildren.filter((child) => child.fieldName === fieldName);
+            const kept = crmRewrittenCreates(queued, ofField) || queued;
+            queuedX2Many[fieldName] = { commands: [...kept, ...(ownCommands[fieldName] || [])] };
+            if (fieldName in queuedValues && fieldName in originalValues) {
+                queuedX2Many[fieldName].originalValue = originalValues[fieldName];
+            }
         }
         return {
-            followUp: {
-                values: pick(written, ...overridden),
-                changes: this._formatOfflineValues(pick(this._changes, ...overridden)),
-                originalValues: this._formatOfflineValues(pick(this._values, ...overridden), {
-                    changes: false,
-                }),
-            },
+            queuedX2Many,
+            ownChildren,
+            otherChildren: children.filter((child) => child.key !== ownEntry.key),
+        };
+    }
+
+    /**
+     * The x2many commands the record's queued save `ownEntry` keeps when this save's
+     * edits are queued in a follow-up write after the later calls of the lead
+     * (`_crmPlanOfflineSave`), for `_crmKeepQueuedCommands`: for each of its x2many
+     * fields `fieldNames`, the commands it held, with their record creations
+     * rewritten as the form leaves them (`crmRewrittenCreates`), the display values
+     * matching them (those it recorded when they are unchanged and match them,
+     * `_crmQueuedDisplayValue` otherwise), and the values they replace as it recorded
+     * them.
+     *
+     * @param {{key: string, value: Object}} ownEntry
+     * @param {string[]} fieldNames
+     * @param {CrmQueuedChild[]} children `_crmOwnSaveFollowUp`
+     * @returns {{queuedX2Many: Object, ownChildren: CrmQueuedChild[], otherChildren: CrmQueuedChild[]}}
+     */
+    _crmKeptQueuedX2Many(ownEntry, fieldNames, children) {
+        const extras = ownEntry.value.extras || {};
+        const ownChildren = children.filter((child) => child.key === ownEntry.key);
+        const queuedX2Many = {};
+        for (const fieldName of fieldNames) {
+            const queued = ownEntry.value.args[1][fieldName];
+            const rewritten = crmRewrittenCreates(
+                Array.isArray(queued) ? queued : [],
+                ownChildren.filter((child) => child.fieldName === fieldName)
+            );
+            const commands = rewritten || queued;
+            const previous = extras.changes?.[fieldName];
+            const unchanged =
+                !rewritten &&
+                isFieldMapping(previous) &&
+                crmJson(previous.commands) === crmJson(queued);
+            const changes = unchanged
+                ? previous
+                : this._crmQueuedDisplayValue(fieldName, commands, previous);
+            queuedX2Many[fieldName] = { commands, changes };
+            if (extras.originalValues && fieldName in extras.originalValues) {
+                queuedX2Many[fieldName].originalValue = extras.originalValues[fieldName];
+            }
+        }
+        return {
+            queuedX2Many,
+            ownChildren,
+            otherChildren: children.filter((child) => child.key !== ownEntry.key),
         };
     }
 
@@ -1798,7 +3045,12 @@ class CrmFormModel extends formView.Model {
         const refresher = getCrmLeadReadRefresher(usePlugin(OfflinePlugin));
         this.crmLeadReadRefresher = refresher;
         refresher.attach(this);
-        onWillDestroy(() => refresher.detach(this));
+        /** Set once the form owning the model is destroyed (`_crmAwaitLeadReplay`). */
+        this.crmDestroyed = signal(false);
+        onWillDestroy(() => {
+            refresher.detach(this);
+            this.crmDestroyed.set(true);
+        });
     }
 
     /**
