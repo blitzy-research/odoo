@@ -40,6 +40,7 @@ import {
     getFocusableElements,
     hover,
     microTick,
+    on,
     press,
     queryAll,
     queryAllTexts,
@@ -4444,7 +4445,10 @@ test("[Offline] non-secure origin disables the card menu toggle and colours, whi
 /** Delete of the open card menu. */
 const CARD_MENU_DELETE = ".o-dropdown--menu .dropdown-item:contains(Delete)";
 
-/** Asserts a usable card-menu Delete: a plain item of the dropdown's navigation. */
+/**
+ * Asserts a usable card-menu Delete: a plain item of the dropdown's navigation, with
+ * the framework's `href="#"`.
+ */
 function expectCardDeleteUsable() {
     expect(CARD_MENU_DELETE).toHaveCount(1);
     expect(CARD_MENU_DELETE).not.toHaveClass("o_disabled_offline");
@@ -4452,12 +4456,14 @@ function expectCardDeleteUsable() {
     expect(CARD_MENU_DELETE).not.toHaveAttribute("aria-disabled");
     expect(CARD_MENU_DELETE).not.toHaveAttribute("tabindex");
     expect(CARD_MENU_DELETE).not.toHaveAttribute("inert");
+    expect(CARD_MENU_DELETE).toHaveAttribute("href", "#");
     expect(CARD_MENU_DELETE).toHaveClass("o-navigable");
 }
 
 /**
  * Asserts a disabled card-menu Delete: dimmed with the framework's offline state,
- * announced as disabled, out of the tab order and of the dropdown's navigation.
+ * announced as disabled, out of the tab order and of the dropdown's navigation, and
+ * without `href`, so no click follows a link.
  */
 function expectCardDeleteDisabled() {
     expect(CARD_MENU_DELETE).toHaveCount(1);
@@ -4465,6 +4471,7 @@ function expectCardDeleteDisabled() {
     expect(CARD_MENU_DELETE).toHaveAttribute("aria-disabled", "true");
     expect(CARD_MENU_DELETE).toHaveAttribute("tabindex", "-1");
     expect(CARD_MENU_DELETE).toHaveAttribute("inert");
+    expect(CARD_MENU_DELETE).not.toHaveAttribute("href");
     expect(CARD_MENU_DELETE).not.toHaveClass("o-navigable");
     expect(getFocusableElements({ tabbable: true })).not.toInclude(queryFirst(CARD_MENU_DELETE));
 }
@@ -4546,10 +4553,30 @@ test("[Offline] non-secure origin disables Delete in a lead card menu opened onl
     expect(".o-dropdown--menu").toHaveCount(1);
     const scriptClick = new MouseEvent("click", { bubbles: true, cancelable: true });
     queryFirst(CARD_MENU_DELETE).dispatchEvent(scriptClick);
-    // Its `href="#"` is not followed either.
+    // The menu's guard cancels it.
     expect(scriptClick.defaultPrevented).toBe(true);
     await settle();
     expect(".o-dropdown--menu").toHaveCount(1);
+    // A script's click that cannot be cancelled, which no `preventDefault` stops,
+    // follows no link either: the page neither navigates nor closes the menu.
+    const navigations = [];
+    for (const type of ["hashchange", "popstate"]) {
+        after(on(window, type, (ev) => navigations.push(ev.type)));
+    }
+    const pageUrl = window.location.href;
+    const clientUrl = browser.location.href;
+    const uncancelableClick = new MouseEvent("click", { bubbles: true });
+    expect(uncancelableClick.cancelable).toBe(false);
+    queryFirst(CARD_MENU_DELETE).dispatchEvent(uncancelableClick);
+    await settle();
+    expect(navigations).toEqual([]);
+    expect(window.location.href).toBe(pageUrl);
+    expect(browser.location.href).toBe(clientUrl);
+    expect(".o-dropdown--menu").toHaveCount(1);
+    expect(".modal").toHaveCount(0);
+    expect(".o_notification").toHaveCount(0);
+    expect(queued("crm.lead")).toEqual([]);
+    expect.verifySteps([]);
     await leadCard.triggerAction({ type: "delete" });
     await settle();
     expect(".modal").toHaveCount(0);
@@ -19183,10 +19210,10 @@ test("[Offline] lead form save held during its create's replay is refused, and c
     expect.verifySteps([]);
 });
 
-// Refine D1.2 (R2): a lead create sent while the connection is reported lost carries its
-// delivery key from its first request, whatever record sends it (lead form, kanban quick
-// create), and only a later save of the lead writes its values on the lead the key
-// created.
+// Refine D1.2 (R2): a lead create sent where the framework queue can hold it (a secure
+// origin), whether the connection is reported lost or up, carries its delivery key from
+// its first request, whatever record sends it (lead form, kanban quick create), and only
+// a later save of the lead writes its values on the lead the key created.
 
 test("[Offline] lead form create sent while reported offline carries its delivery key, so a lost answer still makes one lead", async () => {
     const server = mockFormLeadCreatesByKey();
@@ -19291,15 +19318,144 @@ test("[Offline] lead form create sent while reported offline carries its deliver
     expect.verifySteps([]);
 });
 
-test("[Online] lead form create sends no delivery key and no later-save flag", async () => {
+test("[Online] lead form create sends a delivery key without the later-save flag, and none on a non-secure origin", async () => {
     const server = mockFormLeadCreatesByKey();
     await openNewLeadForm();
+    const countLeads = (name) => MockServer.env["crm.lead"].search_count([["name", "=", name]]);
+
+    // On a secure origin, where the framework queue would hold the create if its answer
+    // were lost, the create carries a delivery key drawn before its request, without the
+    // later-save flag: the server creates the lead, and nothing is queued.
     await contains(".o_field_widget[name=name] input").edit("Online Form Lead");
     await contains(".o_form_button_save").click();
     await expect.waitForSteps(["online create Online Form Lead"]);
     expect(server.received).toHaveLength(1);
-    expect(server.received[0].kwargs.context).toEqual(callContext());
+    const deliveryKey = server.received[0].kwargs.context[CRM_OFFLINE_CREATE_KEY];
+    expect(deliveryKey).toMatch(/^[0-9a-f]{32}$/);
+    expect(server.received[0].kwargs.context).toEqual({
+        ...callContext(),
+        [CRM_OFFLINE_CREATE_KEY]: deliveryKey,
+    });
+    expect(countLeads("Online Form Lead")).toBe(1);
     expect(queued("crm.lead")).toEqual([]);
+
+    // On a non-secure origin, the framework queue holds no call, so no create is ever
+    // replayed: the create is sent without a key.
+    patchWithCleanup(window, { isSecureContext: false });
+    await getService("action").doAction(2);
+    await contains(".o_list_button_add").click();
+    await contains(".o_field_widget[name=name] input").edit("Non-Secure Form Lead");
+    await contains(".o_form_button_save").click();
+    await expect.waitForSteps(["online create Non-Secure Form Lead"]);
+    expect(server.received).toHaveLength(2);
+    expect(server.received[1].kwargs.context).toEqual(callContext());
+    expect(countLeads("Non-Secure Form Lead")).toBe(1);
+    expect(queued("crm.lead")).toEqual([]);
+});
+
+test("[Online] lead form create whose answer is lost is queued with the key its request sent, so its replay makes no second lead", async () => {
+    const server = mockFormLeadCreatesByKey();
+    const setOffline = await openNewLeadForm();
+    const plugin = getService(OfflinePlugin);
+    const leads = () =>
+        MockServer.env["crm.lead"].search_read([["name", "=", "Online Lost Lead"]], ["name"]);
+
+    // Online, the save sends the create with a delivery key drawn before its request,
+    // without the later-save flag. The server creates the lead, but the answer is lost:
+    // the connection is reported lost, and the create is queued with the key its
+    // request sent, still without the flag, so that sent again it writes nothing.
+    server.onlineLosses = 1;
+    await contains(".o_field_widget[name=name] input").edit("Online Lost Lead");
+    await contains(".o_form_button_save").click();
+    await expect.waitForSteps(["online create Online Lost Lead (answer lost)"]);
+    await animationFrame();
+    expect(plugin.isOffline()).toBe(true);
+    const [sent] = server.received;
+    const deliveryKey = sent.kwargs.context[CRM_OFFLINE_CREATE_KEY];
+    expect(deliveryKey).toMatch(/^[0-9a-f]{32}$/);
+    expect(sent.kwargs.context).toEqual({
+        ...callContext(),
+        [CRM_OFFLINE_CREATE_KEY]: deliveryKey,
+    });
+    const leadId = server.leadIdsByKey.get(deliveryKey);
+    expect(leads()).toEqual([{ id: leadId, name: "Online Lost Lead" }]);
+    const [create] = queuedCalls("crm.lead");
+    expect(queuedCalls("crm.lead")).toHaveLength(1);
+    expect(create.args).toEqual([[], sent.args[1]]);
+    expect(create.kwargs).toEqual({
+        context: { ...queuedContext(), [CRM_OFFLINE_CREATE_KEY]: deliveryKey },
+        specification: {},
+    });
+
+    // Back online, the replay sends that create: its key names the lead the request
+    // created, which answers it without a write. One lead, and nothing left queued; the
+    // replay gives the form's new record no id, so the form is left for the list,
+    // which shows that lead.
+    await setOffline(false);
+    await runAllTimers();
+    await expect.waitForSteps(["replayed create Online Lost Lead (delivered, nothing written)"]);
+    server.replayAnswer.resolve();
+    await runAllTimers();
+    await animationFrame();
+    expect(leads()).toEqual([{ id: leadId, name: "Online Lost Lead" }]);
+    expect(server.received).toHaveLength(2);
+    expect(server.received[1]).toEqual(JSON.parse(JSON.stringify(create)));
+    expect(queued("crm.lead")).toEqual([]);
+    expect(plugin.syncingORM()).toBe(false);
+    expect(".o_form_view").toHaveCount(0);
+    expect(".o_list_view .o_data_row:contains(Online Lost Lead)").toHaveCount(1);
+    expect.verifySteps([]);
+});
+
+test("[Online] lead form create whose answer is lost, saved again during its replay, is created once and shown by the form", async () => {
+    const server = mockFormLeadCreatesByKey();
+    const controllers = captureFormControllers();
+    const setOffline = await openNewLeadForm();
+    const plugin = getService(OfflinePlugin);
+    const leads = () =>
+        MockServer.env["crm.lead"].search_read(
+            [["name", "in", ["Online Lost Lead", "Online Lost Lead edited"]]],
+            ["name"]
+        );
+
+    // Online, the save sends the create with a delivery key; the server creates the
+    // lead, the answer is lost, and the create is queued with that key.
+    server.onlineLosses = 1;
+    await contains(".o_field_widget[name=name] input").edit("Online Lost Lead");
+    await contains(".o_form_button_save").click();
+    await expect.waitForSteps(["online create Online Lost Lead (answer lost)"]);
+    await animationFrame();
+    const deliveryKey = server.received[0].kwargs.context[CRM_OFFLINE_CREATE_KEY];
+    expect(deliveryKey).toMatch(/^[0-9a-f]{32}$/);
+    expect(queued("crm.lead")[0].value.kwargs.context[CRM_OFFLINE_CREATE_KEY]).toBe(deliveryKey);
+
+    // Back online, the replay sends that create, which the server answers with the lead
+    // the request created, without a write; its answer is still on its way. Meanwhile
+    // the user saves the still-new lead with another name: the save waits for the
+    // replay, then is sent with the same key flagged as a later save of the lead, which
+    // writes its values on that lead. One lead, holding them, is the form's record.
+    await setOffline(false);
+    await runAllTimers();
+    await expect.waitForSteps(["replayed create Online Lost Lead (delivered, nothing written)"]);
+    await contains(".o_field_widget[name=name] input").edit("Online Lost Lead edited");
+    await contains(".o_form_button_save").click();
+    await runAllTimers();
+    await animationFrame();
+    expect.verifySteps([]);
+    server.replayAnswer.resolve();
+    await runAllTimers();
+    await animationFrame();
+    await expect.waitForSteps(["online create Online Lost Lead edited (delivered)"]);
+    const leadId = server.leadIdsByKey.get(deliveryKey);
+    expect(leads()).toEqual([{ id: leadId, name: "Online Lost Lead edited" }]);
+    expect(server.received).toHaveLength(3);
+    expect(server.received[2].kwargs.context[CRM_OFFLINE_CREATE_KEY]).toBe(deliveryKey);
+    expect(server.received[2].kwargs.context[CRM_OFFLINE_CREATE_WRITE]).toBe(true);
+    expect(controllers.at(-1).model.root.resId).toBe(leadId);
+    expect(".o_form_view .o_field_widget[name=name] input").toHaveValue("Online Lost Lead edited");
+    expect(queued("crm.lead")).toEqual([]);
+    expect(plugin.syncingORM()).toBe(false);
+    expect.verifySteps([]);
 });
 
 const QUICK_CREATE_KANBAN_VIEW_ID = 611;
@@ -19472,17 +19628,106 @@ test("[Offline] lead kanban quick create restored in the lead form and saved dur
 });
 
 test.tags("desktop");
-test("[Online] lead kanban quick create sends no delivery key and no later-save flag", async () => {
+test("[Online] lead kanban quick create sends a delivery key without the later-save flag, and none on a non-secure origin", async () => {
     const server = mockLeadCreatesByKey();
     await openKanbanQuickCreate("Online Quick Lead");
+    const countLeads = (name) => MockServer.env["crm.lead"].search_count([["name", "=", name]]);
+
+    // On a secure origin, where the framework queue would hold the create if its answer
+    // were lost, the create carries a delivery key drawn before its request, without the
+    // later-save flag: the server creates the lead, and nothing is queued.
     await validateKanbanRecord();
     await expect.waitForSteps(["create Online Quick Lead"]);
     expect(server.received).toHaveLength(1);
-    expect(server.received[0].kwargs.context).not.toInclude(CRM_OFFLINE_CREATE_KEY);
+    expect(server.received[0].kwargs.context[CRM_OFFLINE_CREATE_KEY]).toMatch(/^[0-9a-f]{32}$/);
     expect(server.received[0].kwargs.context).not.toInclude(CRM_OFFLINE_CREATE_WRITE);
     expect(server.received[0].kwargs.context).not.toInclude(CRM_OFFLINE_UID_KEY);
     expect(queued("crm.lead")).toEqual([]);
-    expect(MockServer.env["crm.lead"].search_count([["name", "=", "Online Quick Lead"]])).toBe(1);
+    expect(countLeads("Online Quick Lead")).toBe(1);
+
+    // On a non-secure origin, the framework queue holds no call, so no create is ever
+    // replayed: the create the quick create, still open, sends next carries no key.
+    patchWithCleanup(window, { isSecureContext: false });
+    await editKanbanRecordQuickCreateInput("name", "Non-Secure Quick Lead");
+    await validateKanbanRecord();
+    await expect.waitForSteps(["create Non-Secure Quick Lead"]);
+    expect(server.received).toHaveLength(2);
+    expect(server.received[1].kwargs.context).not.toInclude(CRM_OFFLINE_CREATE_KEY);
+    expect(server.received[1].kwargs.context).not.toInclude(CRM_OFFLINE_CREATE_WRITE);
+    expect(server.received[1].kwargs.context).not.toInclude(CRM_OFFLINE_UID_KEY);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(countLeads("Non-Secure Quick Lead")).toBe(1);
+});
+
+test.tags("desktop");
+test("[Online] lead kanban quick create whose answer is lost is queued with the key its request sent, so its replay makes no second lead", async () => {
+    const server = mockLeadCreatesByKey();
+    const setOffline = await openKanbanQuickCreate("Online Lost Quick Lead");
+    const plugin = getService(OfflinePlugin);
+    const countLeads = () =>
+        MockServer.env["crm.lead"].search_count([["name", "=", "Online Lost Quick Lead"]]);
+
+    // Online, the quick create's save sends the create with a delivery key drawn before
+    // its request, without the later-save flag. The server creates the lead, but the
+    // answer is lost: the connection is reported lost, and the create is queued with
+    // the key its request sent, still without the flag.
+    server.losses.push(true);
+    await validateKanbanRecord();
+    await expect.waitForSteps(["create Online Lost Quick Lead (answer lost)"]);
+    await animationFrame();
+    expect(plugin.isOffline()).toBe(true);
+    expect(countLeads()).toBe(1);
+    const [sent] = server.received;
+    const deliveryKey = sent.kwargs.context[CRM_OFFLINE_CREATE_KEY];
+    expect(deliveryKey).toMatch(/^[0-9a-f]{32}$/);
+    expect(sent.kwargs.context).not.toInclude(CRM_OFFLINE_CREATE_WRITE);
+    expect(sent.kwargs.context).not.toInclude(CRM_OFFLINE_UID_KEY);
+    const [create] = queuedCalls("crm.lead");
+    expect(queuedCalls("crm.lead")).toHaveLength(1);
+    expect(create.args).toEqual([[], sent.args[1]]);
+    expect(create.kwargs).toEqual({
+        context: { ...sent.kwargs.context, [CRM_OFFLINE_UID_KEY]: serverState.userId },
+        specification: {},
+    });
+
+    // Back online, the replay sends that create: its key names the lead the request
+    // created, which answers it without a write. One lead, and nothing left queued.
+    await reconnect(setOffline);
+    await expect.waitForSteps(["create Online Lost Quick Lead (delivered)"]);
+    expect(countLeads()).toBe(1);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(server.received).toHaveLength(2);
+    expect(server.received[1]).toEqual(create);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] consecutive lead kanban quick creates each send their own delivery key and make their own lead", async () => {
+    const server = mockLeadCreatesByKey();
+    await openKanbanQuickCreate("First Quick Lead");
+    await validateKanbanRecord();
+    await expect.waitForSteps(["create First Quick Lead"]);
+
+    // The quick create stays open on a new record, whose create draws a key of its
+    // own: the server does not answer it with the first lead.
+    await editKanbanRecordQuickCreateInput("name", "Second Quick Lead");
+    await validateKanbanRecord();
+    await expect.waitForSteps(["create Second Quick Lead"]);
+    const [firstKey, secondKey] = server.received.map(
+        ({ kwargs }) => kwargs.context[CRM_OFFLINE_CREATE_KEY]
+    );
+    expect(server.received).toHaveLength(2);
+    expect(firstKey).toMatch(/^[0-9a-f]{32}$/);
+    expect(secondKey).toMatch(/^[0-9a-f]{32}$/);
+    expect(secondKey).not.toBe(firstKey);
+    expect(
+        MockServer.env["crm.lead"]
+            .search_read([["name", "in", ["First Quick Lead", "Second Quick Lead"]]], ["name"])
+            .map(({ name }) => name)
+            .sort()
+    ).toEqual(["First Quick Lead", "Second Quick Lead"]);
+    expect(queued("crm.lead")).toEqual([]);
+    expect.verifySteps([]);
 });
 
 test("[Offline] a lead create queued without a delivery key gets one, the same one when queued again under its queue key", async () => {

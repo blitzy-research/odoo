@@ -1333,16 +1333,16 @@ const crmReplayPlugins = new WeakSet();
  * Context key of the delivery key a quick create sends with its lead create, a
  * `crm.lead` record (a lead form, a kanban quick create) with every create of its
  * new lead once it entered the offline flow (`Record` patch of `crm_form.js`: a save
- * started while the connection is reported lost, the create queued when a request
- * is lost, and every later save of the still-new lead, online ones included), any
- * lead create queued without one (`OfflinePlugin.scheduleORM` patch below), and the
- * activity sheet with each activity it schedules, online and in its queued replay
- * alike. The framework replay is at-least-once (a create whose answer is lost
- * stays queued and is sent again), so the server's `crm.lead` `web_save` and
- * `mail.activity` `create` register the key with the record they create and answer
- * any later delivery of that key with this record instead of creating another one;
- * only a lead create flagged as a later save of its lead
- * (`CRM_OFFLINE_CREATE_WRITE`) writes its values there.
+ * started where the framework queue can hold the create, whatever the connection
+ * state, the create queued when a request is lost, and every later save of the
+ * still-new lead, online ones included), any lead create queued without one
+ * (`OfflinePlugin.scheduleORM` patch below), and the activity sheet with each
+ * activity it schedules, online and in its queued replay alike. The framework replay
+ * is at-least-once (a create whose answer is lost stays queued and is sent again),
+ * so the server's `crm.lead` `web_save` and `mail.activity` `create` register the
+ * key with the record they create and answer any later delivery of that key with
+ * this record instead of creating another one; only a lead create flagged as a
+ * later save of its lead (`CRM_OFFLINE_CREATE_WRITE`) writes its values there.
  */
 export const CRM_OFFLINE_CREATE_KEY = "crm_offline_create_key";
 
@@ -4400,12 +4400,14 @@ function setCrmDeleteBlockedAttribute(el, name, offlineExpr) {
  * "Configuration" link in a menu opened online: `o_disabled_offline pe-none`,
  * `aria-disabled="true"`, out of the tab order and `inert`, so no pointer, focus or
  * key reaches it (`inert` holds whatever `pointer-events` the framework's
- * `o_disabled_offline` rule computes). Its `t-key` re-creates it on each change of
- * that state, so the open dropdown refreshes its keyboard-navigable items, which
- * the `KanbanDropdownMenuWrapper` patch then rebuilds without it. A click a script
+ * `o_disabled_offline` rule computes). It also renders without the `href="#"` the
+ * framework gives it: an `<a>` without `href` is not a hyperlink, so no click,
+ * cancelable or not, navigates. Its `t-key` re-creates it on each change of that
+ * state, so the open dropdown refreshes its keyboard-navigable items, which the
+ * `KanbanDropdownMenuWrapper` patch then rebuilds without it. A click a script
  * dispatches on it is stopped by `triggerAction` and by that wrapper. Online and in
- * a secure context every expression yields the arch's own attributes, so the DOM
- * is unchanged.
+ * a secure context every expression yields the attributes the framework renders, so
+ * the DOM is unchanged.
  */
 export class CrmLeadCardCompiler extends CardCompiler {
     compileButton(el, params) {
@@ -4423,6 +4425,7 @@ export class CrmLeadCardCompiler extends CardCompiler {
         setCrmDeleteBlockedAttribute(compiled, "aria-disabled", "'true'");
         setCrmDeleteBlockedAttribute(compiled, "tabindex", "-1");
         setCrmDeleteBlockedAttribute(compiled, "inert", "''");
+        setCrmDeleteBlockedAttribute(compiled, "href", "false");
         const baseKey = compiled.hasAttribute("t-key")
             ? `(${compiled.getAttribute("t-key")})`
             : "''";
@@ -4561,8 +4564,10 @@ patch(KanbanDropdownMenuWrapper.prototype, {
      * a team menu opened online cannot be reopened offline (its toggle is
      * disabled), and closing it would make its queued colour picker unreachable;
      * neither can a lead menu opened online on a non-secure origin, whose "Edit"
-     * of a lead form cached offline stays reachable. The item's `href="#"` is not
-     * followed either, as that navigation closes the menu too.
+     * of a lead form cached offline stays reachable. The team item's `href="#"` is
+     * not followed on a cancelable click either, as that navigation closes the menu
+     * too; the lead Delete has no `href` while disabled (`CrmLeadCardCompiler`), so
+     * no click on it, cancelable or not, navigates.
      */
     onClick(ev) {
         if (isCrmOfflineDisabledMenuClick(ev?.target ?? null)) {

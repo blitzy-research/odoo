@@ -1054,17 +1054,17 @@ class CrmLead(models.Model):
 
     def web_save(self, vals, specification, next_id=None):
         """ Create a lead at most once per delivery key of the mobile quick create
-        or of a new lead saved offline.
+        or of a new lead whose create the web client may queue.
 
         The web client replays its offline queue at least once: a create whose
         answer was lost (the server committed it, then the connection dropped)
         stays queued and is sent again verbatim, possibly from another tab or
         after a reload. A lead form keeps its new lead unsaved for the client
         until the replay of its queued create, so saving it online meanwhile
-        sends a create again. The quick create, and a lead created offline
-        (in a lead form or a kanban quick create, from its first save while
-        the client reports the connection lost, or from its queued create),
-        therefore send a delivery key of 32 lowercase hexadecimal digits in the
+        sends a create again. The quick create, and a new lead of a lead form
+        or a kanban quick create (from its first save on a secure origin,
+        where the client can queue it, or from its queued create), therefore
+        send a delivery key of 32 lowercase hexadecimal digits in the
         ``CRM_OFFLINE_CREATE_KEY`` context key, the same for every delivery of
         one lead: its first request and the create queued when its answer is
         lost, that create queued again with later values, and the form's
@@ -1107,9 +1107,9 @@ class CrmLead(models.Model):
         record a key names. Deleting a lead deletes its external identifiers
         (base ``unlink``), so a delivery after the deletion creates the lead
         again.
-        Writes, and creates without a valid key (desktop, new leads saved while
-        the client reports the connection up, any other caller), keep the base
-        behaviour.
+        Writes, and creates without a valid key (a new lead saved on a
+        non-secure origin, where the client queues nothing, any other caller),
+        keep the base behaviour.
 
         Any save, keyed or not, queued offline by another user than the caller
         is refused first (``_check_offline_queue_origin``).

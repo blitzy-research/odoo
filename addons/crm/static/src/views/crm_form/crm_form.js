@@ -58,6 +58,7 @@ import {
     getCrmActivitySubfields,
     isCrmOfflineCreateKey,
     isCrmOfflineQueueBlocked,
+    isCrmOfflineQueueUsable,
     isCrmReplaySent,
     isFieldMapping,
     newCrmOfflineCreateKey,
@@ -286,17 +287,19 @@ function crmLeadCreateContext(record, context) {
  * values of a delivery on it only when flagged as a later save of the lead
  * (`CRM_OFFLINE_CREATE_WRITE`).
  *
- * A lead enters this offline flow when a save of it starts while the connection is
- * reported lost (an urgent save excepted), or when a request of its save is lost. It
- * then holds a key (`_crmCreateKey`, on the raw record), drawn before the first
- * request that may create the lead, and sends it with every delivery of its create:
- * that request, the create queued when its answer is lost, and every later save of
- * the still-new lead, queued or online, flagged as a later save once a delivery of the
- * key was sent or queued (`_crmCreateKeyDelivered`). A lead restored from its queued
- * create takes that create's key (`CrmFormRecord._crmAdoptCreateKey`). A lead that
- * never entered the flow (saved while the connection is reported up, its requests
- * answered) sends no key and no flag. Every other record, and a lead with an id, is
- * saved and queued as the framework does.
+ * A lead enters this offline flow when a save of it starts where the framework queue
+ * can hold its create (`isCrmOfflineQueueUsable`, a secure origin), whether the
+ * connection is reported lost or up (an urgent save excepted), or when a request of
+ * its save is lost. It then holds a key (`_crmCreateKey`, on the raw record), drawn
+ * before the first request that may create the lead, and sends it with every delivery
+ * of its create: that request, the create queued when its answer is lost, and every
+ * later save of the still-new lead, queued or online, flagged as a later save once a
+ * delivery of the key was sent or queued (`_crmCreateKeyDelivered`). A lead restored
+ * from its queued create takes that create's key (`CrmFormRecord._crmAdoptCreateKey`).
+ * A lead that never entered the flow (its saves urgent, or made on a non-secure
+ * origin, which queues nothing, with their requests answered) sends no key and no
+ * flag. Every other record, and a lead with an id, is saved and queued as the
+ * framework does.
  */
 patch(Record.prototype, {
     /**
@@ -331,8 +334,8 @@ patch(Record.prototype, {
      * @override
      * The queued create of a still-new lead carries its delivery key in its context
      * (`context`): the key its save sent with its request, or one drawn now when that
-     * request carried none (the save started while the connection was reported up),
-     * with the later-save flag of the save. The framework sends that create again
+     * request carried none (an urgent save, or a save on a non-secure origin), with
+     * the later-save flag of the save. The framework sends that create again
      * whenever its answer is lost, and the lead's later saves name the same lead, so
      * the server creates it once. A key drawn here is dropped again when nothing is
      * queued (a non-secure origin has no queue, and the CRM never queues some
@@ -388,11 +391,15 @@ patch(Record.prototype, {
     /**
      * Runs `save`, the parent save of this still-new lead, so that the create it sends
      * carries the lead's delivery key (`_crmCreateKey`). A save of a lead without a
-     * key that starts while the connection is reported lost (an urgent save
-     * excepted) draws one first: its first request, which may reach the server and
-     * create the lead although its answer is lost, already names the lead. A key that
-     * is then neither sent nor queued (the record was invalid) is dropped. A lead
-     * without a key otherwise is saved as the parent saves it, unchanged.
+     * key that starts where the framework queue can hold its create
+     * (`isCrmOfflineQueueUsable`), whether the connection is reported lost or up (an
+     * urgent save excepted), draws one first: its first request, which may reach the
+     * server and create the lead although its answer is lost, already names the lead,
+     * so the create queued when that answer is lost, sent with the same key, does not
+     * create it again. A key that is then neither sent nor queued (the record was
+     * invalid) is dropped. A lead without a key otherwise (an urgent save, a save on a
+     * non-secure origin, where nothing is queued) is saved as the parent saves it,
+     * unchanged.
      *
      * Whether the save is a later save of the lead (`CRM_OFFLINE_CREATE_WRITE`) is
      * decided at its start (`_crmCreateWrite`): it is once a delivery of the key was
@@ -423,10 +430,7 @@ patch(Record.prototype, {
     async _crmSaveSendingCreateKey(save) {
         const record = toRaw(this);
         const model = toRaw(this.model);
-        const drawsKey =
-            !record._crmCreateKey &&
-            !model._urgentSave &&
-            untrack(() => model.offlinePlugin.isOffline());
+        const drawsKey = !record._crmCreateKey && !model._urgentSave && isCrmOfflineQueueUsable();
         if (drawsKey) {
             record._crmCreateKey = newCrmOfflineCreateKey();
             record._crmCreateKeyDelivered = false;
