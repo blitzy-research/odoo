@@ -50,9 +50,11 @@ import {
 } from "@odoo/hoot-dom";
 import {
     contains,
+    createKanbanRecord,
     defineActions,
     defineMenus,
     defineModels,
+    editKanbanRecordQuickCreateInput,
     fields,
     getFacetTexts,
     getService,
@@ -71,6 +73,7 @@ import {
     serverState,
     toggleActionMenu,
     toggleMenuItem,
+    validateKanbanRecord,
 } from "@web/../tests/web_test_helpers";
 import { clickDate } from "@web/../tests/views/calendar/calendar_test_helpers";
 import { defineCrmModels } from "@crm/../tests/crm_test_helpers";
@@ -87,6 +90,7 @@ import { Avatar } from "@mail/views/web/fields/avatar/avatar";
 import {
     CRM_MOBILE_ACTIVITY_LIMIT,
     CRM_OFFLINE_CREATE_KEY,
+    CRM_OFFLINE_CREATE_WRITE,
     CRM_OFFLINE_DISABLED_ACTIONS,
     CRM_OFFLINE_UID_KEY,
     CRM_OFFLINE_DISABLED_MENUS,
@@ -14814,12 +14818,14 @@ function holdQueueRemovals(plugin) {
  * Emulates the server's lead create by delivery key (the `crm.lead` `web_save`
  * override): a create (`web_save` without ids) whose context carries the key
  * (`CRM_OFFLINE_CREATE_KEY`) of a lead already created answers with that lead and
- * creates nothing. The mock server also decides the fate of the next lead creates,
- * one per value pushed to the returned `losses`, in order: `null` when it answers
- * the create, `true` when it handles the create before its answer is lost, `false`
- * when the request never reaches it; a loss reaches the page as a lost connection
- * (a 502). The creates after the last value are answered. Each create is
- * stepped as `create <name>`, `create <name> (delivered)` when its key answered it,
+ * creates nothing; it writes its values on that lead only when flagged as a later
+ * save of it (`CRM_OFFLINE_CREATE_WRITE`). The mock server also decides the fate of
+ * the next lead creates, one per value pushed to the returned `losses`, in order:
+ * `null` when it answers the create, `true` when it handles the create before its
+ * answer is lost, `false` when the request never reaches it; a loss reaches the page
+ * as a lost connection (a 502). The creates after the last value are answered. Each
+ * create is stepped as `create <name>`, `create <name> (delivered)` when its key
+ * answered it, `create <name> (delivered, written)` when it also wrote its values,
  * with ` (answer lost)` appended when its answer is lost, or as `create <name>
  * (request lost)`. The payload (`callPayload`) of each create the server handles is
  * appended to `received`, and any `crm.lead` `search` is stepped as `crm.lead search`.
@@ -14844,8 +14850,14 @@ function mockLeadCreatesByKey() {
         let step = `create ${args[1].name}`;
         let result;
         if (leadIdsByKey.has(key)) {
-            step += " (delivered)";
-            result = [{ id: leadIdsByKey.get(key) }];
+            const id = leadIdsByKey.get(key);
+            if (kwargs.context[CRM_OFFLINE_CREATE_WRITE] === true) {
+                MockServer.env["crm.lead"].write([id], args[1]);
+                step += " (delivered, written)";
+            } else {
+                step += " (delivered)";
+            }
+            result = [{ id }];
         } else {
             result = await parent();
             if (typeof key === "string") {
@@ -15003,19 +15015,24 @@ test("[Offline] queued lead create whose replay answer is lost is sent again wit
 /**
  * Emulates the server's keyed lead create (the `crm.lead` `web_save` override) for the
  * lead form: a create (`web_save` without ids) whose context carries a delivery key
- * (`CRM_OFFLINE_CREATE_KEY`) creates its lead once; a later delivery of that key writes
- * its values on that lead and answers as a save of it. Each create is stepped as
+ * (`CRM_OFFLINE_CREATE_KEY`) creates its lead once; a later delivery of that key
+ * answers as a save of that lead, and writes its values on it only when flagged as a
+ * later save of it (`CRM_OFFLINE_CREATE_WRITE`). Each create is stepped as
  * `replayed create <name>` (a queued call: its context names the user who queued it,
  * `CRM_OFFLINE_UID_KEY`) or `online create <name>`, with ` (delivered)` appended when
- * its key answered it. The answer of the first replayed create waits for
- * `replayAnswer`, and is a lost connection (a 502) once `loseReplayAnswer` is set. The
- * payload (`callPayload`) of each create is appended to `received`.
+ * its key answered it and its values were written, ` (delivered, nothing written)`
+ * when its key answered it without the flag, and ` (answer lost)` when the answer of
+ * an online create is lost (a 502): `onlineLosses` counts the next online creates
+ * whose answer is lost once handled. The answer of the first replayed create waits
+ * for `replayAnswer`, and is a lost connection (a 502) once `loseReplayAnswer` is
+ * set. The payload (`callPayload`) of each create is appended to `received`.
  *
  * @returns {{
  *  leadIdsByKey: Map<string, number>,
  *  received: Object[],
  *  replayAnswer: PromiseWithResolvers<void>,
  *  loseReplayAnswer: boolean,
+ *  onlineLosses: number,
  * }}
  */
 function mockFormLeadCreatesByKey() {
@@ -15024,6 +15041,7 @@ function mockFormLeadCreatesByKey() {
         received: [],
         replayAnswer: Promise.withResolvers(),
         loseReplayAnswer: false,
+        onlineLosses: 0,
     };
     let heldReplay = false;
     onRpc("crm.lead", "web_save", async (params) => {
@@ -15035,17 +15053,28 @@ function mockFormLeadCreatesByKey() {
         const context = kwargs.context || {};
         const key = context[CRM_OFFLINE_CREATE_KEY];
         const replayed = CRM_OFFLINE_UID_KEY in context;
-        const step = `${replayed ? "replayed" : "online"} create ${args[1].name}`;
+        let step = `${replayed ? "replayed" : "online"} create ${args[1].name}`;
         const leads = MockServer.env["crm.lead"];
+        let result;
         if (state.leadIdsByKey.has(key)) {
             const id = state.leadIdsByKey.get(key);
-            leads.write([id], args[1]);
-            expect.step(`${step} (delivered)`);
-            return leads.web_read([id], kwargs.specification);
+            if (context[CRM_OFFLINE_CREATE_WRITE] === true) {
+                leads.write([id], args[1]);
+                step += " (delivered)";
+            } else {
+                step += " (delivered, nothing written)";
+            }
+            result = leads.web_read([id], kwargs.specification);
+        } else {
+            result = await parent();
+            if (typeof key === "string") {
+                state.leadIdsByKey.set(key, result[0].id);
+            }
         }
-        const result = await parent();
-        if (typeof key === "string") {
-            state.leadIdsByKey.set(key, result[0].id);
+        if (!replayed && state.onlineLosses > 0) {
+            state.onlineLosses--;
+            expect.step(`${step} (answer lost)`);
+            return new Response("", { status: 502 });
         }
         expect.step(step);
         if (replayed && !heldReplay) {
@@ -15061,13 +15090,11 @@ function mockFormLeadCreatesByKey() {
 }
 
 /**
- * Opens the new-lead form of the "Leads" action online (so it is cached), then saves a
- * lead named `name` in it offline: its create is queued, with a delivery key.
+ * Opens the new-lead form of the "Leads" action online (so it is cached).
  *
- * @param {string} name
- * @returns {Promise<{setOffline: Function, deliveryKey: string}>}
+ * @returns {Promise<Function>} the `setOffline` of `mockOffline`
  */
-async function queueFormLeadCreate(name) {
+async function openNewLeadForm() {
     defineActions([
         {
             id: 2,
@@ -15085,6 +15112,19 @@ async function queueFormLeadCreate(name) {
     await getService("action").doAction(2);
     await contains(".o_list_button_add").click();
     await flushStartupSync();
+    return setOffline;
+}
+
+/**
+ * Opens the new-lead form of the "Leads" action online (so it is cached), then saves a
+ * lead named `name` in it offline: its create is queued, with a delivery key and
+ * without the later-save flag (`CRM_OFFLINE_CREATE_WRITE`).
+ *
+ * @param {string} name
+ * @returns {Promise<{setOffline: Function, deliveryKey: string}>}
+ */
+async function queueFormLeadCreate(name) {
+    const setOffline = await openNewLeadForm();
     await setOffline(true);
     await contains(".o_field_widget[name=name] input").edit(name);
     await contains(".o_form_button_save").click();
@@ -15122,9 +15162,9 @@ test("[Offline] lead created in the form offline and saved online during its rep
     await animationFrame();
     expect.verifySteps([]);
 
-    // Once the create is replayed, the save is sent, with the create's delivery key:
-    // it writes its values on the lead the replay created. One lead, holding them, is
-    // the form's record.
+    // Once the create is replayed, the save is sent, with the create's delivery key
+    // flagged as a later save of the lead: it writes its values on the lead the replay
+    // created. One lead, holding them, is the form's record.
     server.replayAnswer.resolve();
     await runAllTimers();
     await animationFrame();
@@ -15135,8 +15175,10 @@ test("[Offline] lead created in the form offline and saved online during its rep
         env["crm.lead"].search_read([["name", "in", ["R2 Offline Lead", "R2 Online Lead"]]], ["name"])
     ).toEqual([{ id: leadId, name: "R2 Online Lead" }]);
     expect(server.received).toHaveLength(2);
+    expect(server.received[0].kwargs.context).not.toInclude(CRM_OFFLINE_CREATE_WRITE);
     expect(server.received[1].args[0]).toEqual([]);
     expect(server.received[1].kwargs.context[CRM_OFFLINE_CREATE_KEY]).toBe(deliveryKey);
+    expect(server.received[1].kwargs.context[CRM_OFFLINE_CREATE_WRITE]).toBe(true);
     expect(server.received[1].kwargs.context).not.toInclude(CRM_OFFLINE_UID_KEY);
     expect(controllers.at(-1).model.root.resId).toBe(leadId);
     expect(".o_form_view .o_field_widget[name=name] input").toHaveValue("R2 Online Lead");
@@ -15164,7 +15206,8 @@ test("[Offline] lead form save during a create replay whose answer is lost is qu
 
     // The answer is lost: the replay stops with the create still queued, so the held
     // save is not sent, which would let that older create overwrite it: it is queued
-    // into the create, with the create's delivery key.
+    // into the create, with the create's delivery key flagged as a later save of the
+    // lead (the create it replaces may have created it).
     server.replayAnswer.resolve();
     await animationFrame();
     expect.verifySteps([]);
@@ -15175,6 +15218,7 @@ test("[Offline] lead form save during a create replay whose answer is lost is qu
     expect(entry.value.args).toEqual([[], entry.value.args[1]]);
     expect(entry.value.args[1]).toMatchObject({ name: "R2 Lost Lead edited" });
     expect(entry.value.kwargs.context[CRM_OFFLINE_CREATE_KEY]).toBe(deliveryKey);
+    expect(entry.value.kwargs.context[CRM_OFFLINE_CREATE_WRITE]).toBe(true);
 
     // The next replay delivers that create again: the server writes its values on the
     // lead it created. One lead, with the values of the user's last save.
@@ -15189,6 +15233,399 @@ test("[Offline] lead form save during a create replay whose answer is lost is qu
     expect.verifySteps([]);
 });
 
+// Refine D1.2 (R2): a lead create sent while the connection is reported lost carries its
+// delivery key from its first request, whatever record sends it (lead form, kanban quick
+// create), and only a later save of the lead writes its values on the lead the key
+// created.
+
+test("[Offline] lead form create sent while reported offline carries its delivery key, so a lost answer still makes one lead", async () => {
+    const server = mockFormLeadCreatesByKey();
+    const controllers = captureFormControllers();
+    const setOffline = await openNewLeadForm();
+    const plugin = getService(OfflinePlugin);
+    const leadNames = () =>
+        MockServer.env["crm.lead"]
+            .search_read(
+                [["name", "in", ["F03 Lead", "F03 Lead edited", "F03 Lead online"]]],
+                ["name"]
+            )
+            .map(({ name }) => name);
+
+    // The connection is reported lost while the network is in fact back: the save is
+    // sent, with a delivery key drawn before its request. The server creates the lead,
+    // but the answer is lost: the create is queued with the key the request carried,
+    // without the later-save flag, so that create sent again writes nothing.
+    plugin.setOffline(true);
+    await animationFrame();
+    server.onlineLosses = 1;
+    await contains(".o_field_widget[name=name] input").edit("F03 Lead");
+    await contains(".o_form_button_save").click();
+    await expect.waitForSteps(["online create F03 Lead (answer lost)"]);
+    await animationFrame();
+    expect(plugin.isOffline()).toBe(true);
+    expect(leadNames()).toEqual(["F03 Lead"]);
+    const [sent] = server.received;
+    const deliveryKey = sent.kwargs.context[CRM_OFFLINE_CREATE_KEY];
+    expect(deliveryKey).toMatch(/^[0-9a-f]{32}$/);
+    expect(sent.kwargs.context).toEqual({
+        ...callContext(),
+        [CRM_OFFLINE_CREATE_KEY]: deliveryKey,
+    });
+    const [create] = queued("crm.lead");
+    expect(queued("crm.lead")).toHaveLength(1);
+    expect(create.value.args).toEqual([[], create.value.args[1]]);
+    expect(create.value.args[1]).toMatchObject({ name: "F03 Lead", type: "opportunity" });
+    expect(create.value.kwargs).toEqual({
+        context: { ...queuedContext(), [CRM_OFFLINE_CREATE_KEY]: deliveryKey },
+        specification: {},
+    });
+
+    // The connection is then lost for good. A later save of the still-new lead is
+    // queued into its pending create, without a request, with the same key flagged as
+    // a later save of the lead: its replay writes the values on the lead the first
+    // request created.
+    await setOffline(true);
+    await contains(".o_field_widget[name=name] input").edit("F03 Lead edited");
+    await contains(".o_form_button_save").click();
+    expect(server.received).toHaveLength(1);
+    expect(queued("crm.lead")).toHaveLength(1);
+    const [requeued] = queued("crm.lead");
+    expect(requeued.key).toBe(create.key);
+    expect(requeued.value.args[1]).toMatchObject({ name: "F03 Lead edited" });
+    expect(requeued.value.kwargs).toEqual({
+        context: {
+            ...queuedContext(),
+            [CRM_OFFLINE_CREATE_KEY]: deliveryKey,
+            [CRM_OFFLINE_CREATE_WRITE]: true,
+        },
+        specification: {},
+    });
+
+    // Back online, the replay delivers it: its values are written on that lead, and its
+    // answer is still on its way. Meanwhile the user saves the still-new lead again:
+    // once the create is replayed, that save is sent with the same key flagged as a
+    // later save. One lead, with the values of the user's last save, is the form's
+    // record.
+    await setOffline(false);
+    await runAllTimers();
+    await expect.waitForSteps(["replayed create F03 Lead edited (delivered)"]);
+    expect(leadNames()).toEqual(["F03 Lead edited"]);
+    await contains(".o_field_widget[name=name] input").edit("F03 Lead online");
+    await contains(".o_form_button_save").click();
+    await runAllTimers();
+    await animationFrame();
+    expect.verifySteps([]);
+    server.replayAnswer.resolve();
+    await runAllTimers();
+    await animationFrame();
+    await expect.waitForSteps(["online create F03 Lead online (delivered)"]);
+    const leadId = server.leadIdsByKey.get(deliveryKey);
+    expect(
+        MockServer.env["crm.lead"].search_read(
+            [["name", "in", ["F03 Lead", "F03 Lead edited", "F03 Lead online"]]],
+            ["name"]
+        )
+    ).toEqual([{ id: leadId, name: "F03 Lead online" }]);
+    expect(server.received).toHaveLength(3);
+    expect(server.received[2].kwargs.context).toEqual({
+        ...callContext(),
+        [CRM_OFFLINE_CREATE_KEY]: deliveryKey,
+        [CRM_OFFLINE_CREATE_WRITE]: true,
+    });
+    expect(controllers.at(-1).model.root.resId).toBe(leadId);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(plugin.syncingORM()).toBe(false);
+    expect.verifySteps([]);
+});
+
+test("[Online] lead form create sends no delivery key and no later-save flag", async () => {
+    const server = mockFormLeadCreatesByKey();
+    await openNewLeadForm();
+    await contains(".o_field_widget[name=name] input").edit("Online Form Lead");
+    await contains(".o_form_button_save").click();
+    await expect.waitForSteps(["online create Online Form Lead"]);
+    expect(server.received).toHaveLength(1);
+    expect(server.received[0].kwargs.context).toEqual(callContext());
+    expect(queued("crm.lead")).toEqual([]);
+});
+
+const QUICK_CREATE_KANBAN_VIEW_ID = 611;
+const QUICK_CREATE_FORM_REF = "crm.quick_create_opportunity_form";
+
+/** A lead pipeline with the kanban quick create of the real one (`quick_create_view`). */
+const QUICK_CREATE_PIPELINE_ACTION = {
+    id: 61,
+    name: "Quick Create Pipeline",
+    res_model: "crm.lead",
+    views: [
+        [QUICK_CREATE_KANBAN_VIEW_ID, "kanban"],
+        [false, "form"],
+    ],
+    context: { default_type: "opportunity" },
+};
+
+/**
+ * Opens `QUICK_CREATE_PIPELINE_ACTION` online, then its kanban quick create (a framework
+ * record of `crm.lead`, not the lead form's), filled with the lead name `name`.
+ *
+ * @param {string} name
+ * @returns {Promise<Function>} the `setOffline` of `mockOffline`
+ */
+async function openKanbanQuickCreate(name) {
+    registerInlineViewArchs("crm.lead", {
+        [`kanban,${QUICK_CREATE_KANBAN_VIEW_ID}`]: /* xml */ `
+            <kanban js_class="crm_kanban" default_group_by="stage_id" on_create="quick_create"
+                quick_create_view="${QUICK_CREATE_FORM_REF}" archivable="false">
+                <templates>
+                    <t t-name="card">
+                        <field name="name"/>
+                    </t>
+                </templates>
+            </kanban>`,
+        [`form,${QUICK_CREATE_FORM_REF}`]: /* xml */ `
+            <form>
+                <field name="name"/>
+                <field name="expected_revenue"/>
+            </form>`,
+    });
+    defineActions([QUICK_CREATE_PIPELINE_ACTION]);
+    const setOffline = mockOffline();
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(QUICK_CREATE_PIPELINE_ACTION.id);
+    await flushStartupSync();
+    await createKanbanRecord();
+    await editKanbanRecordQuickCreateInput("name", name);
+    return setOffline;
+}
+
+test.tags("desktop");
+test("[Offline] lead kanban quick create sent while reported offline and its queued create share one delivery key", async () => {
+    const server = mockLeadCreatesByKey();
+    const setOffline = await openKanbanQuickCreate("F01 Quick Lead");
+    const plugin = getService(OfflinePlugin);
+    const countLeads = () =>
+        MockServer.env["crm.lead"].search_count([["name", "=", "F01 Quick Lead"]]);
+
+    // The connection is reported lost while the network is in fact back: the quick
+    // create's save is sent with a delivery key, drawn before its request. The server
+    // creates the lead and the answer is lost: the create is queued with that key, as
+    // the very create its request sent, without the later-save flag.
+    plugin.setOffline(true);
+    await animationFrame();
+    server.losses.push(true);
+    await validateKanbanRecord();
+    await expect.waitForSteps(["create F01 Quick Lead (answer lost)"]);
+    await animationFrame();
+    expect(plugin.isOffline()).toBe(true);
+    expect(countLeads()).toBe(1);
+    const [sent] = server.received;
+    const deliveryKey = sent.kwargs.context[CRM_OFFLINE_CREATE_KEY];
+    expect(deliveryKey).toMatch(/^[0-9a-f]{32}$/);
+    expect(sent.kwargs.context).not.toInclude(CRM_OFFLINE_CREATE_WRITE);
+    expect(sent.kwargs.context).not.toInclude(CRM_OFFLINE_UID_KEY);
+    const [create] = queuedCalls("crm.lead");
+    expect(queuedCalls("crm.lead")).toHaveLength(1);
+    expect(create.args).toEqual([[], sent.args[1]]);
+    expect(create.kwargs).toEqual({
+        context: { ...sent.kwargs.context, [CRM_OFFLINE_UID_KEY]: serverState.userId },
+        specification: {},
+    });
+
+    // Back online, the replay sends that create: its key names the lead the request
+    // created, which answers it without a write, and the answer is lost again: the
+    // create stays queued, not parked. The next replay sends it again: one lead.
+    server.losses.push(true);
+    await setOffline(false);
+    await expect.waitForSteps(["create F01 Quick Lead (delivered) (answer lost)"]);
+    await animationFrame();
+    expect(countLeads()).toBe(1);
+    expect(queued("crm.lead")).toHaveLength(1);
+    expect(queued("crm.lead")[0].value.extras.error).toBe(undefined);
+    await reconnect(setOffline);
+    await expect.waitForSteps(["create F01 Quick Lead (delivered)"]);
+    expect(countLeads()).toBe(1);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(server.received).toHaveLength(3);
+    expect(server.received[1]).toEqual(create);
+    expect(server.received[2]).toEqual(create);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Offline] lead kanban quick create restored in the lead form and saved during its replay is created once", async () => {
+    const server = mockFormLeadCreatesByKey();
+    const controllers = captureFormControllers();
+    const setOffline = await openKanbanQuickCreate("F01 Restored Lead");
+    const plugin = getService(OfflinePlugin);
+
+    // Offline, the quick create's save is queued with a delivery key.
+    await setOffline(true);
+    await validateKanbanRecord();
+    expect(queued("crm.lead")).toHaveLength(1);
+    const [entry] = queued("crm.lead");
+    const deliveryKey = entry.value.kwargs.context[CRM_OFFLINE_CREATE_KEY];
+    expect(deliveryKey).toMatch(/^[0-9a-f]{32}$/);
+    expect(entry.value.kwargs.context).not.toInclude(CRM_OFFLINE_CREATE_WRITE);
+    expect(entry.value.args).toEqual([[], entry.value.args[1]]);
+    expect(entry.value.args[1]).toMatchObject({ name: "F01 Restored Lead" });
+    expect(server.received).toEqual([]);
+
+    // Back online, the replay sends it: the server creates the lead, and its answer is
+    // still on its way. Meanwhile the queued create is opened in the lead form, as the
+    // offline systray opens a queued save (`OfflineSystray.openView`): the form shows
+    // its values and takes its delivery key.
+    await setOffline(false);
+    await runAllTimers();
+    await expect.waitForSteps(["replayed create F01 Restored Lead"]);
+    await getService("action").doAction(QUICK_CREATE_PIPELINE_ACTION.id, {
+        viewType: "form",
+        props: { offlineId: entry.key },
+    });
+    await animationFrame();
+    expect(controllers.at(-1).model.root.offlineId).toBe(entry.key);
+    expect(".o_form_view .o_field_widget[name=name] input").toHaveValue("F01 Restored Lead");
+
+    // The user saves the still-new lead with another name: the save waits for the
+    // replay of its create, then is sent with the create's delivery key flagged as a
+    // later save of the lead, which writes its values on the lead the replay created.
+    await contains(".o_field_widget[name=name] input").edit("F01 Restored Lead edited");
+    await contains(".o_form_button_save").click();
+    await runAllTimers();
+    await animationFrame();
+    expect.verifySteps([]);
+    server.replayAnswer.resolve();
+    await runAllTimers();
+    await animationFrame();
+    await expect.waitForSteps(["online create F01 Restored Lead edited (delivered)"]);
+    const leadId = server.leadIdsByKey.get(deliveryKey);
+    expect(
+        MockServer.env["crm.lead"].search_read(
+            [["name", "in", ["F01 Restored Lead", "F01 Restored Lead edited"]]],
+            ["name"]
+        )
+    ).toEqual([{ id: leadId, name: "F01 Restored Lead edited" }]);
+    expect(server.received).toHaveLength(2);
+    const [, twin] = server.received;
+    expect(twin.args[0]).toEqual([]);
+    expect(twin.kwargs.context[CRM_OFFLINE_CREATE_KEY]).toBe(deliveryKey);
+    expect(twin.kwargs.context[CRM_OFFLINE_CREATE_WRITE]).toBe(true);
+    expect(twin.kwargs.context).not.toInclude(CRM_OFFLINE_UID_KEY);
+    expect(controllers.at(-1).model.root.resId).toBe(leadId);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(plugin.syncingORM()).toBe(false);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] lead kanban quick create sends no delivery key and no later-save flag", async () => {
+    const server = mockLeadCreatesByKey();
+    await openKanbanQuickCreate("Online Quick Lead");
+    await validateKanbanRecord();
+    await expect.waitForSteps(["create Online Quick Lead"]);
+    expect(server.received).toHaveLength(1);
+    expect(server.received[0].kwargs.context).not.toInclude(CRM_OFFLINE_CREATE_KEY);
+    expect(server.received[0].kwargs.context).not.toInclude(CRM_OFFLINE_CREATE_WRITE);
+    expect(server.received[0].kwargs.context).not.toInclude(CRM_OFFLINE_UID_KEY);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].search_count([["name", "=", "Online Quick Lead"]])).toBe(1);
+});
+
+test("[Offline] a lead create queued without a delivery key gets one, the same one when queued again under its queue key", async () => {
+    const server = mockLeadCreatesByKey();
+    const setOffline = mockOffline();
+    await makeTestApp();
+    await flushStartupSync();
+    const plugin = getService(OfflinePlugin);
+    const contextOf = (key) => plugin._ormToSync()[key].value.kwargs.context;
+    const timeStamp = Date.now();
+    const vals = { name: "Boundary Lead", stage_id: STAGE_QUALIFIED, expected_revenue: 30 };
+
+    // A lead create queued without a key, as a caller other than a lead record
+    // queues it: the queue gives it a delivery key, without the later-save flag,
+    // and leaves the caller's kwargs and options as they are.
+    await setOffline(true);
+    const kwargs = { context: { default_type: "opportunity" }, specification: {} };
+    const options = { extras: { displayName: "Boundary Lead", timeStamp } };
+    const id = plugin.scheduleORM("crm.lead", "web_save", [[], vals], kwargs, options);
+    expect(kwargs).toEqual({ context: { default_type: "opportunity" }, specification: {} });
+    expect(options).toEqual({ extras: { displayName: "Boundary Lead", timeStamp } });
+    const deliveryKey = contextOf(id)[CRM_OFFLINE_CREATE_KEY];
+    expect(deliveryKey).toMatch(/^[0-9a-f]{32}$/);
+    expect(contextOf(id)).toEqual({
+        default_type: "opportunity",
+        [CRM_OFFLINE_UID_KEY]: serverState.userId,
+        [CRM_OFFLINE_CREATE_KEY]: deliveryKey,
+    });
+
+    // Queued again under its queue key with later values, still without a key: it
+    // keeps that key, flagged as a later save of the lead, since the create it
+    // replaces may already have created it.
+    plugin.scheduleORM(
+        "crm.lead",
+        "web_save",
+        [[], { ...vals, name: "Boundary Lead edited" }],
+        { context: { default_type: "opportunity" }, specification: {} },
+        { id, extras: { displayName: "Boundary Lead edited", timeStamp } }
+    );
+    expect(contextOf(id)).toEqual({
+        default_type: "opportunity",
+        [CRM_OFFLINE_UID_KEY]: serverState.userId,
+        [CRM_OFFLINE_CREATE_KEY]: deliveryKey,
+        [CRM_OFFLINE_CREATE_WRITE]: true,
+    });
+
+    // Another create gets its own key, and so does one sent with an invalid key; a
+    // valid key the caller sent is kept as it is; saves with ids and calls of other
+    // models get none.
+    const extras = { timeStamp: timeStamp + 1 };
+    const schedule = (model, args, context) =>
+        plugin.scheduleORM(model, "web_save", args, { context, specification: {} }, { extras });
+    const otherId = schedule("crm.lead", [[], { ...vals, name: "Other Boundary Lead" }], {});
+    expect(contextOf(otherId)[CRM_OFFLINE_CREATE_KEY]).toMatch(/^[0-9a-f]{32}$/);
+    expect(contextOf(otherId)[CRM_OFFLINE_CREATE_KEY]).not.toBe(deliveryKey);
+    expect(contextOf(otherId)).not.toInclude(CRM_OFFLINE_CREATE_WRITE);
+    const invalidId = schedule("crm.lead", [[], { ...vals, name: "Invalid Key Lead" }], {
+        [CRM_OFFLINE_CREATE_KEY]: "ABC",
+    });
+    expect(contextOf(invalidId)[CRM_OFFLINE_CREATE_KEY]).toMatch(/^[0-9a-f]{32}$/);
+    const givenKey = "0123456789abcdef".repeat(2);
+    const keyedId = schedule("crm.lead", [[], { ...vals, name: "Keyed Lead" }], {
+        [CRM_OFFLINE_CREATE_KEY]: givenKey,
+    });
+    expect(contextOf(keyedId)).toEqual({
+        [CRM_OFFLINE_CREATE_KEY]: givenKey,
+        [CRM_OFFLINE_UID_KEY]: serverState.userId,
+    });
+    const writeId = schedule("crm.lead", [[1], { name: "Written Lead" }], {});
+    expect(contextOf(writeId)).toEqual({ [CRM_OFFLINE_UID_KEY]: serverState.userId });
+    const stageId = schedule("crm.stage", [[], { name: "Boundary Stage" }], {});
+    expect(contextOf(stageId)).toEqual({ [CRM_OFFLINE_UID_KEY]: serverState.userId });
+    for (const key of [otherId, invalidId, keyedId, writeId, stageId]) {
+        plugin.removeScheduledORM(key);
+    }
+
+    // Back online, the replay sends the create, and its answer is lost: it stays
+    // queued and is sent again, flagged, so it writes its values on the lead the
+    // first delivery created: one lead, with the values queued last.
+    server.losses.push(true);
+    await setOffline(false);
+    await expect.waitForSteps(["create Boundary Lead edited (answer lost)"]);
+    await animationFrame();
+    expect(queued("crm.lead").map(({ key }) => key)).toEqual([id]);
+    await reconnect(setOffline);
+    await expect.waitForSteps(["create Boundary Lead edited (delivered, written)"]);
+    expect(
+        MockServer.env["crm.lead"]
+            .search_read([["name", "in", ["Boundary Lead", "Boundary Lead edited"]]], ["name"])
+            .map(({ name }) => name)
+    ).toEqual(["Boundary Lead edited"]);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(server.received.map(({ kwargs }) => kwargs.context[CRM_OFFLINE_CREATE_KEY])).toEqual([
+        deliveryKey,
+        deliveryKey,
+    ]);
+    expect.verifySteps([]);
+});
 
 test("[Offline] lost lead creates: each delivery key is answered with its own lead only", async () => {
     const server = mockLeadCreatesByKey();

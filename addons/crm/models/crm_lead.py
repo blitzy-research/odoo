@@ -86,11 +86,19 @@ PLS_UPDATE_BATCH_STEP = 5000
 # `web_save` and `mail.activity` `create`), and the external identifier module
 # under which it is registered with the record it created.
 CRM_OFFLINE_CREATE_KEY = 'crm_offline_create_key'
+# Context key marking a keyed lead create as a later save of the lead its key names
+# (value `True` only), which the web client sends with a save of a new lead once a
+# delivery of its create was sent or queued: a repeated delivery writes its values
+# only with it (see `web_save`).
+CRM_OFFLINE_CREATE_WRITE = 'crm_offline_create_write'
 CRM_OFFLINE_CREATE_MODULE = '__crm_offline__'
 CRM_OFFLINE_CREATE_KEY_RE = re.compile(r'[0-9a-f]{32}')
 # Context key of the id of the user who queued a call in the web client's offline
 # queue, see `_check_offline_queue_origin`.
 CRM_OFFLINE_UID_KEY = 'crm_offline_uid'
+# Context key asking `web_search_read` to list, under the same key of its result,
+# the stage choices of its search, see `web_search_read`.
+CRM_STAGE_CHOICES_KEY = 'crm_stage_choices'
 
 
 class CrmOfflineOriginError(AccessError):
@@ -1009,32 +1017,69 @@ class CrmLead(models.Model):
             })
         return super().unlink()
 
+    @api.model
+    @api.readonly
+    def web_search_read(self, domain, specification, offset=0, limit=None, order=None, count_limit=None):
+        """ Also list the stage choices of the search when the context holds a
+        truthy ``CRM_STAGE_CHOICES_KEY``.
+
+        The mobile web client offers, on the cards of an ungrouped lead list,
+        the stages the same search shows when grouped by stage. Its online
+        reload after a discarded offline change asks for them with its records,
+        so that one request brings both. They are listed under that key, as
+        ``[{'id': stage_id, 'display_name': name}]`` in stage order: the stage
+        groups of ``domain`` with group expansion (the stages of the matching
+        leads, plus those ``_read_group_stage_ids`` adds), without the group of
+        leads without stage, read under the caller's rights exactly as the
+        client's own ``formatted_read_group`` of the stage choices reads them.
+        Without the key, the result is the base one, unchanged.
+        """
+        result = super().web_search_read(
+            domain, specification, offset=offset, limit=limit, order=order, count_limit=count_limit,
+        )
+        if self.env.context.get(CRM_STAGE_CHOICES_KEY):
+            groups = self.with_context(read_group_expand=True).formatted_read_group(domain, ['stage_id'], [])
+            result[CRM_STAGE_CHOICES_KEY] = [
+                {'id': group['stage_id'][0], 'display_name': group['stage_id'][1]}
+                for group in groups
+                if group['stage_id']
+            ]
+        return result
+
     def web_save(self, vals, specification, next_id=None):
         """ Create a lead at most once per delivery key of the mobile quick create
-        or of a lead form's new lead.
+        or of a new lead saved offline.
 
         The web client replays its offline queue at least once: a create whose
         answer was lost (the server committed it, then the connection dropped)
         stays queued and is sent again verbatim, possibly from another tab or
         after a reload. A lead form keeps its new lead unsaved for the client
         until the replay of its queued create, so saving it online meanwhile
-        sends a create again. The quick create, and a lead form once it queued
-        its new lead's create, therefore send a delivery key of 32 lowercase
-        hexadecimal digits in the ``CRM_OFFLINE_CREATE_KEY`` context key, the
-        same for every delivery of one lead: its queued create, that create
-        queued again with later values, and the form's online save of the
-        still-new lead. The first delivery creates the lead and registers the
-        key as its external identifier ``__crm_offline__.<key>``: an
-        ``ir.model.data`` row, so the lead model gains no field. A later
-        delivery of that key by the lead's creator creates nothing: its values
-        are written on that lead, as a save of the lead (a replay sending the
-        same values again writes them again), and it answers as a save of that
-        lead does; a key registered by another user is refused. Of two
-        concurrent deliveries of one key, only the first registers it: the
-        unique ``(module, name)`` index fails the later one's registration with
-        a serialization failure, so the RPC layer rolls that delivery back with
-        the lead it created and retries it, and the retry writes on the lead the
-        first one created.
+        sends a create again. The quick create, and a lead created offline
+        (in a lead form or a kanban quick create, from its first save while
+        the client reports the connection lost, or from its queued create),
+        therefore send a delivery key of 32 lowercase hexadecimal digits in the
+        ``CRM_OFFLINE_CREATE_KEY`` context key, the same for every delivery of
+        one lead: its first request and the create queued when its answer is
+        lost, that create queued again with later values, and the form's
+        online save of the still-new lead. The first delivery creates the lead
+        and registers the key as its external identifier
+        ``__crm_offline__.<key>``: an ``ir.model.data`` row, so the lead model
+        gains no field. A later delivery of that key by the lead's creator
+        creates nothing. A later save of the still-new lead, sent once a
+        delivery of its key was sent or queued, is flagged as such
+        (``CRM_OFFLINE_CREATE_WRITE`` set to ``True``): its values are written
+        on that lead, as a save of the lead, and it answers as a save of that
+        lead does. Any other delivery (the same create sent again because its
+        answer was lost) writes nothing, so a save the creator made since, by
+        the lead's id, keeps its values, and it answers with a read of that
+        lead (of ``next_id`` when given).
+        A key registered by another user is refused. Of two concurrent
+        deliveries of one key, only the first registers it: the unique
+        ``(module, name)`` index fails the later one's registration with a
+        serialization failure, so the RPC layer rolls that delivery back with
+        the lead it created and retries it, and the retry answers with the
+        lead the first one created, writing on it only when flagged.
 
         A delivery is bound to the user who queued it: the web client sends that
         user's id as ``uid`` in the context of every call, its queued ones
@@ -1050,8 +1095,9 @@ class CrmLead(models.Model):
         lookup and registration, made as superuser on that fixed module with a
         validated key. Deleting a lead deletes its external identifiers (base
         ``unlink``), so a delivery after the deletion creates the lead again.
-        Writes, and creates without a valid key (desktop, lead forms that queued
-        nothing, any other caller), keep the base behaviour.
+        Writes, and creates without a valid key (desktop, new leads saved while
+        the client reports the connection up, any other caller), keep the base
+        behaviour.
 
         Any save, keyed or not, queued offline by another user than the caller
         is refused first (``_check_offline_queue_origin``).
@@ -1065,18 +1111,26 @@ class CrmLead(models.Model):
         if isinstance(origin_uid, int) and not isinstance(origin_uid, bool) and origin_uid != self.env.uid:
             raise CrmOfflineOriginError(_("This offline change was sent in another user's session and was not applied."))
 
-        # the key only selects the delivery: the save itself sees the caller's context
-        leads = self.with_context({k: v for k, v in self.env.context.items() if k != CRM_OFFLINE_CREATE_KEY})
+        # the key and the later-save flag only select the delivery: the save itself
+        # sees the caller's context
+        later_save = self.env.context.get(CRM_OFFLINE_CREATE_WRITE) is True
+        leads = self.with_context({
+            k: v for k, v in self.env.context.items() if k not in (CRM_OFFLINE_CREATE_KEY, CRM_OFFLINE_CREATE_WRITE)
+        })
         IrModelData = self.env['ir.model.data'].sudo()
         data = IrModelData.search([('module', '=', CRM_OFFLINE_CREATE_MODULE), ('name', '=', key)], limit=1)
         if data:
             delivered = self.sudo().browse(data.res_id).exists() if data.model == self._name else None
             if delivered is None or (delivered and delivered.create_uid.id != self.env.uid):
                 raise AccessError(_("This lead was already created by another user."))
-            if delivered:
+            if delivered and later_save:
                 # a later save of the delivered lead: written under the caller's
                 # rights, then answered as base web_save answers a write
                 return super(CrmLead, leads.browse(delivered.id)).web_save(vals, specification, next_id=next_id)
+            if delivered:
+                # the create delivered again: nothing is written, so a save made
+                # since by the lead's id keeps its values
+                return leads.browse(next_id or delivered.id).with_context(bin_size=True).web_read(specification)
 
         # with a next_id, base web_save would answer that record: keep the created id
         result = super(CrmLead, leads).web_save(vals, {} if next_id else specification)

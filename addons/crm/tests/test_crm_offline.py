@@ -1042,14 +1042,18 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
             'The pipeline action lists the replayed and the online lead alike',
         )
 
-    def _quick_create(self, user, vals, key, specification=None, next_id=None):
+    def _quick_create(self, user, vals, key, specification=None, next_id=None, later_save=None):
         """ Deliver the call the mobile quick create sends, online or replayed from
         the offline queue: ``web_save([], vals)`` with the pipeline context and the
-        create's delivery key, as ``user``.
+        create's delivery key, as ``user``. ``later_save`` (when not ``None``) is
+        sent as the ``crm_offline_create_write`` flag a lead form adds to a later
+        save of its still-new lead.
 
         :return: the ``web_save`` answer
         """
         context = dict(self.pipeline_context, crm_offline_create_key=key)
+        if later_save is not None:
+            context['crm_offline_create_write'] = later_save
         return self.env['crm.lead'].with_user(user).with_context(context).browse().web_save(
             vals, specification={} if specification is None else specification, next_id=next_id,
         )
@@ -1061,9 +1065,9 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
     def test_offline_quick_create_replay_same_key_creates_once(self):
         """ A quick create whose answer was lost is sent again verbatim, with the
         same delivery key: the server answers with the lead the first delivery
-        created and creates nothing. A delivery of the key writes its values on
-        that lead, so the same values again change nothing, and other values (a
-        later save of the still-new lead) are written there. """
+        created and creates nothing. A repeated delivery writes nothing, other
+        values included; one flagged as a later save of the still-new lead
+        (``crm_offline_create_write``) writes its values there. """
         salesman = self.user_sales_salesman
         key = secrets.token_hex(16)
         vals = {
@@ -1086,11 +1090,16 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         # unchanged
         self.assertEqual(self._quick_create(salesman, dict(vals), key), first)
         self.assertEqual(lead.message_ids, messages, 'A repeated delivery of the same values changes nothing')
-        # then with other values: the first delivery's lead answers it, with them
+        # then with other values: the first delivery's lead answers it, unchanged
         self.assertEqual(self._quick_create(salesman, dict(vals, expected_revenue=999.0, name='Other'), key), first)
+        self.assertEqual((lead.name, lead.expected_revenue), ('Lost Answer Lead', 300.0))
+        # flagged as a later save of the still-new lead: written there
+        self.assertEqual(
+            self._quick_create(salesman, dict(vals, expected_revenue=999.0, name='Other'), key, later_save=True), first,
+        )
         self.assertEqual((lead.name, lead.expected_revenue), ('Other', 999.0))
         self.assertEqual(
-            self._quick_create(salesman, vals, key, specification={'name': {}, 'expected_revenue': {}}),
+            self._quick_create(salesman, vals, key, specification={'name': {}, 'expected_revenue': {}}, later_save=True),
             [{'id': lead.id, 'name': 'Lost Answer Lead', 'expected_revenue': 300.0}],
             'A delivery reading fields back reads them from the delivered lead, as it wrote them',
         )
@@ -1117,6 +1126,93 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         next_key_lead = self.env['crm.lead'].search([('name', '=', 'Next Key Lead')])
         self.assertEqual(len(next_key_lead), 1)
         self.assertEqual(self._quick_create_xmlids(next_key).res_id, next_key_lead.id)
+
+    def test_offline_quick_create_retry_keeps_later_save(self):
+        """ A keyed quick create whose answer was lost stays queued while its
+        creator saves the lead by its id (in another tab, online). Sent again
+        verbatim, the create answers with that lead and creates and writes
+        nothing: the later save keeps its values and no message is posted. A
+        flag other than ``True`` is no later-save flag. Only a delivery flagged
+        as a later save of the still-new lead (``crm_offline_create_write``)
+        writes its values, under the caller's context without the key and the
+        flag; a flagged first delivery creates the lead with the same context. """
+        salesman = self.user_sales_salesman
+        key = secrets.token_hex(16)
+        vals = {
+            'name': 'Retried Lead',
+            'contact_name': 'Retried Contact',
+            'phone': '+32 494 77 77 77',
+            'email_from': 'retried@example.com',
+            'expected_revenue': 100.0,
+            'stage_id': self.stage_gen_1.id,
+        }
+        first = self._quick_create(salesman, vals, key)
+        lead = self.env['crm.lead'].browse(first[0]['id'])
+        # the creator's later save, by the lead's id
+        lead.with_user(salesman).web_save({'name': 'Saved Since', 'expected_revenue': 200.0}, specification={})
+        self.assertEqual((lead.name, lead.expected_revenue), ('Saved Since', 200.0))
+        messages = lead.message_ids
+
+        CrmLead = self.registry['crm.lead']
+        write, create = CrmLead.write, CrmLead.create
+        calls = []
+
+        def record_write(records, vals):
+            calls.append(('write', records.ids, dict(records.env.context)))
+            return write(records, vals)
+
+        def record_create(records, vals_list):
+            calls.append(('create', dict(records.env.context)))
+            return create(records, vals_list)
+
+        with patch.object(CrmLead, 'write', record_write), patch.object(CrmLead, 'create', record_create):
+            self.assertEqual(self._quick_create(salesman, dict(vals), key), first)
+            self.assertEqual(
+                self._quick_create(salesman, dict(vals), key, specification={'name': {}, 'expected_revenue': {}}),
+                [{'id': lead.id, 'name': 'Saved Since', 'expected_revenue': 200.0}],
+                'The retry reads the lead back as the later save left it',
+            )
+            for flag in (False, 'true', 'True', '1', [True], {'write': True}):
+                with self.subTest(flag=flag):
+                    self.assertEqual(self._quick_create(salesman, dict(vals), key, later_save=flag), first)
+        self.assertEqual(calls, [], 'A repeated delivery creates and writes nothing')
+        self.assertEqual((lead.name, lead.expected_revenue), ('Saved Since', 200.0))
+        self.assertEqual(lead.message_ids, messages, 'A repeated delivery posts nothing')
+
+        # a later save of the still-new lead, flagged: written on the delivered lead
+        with patch.object(CrmLead, 'write', record_write), patch.object(CrmLead, 'create', record_create):
+            self.assertEqual(
+                self._quick_create(salesman, dict(vals, name='Later Save', expected_revenue=300.0), key, later_save=True),
+                first,
+            )
+        self.assertEqual([call[:2] for call in calls], [('write', lead.ids)])
+        written_context = calls[0][2]
+        self.assertNotIn('crm_offline_create_key', written_context)
+        self.assertNotIn('crm_offline_create_write', written_context)
+        self.assertEqual(written_context['default_type'], 'opportunity')
+        self.assertEqual((lead.name, lead.expected_revenue), ('Later Save', 300.0))
+        self.assertEqual(
+            self.env['crm.lead'].with_context(active_test=False).search(
+                [('name', 'in', ('Retried Lead', 'Saved Since', 'Later Save'))],
+            ),
+            lead,
+            'Every delivery of one key makes one lead',
+        )
+        self.assertEqual(len(self._quick_create_xmlids(key)), 1)
+        self.assertEqual(self._quick_create_xmlids(key).res_id, lead.id)
+
+        # a flagged first delivery (a create queued again with later values before
+        # any delivery reached the server) creates the lead and registers its key
+        calls.clear()
+        flagged_key = secrets.token_hex(16)
+        with patch.object(CrmLead, 'create', record_create):
+            [created] = self._quick_create(salesman, dict(vals, name='Flagged First'), flagged_key, later_save=True)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn('crm_offline_create_key', calls[0][1])
+        self.assertNotIn('crm_offline_create_write', calls[0][1])
+        flagged_lead = self.env['crm.lead'].search([('name', '=', 'Flagged First')])
+        self.assertEqual(flagged_lead.ids, [created['id']])
+        self.assertEqual(self._quick_create_xmlids(flagged_key).res_id, flagged_lead.id)
 
     def test_offline_quick_create_replay_distinct_keys(self):
         """ Two quick creates carry two delivery keys: identical values still make
@@ -1373,19 +1469,23 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
     # saved online while its own create replays, it is created once and keeps the
     # later values.
 
-    def _form_create(self, user, vals, key, specification=None, queued_by=None):
+    def _form_create(self, user, vals, key, specification=None, queued_by=None, later_save=False):
         """ Deliver the create a lead form sends for its new lead, as ``user``:
         ``web_save([], vals)`` with the form's context (the pipeline action's,
         with the user's ``uid`` the web client adds) and the lead's delivery key.
         ``queued_by`` adds the ``crm_offline_uid`` of a queued call: the form's
         queued create, as its replay sends it; without it, the call is the form's
-        online save of the still-new lead.
+        online save of the still-new lead. ``later_save`` adds the
+        ``crm_offline_create_write`` flag of a save made once a delivery of the
+        key was sent or queued.
 
         :return: the ``web_save`` answer
         """
         context = dict(self.pipeline_context, uid=user.id, crm_offline_create_key=key)
         if queued_by:
             context['crm_offline_uid'] = queued_by.id
+        if later_save:
+            context['crm_offline_create_write'] = True
         return self.env['crm.lead'].with_user(user).with_context(context).browse().web_save(
             vals, specification={} if specification is None else specification,
         )
@@ -1393,10 +1493,11 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
     def test_offline_form_create_replayed_then_saved_online_creates_once(self):
         """ A lead created in the form offline queues its create with a delivery
         key. Saved online while that create replays, the still-new lead sends a
-        create again, with the same key: the replay creates the lead, and the
-        online save, which the form sends after it, writes its values on that
-        lead under the caller's rights and reads it back, so the form shows its
-        id. One lead, with the values of the user's last save. """
+        create again, with the same key and the later-save flag: the replay
+        creates the lead, and the online save, which the form sends after it,
+        writes its values on that lead under the caller's rights and reads it
+        back, so the form shows its id. One lead, with the values of the user's
+        last save. """
         salesman = self.user_sales_salesman
         key = secrets.token_hex(16)
         queued_vals = {
@@ -1426,6 +1527,7 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         with patch.object(CrmLead, 'write', record_write):
             answer = self._form_create(
                 salesman, online_vals, key, specification={'name': {}, 'expected_revenue': {}, 'phone': {}},
+                later_save=True,
             )
         self.assertEqual(writes, [(lead.ids, salesman.id, False)], 'The online save is written as the caller, without sudo')
         self.assertEqual(answer, [{
@@ -1444,8 +1546,10 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self.assertEqual(len(self._quick_create_xmlids(key)), 1)
 
         # an online save whose connection is lost is queued into the lead's queued
-        # create, with its key: that create, sent again, still makes one lead
-        self.assertEqual(self._form_create(salesman, online_vals, key, queued_by=salesman), [{'id': lead.id}])
+        # create, with its key and flag: that create, sent again, still makes one lead
+        self.assertEqual(
+            self._form_create(salesman, online_vals, key, queued_by=salesman, later_save=True), [{'id': lead.id}],
+        )
         leads = self.env['crm.lead'].with_context(active_test=False).search(
             [('name', 'in', ('Form Offline Lead', 'Form Online Lead'))],
         )
@@ -1470,10 +1574,14 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         lead = self.env['crm.lead'].browse(delivered['id'])
         self.assertTrue(lead.with_user(manager).has_access('write'), 'The manager may write the lead itself')
         for queued_by in (manager, None):
-            with self.subTest(queued=bool(queued_by)), self.assertRaises(AccessError) as refused:
-                self._form_create(manager, dict(vals, expected_revenue=999.0), key, queued_by=queued_by)
-            # sent by its own user: not an origin refusal
-            self.assertNotIsInstance(refused.exception, CrmOfflineOriginError)
+            for later_save in (False, True):
+                with self.subTest(queued=bool(queued_by), later_save=later_save), \
+                        self.assertRaises(AccessError) as refused:
+                    self._form_create(
+                        manager, dict(vals, expected_revenue=999.0), key, queued_by=queued_by, later_save=later_save,
+                    )
+                # sent by its own user: not an origin refusal
+                self.assertNotIsInstance(refused.exception, CrmOfflineOriginError)
         leads = self.env['crm.lead'].with_context(active_test=False).search([('name', '=', 'Form Foreign Key Lead')])
         self.assertEqual(leads, lead)
         self.assertEqual(lead.expected_revenue, 40.0)
@@ -1690,6 +1798,71 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self.assertEqual(self.make_jsonrpc_request('/web/dataset/call_kw/crm.lead/web_save', call), [{'id': lead.id}])
         lead.invalidate_recordset()
         self.assertEqual((lead.name, lead.expected_revenue, lead.write_uid), ('Route Pending', 1777, salesman))
+
+    # ------------------------------------------------------------
+    # Stage choices of an ungrouped list
+    # ------------------------------------------------------------
+
+    def test_web_search_read_stage_choices(self):
+        """ The online reload of an ungrouped mobile lead list after a discarded
+        offline change sends its ``web_search_read`` with ``crm_stage_choices`` in
+        its context: the answer also lists, under that key, the stages the same
+        search shows when grouped by stage, in stage order, read under the
+        caller's rights. A stage of no sales team that no lead has is listed, a
+        deleted stage is not, nor is the stage of a lead the caller cannot read.
+        Records and length are those of the call without the key, whose answer
+        is the base one. """
+        salesman = self.user_sales_salesman
+        own_lead = self._create_salesman_opportunity('Choices Lead')
+        empty_stage = self.env['crm.stage'].create({'name': 'Empty Stage', 'sequence': 2, 'team_ids': False})
+        deleted_stage = self.env['crm.stage'].create({'name': 'Deleted Stage', 'sequence': 2, 'team_ids': False})
+        hidden_stage = self.env['crm.stage'].create({
+            'name': 'Hidden Team Stage', 'sequence': 4, 'team_ids': [self.sales_team_1.id],
+        })
+        hidden_lead = self.env['crm.lead'].create({
+            'name': 'Hidden Lead',
+            'type': 'opportunity',
+            'user_id': self.user_sales_manager.id,
+            'team_id': self.sales_team_1.id,
+            'stage_id': hidden_stage.id,
+        })
+        deleted_stage.unlink()
+        domain = self.pipeline_domain
+        specification = {'name': {}, 'stage_id': {'fields': {'display_name': {}}}}
+        leads = self.env['crm.lead'].with_user(salesman).with_context(self.pipeline_context)
+        self.assertFalse(leads.search([('id', '=', hidden_lead.id)]), 'The salesperson cannot read the hidden lead')
+
+        plain = leads.web_search_read(domain, specification, limit=80)
+        self.assertEqual(set(plain), {'length', 'records'})
+        self.assertIn(own_lead.id, [record['id'] for record in plain['records']])
+        self.assertEqual(leads.with_context(crm_stage_choices=False).web_search_read(domain, specification, limit=80), plain)
+
+        flagged = leads.with_context(crm_stage_choices=True).web_search_read(domain, specification, limit=80)
+        self.assertEqual(set(flagged), {'length', 'records', 'crm_stage_choices'})
+        self.assertEqual(flagged['records'], plain['records'])
+        self.assertEqual(flagged['length'], plain['length'])
+
+        # the stages of the salesperson's leads of the search and every stage of no
+        # sales team (the salesperson is in none), in stage order
+        expected = self.env['crm.stage'].search([
+            '|', ('id', 'in', leads.search(domain).stage_id.ids), ('team_ids', '=', False),
+        ])
+        self.assertEqual(
+            flagged['crm_stage_choices'],
+            [{'id': stage.id, 'display_name': stage.display_name} for stage in expected],
+        )
+        choice_ids = [stage['id'] for stage in flagged['crm_stage_choices']]
+        self.assertIn(self.stage_gen_1.id, choice_ids)
+        self.assertIn(empty_stage.id, choice_ids)
+        self.assertNotIn(deleted_stage.id, choice_ids)
+        self.assertNotIn(hidden_stage.id, choice_ids)
+        self.assertLess(choice_ids.index(empty_stage.id), choice_ids.index(self.stage_gen_1.id))
+
+        # a caller who reads the hidden lead (here the superuser) gets its stage
+        superuser_choices = self.env['crm.lead'].with_context(self.pipeline_context, crm_stage_choices=True).web_search_read(
+            domain, specification, limit=80,
+        )['crm_stage_choices']
+        self.assertIn(hidden_stage.id, [stage['id'] for stage in superuser_choices])
 
     # ------------------------------------------------------------
     # Wiring

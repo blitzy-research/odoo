@@ -1,5 +1,9 @@
 import { toRaw, untrack } from "@odoo/owl";
-import { crmLeadWriteTurn, crmPendingLeadWrites } from "@crm/mobile/crm_offline_hooks";
+import {
+    CRM_STAGE_CHOICES_KEY,
+    crmLeadWriteTurn,
+    crmPendingLeadWrites,
+} from "@crm/mobile/crm_offline_hooks";
 import { checkRainbowmanMessage } from "@crm/views/check_rainbowman_message";
 import { ConnectionLostError } from "@web/core/network/rpc";
 import { RelationalModel } from "@web/model/relational_model/relational_model";
@@ -121,6 +125,13 @@ export class CrmKanbanModel extends RelationalModel {
         this._crmLoadingServerValues = null;
         /** @type {Set<Promise<void>>} settlements of the writes `crmWriteInTurn` holds */
         this._crmHeldWrites = new Set();
+        /**
+         * Root configurations of loads given `crmStageChoices`, mapped to that
+         * callback, until their first ungrouped request (`_loadUngroupedList`).
+         *
+         * @type {WeakMap<Object, (stages: {id: number, display_name: string}[]|null) => void>}
+         */
+        this._crmStageChoicesCallbacks = new WeakMap();
     }
 
     /**
@@ -248,8 +259,12 @@ export class CrmKanbanModel extends RelationalModel {
      * the groups it showed before and the server no longer returns
      * (`config.currentGroups`), so a stage deleted on the server since would stay
      * listed. Those groups are dropped from the configuration of that load only: a
-     * load that fails leaves the model's configuration as it was. Without the
-     * option (every framework and desktop load), nothing changes.
+     * load that fails leaves the model's configuration as it was.
+     *
+     * A root load given `crmStageChoices`, a callback, has its ungrouped request
+     * list the stage choices of its search too (`_loadUngroupedList`).
+     *
+     * Without these options (every framework and desktop load), nothing changes.
      *
      * @param {Object} currentConfig
      * @param {Object} params
@@ -260,7 +275,55 @@ export class CrmKanbanModel extends RelationalModel {
         if (params?.crmServerGroups) {
             delete config.currentGroups;
         }
+        if (typeof params?.crmStageChoices === "function") {
+            this._crmStageChoicesCallbacks.set(config, params.crmStageChoices);
+        }
         return config;
+    }
+
+    /**
+     * @override
+     *
+     * The first ungrouped request of a root load given `crmStageChoices`
+     * (`_getNextConfig`) also asks the server, online, for the stage choices of its
+     * search (`CRM_STAGE_CHOICES_KEY` in the context of that request only, never in
+     * the model's configuration: other requests, "Load more" included, send what
+     * they send without it), so that one request brings the records and those
+     * choices. The callback receives the choices the answer lists, or `null` when
+     * the load is offline (no flag is sent, so the root is served from the cache
+     * as without the option), fails, or its answer lists none. The answer is
+     * otherwise used as the framework uses it. The RPC cache keys a request on all
+     * its parameters, so this one is cached under a key of its own, which no
+     * offline load reads: an offline reload of the search is still served the
+     * answer of its last load without the flag.
+     *
+     * @param {Object} config
+     * @param {Object} [cache]
+     */
+    async _loadUngroupedList(config, cache) {
+        const onStageChoices = this._crmStageChoicesCallbacks.get(config);
+        if (!onStageChoices) {
+            return super._loadUngroupedList(...arguments);
+        }
+        this._crmStageChoicesCallbacks.delete(config);
+        if (this.offlinePlugin.isOffline()) {
+            onStageChoices(null);
+            return super._loadUngroupedList(...arguments);
+        }
+        const flagged = {
+            ...config,
+            context: { ...config.context, [CRM_STAGE_CHOICES_KEY]: true },
+        };
+        let result;
+        try {
+            result = await super._loadUngroupedList(flagged, cache);
+        } catch (error) {
+            onStageChoices(null);
+            throw error;
+        }
+        const stages = result?.[CRM_STAGE_CHOICES_KEY];
+        onStageChoices(Array.isArray(stages) ? stages : null);
+        return result;
     }
 
     /**

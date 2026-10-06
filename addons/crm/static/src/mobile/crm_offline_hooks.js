@@ -1130,17 +1130,31 @@ const CRM_REPLAY_MODELS = freezeSet(["crm.lead", "crm.stage", "crm.team", "mail.
 const crmReplayPlugins = new WeakSet();
 
 /**
- * Context key of the delivery key a quick create sends with its lead create, a lead
- * form with every create of a new lead once it queued it (`CrmFormRecord`: the
- * queued create and the online save of the still-new lead), and the activity sheet
- * with each activity it schedules, online and in its queued replay alike. The
- * framework replay is at-least-once (a create whose answer is lost stays queued and
- * is sent again), so the server's `crm.lead` `web_save` and `mail.activity`
- * `create` register the key with the record they create and answer any later
- * delivery of that key with this record (a later lead save writing its values
- * there) instead of creating another one.
+ * Context key of the delivery key a quick create sends with its lead create, a
+ * `crm.lead` record (a lead form, a kanban quick create) with every create of its
+ * new lead once it entered the offline flow (`Record` patch of `crm_form.js`: a save
+ * started while the connection is reported lost, the create queued when a request
+ * is lost, and every later save of the still-new lead, online ones included), any
+ * lead create queued without one (`OfflinePlugin.scheduleORM` patch below), and the
+ * activity sheet with each activity it schedules, online and in its queued replay
+ * alike. The framework replay is at-least-once (a create whose answer is lost
+ * stays queued and is sent again), so the server's `crm.lead` `web_save` and
+ * `mail.activity` `create` register the key with the record they create and answer
+ * any later delivery of that key with this record instead of creating another one;
+ * only a lead create flagged as a later save of its lead
+ * (`CRM_OFFLINE_CREATE_WRITE`) writes its values there.
  */
 export const CRM_OFFLINE_CREATE_KEY = "crm_offline_create_key";
+
+/**
+ * Context key (value `true`) of a lead create that is a later save of the lead its
+ * delivery key (`CRM_OFFLINE_CREATE_KEY`) names: a save of a still-new lead once a
+ * delivery of its key was sent or queued, or a queued create queued again under its
+ * key. The server writes the values of such a delivery on the lead the key already
+ * created; a delivery without it (the same create sent again because its answer was
+ * lost) writes nothing, so a save made since by the lead's id keeps its values.
+ */
+export const CRM_OFFLINE_CREATE_WRITE = "crm_offline_create_write";
 
 /**
  * Context key of the id of the user who queued a call of `CRM_REPLAY_MODELS`. The
@@ -1149,6 +1163,14 @@ export const CRM_OFFLINE_CREATE_KEY = "crm_offline_create_key";
  * the server refuses a call carrying this key whose user is not the caller.
  */
 export const CRM_OFFLINE_UID_KEY = "crm_offline_uid";
+
+/**
+ * Context key asking a `crm.lead` `web_search_read` to list, under the same key of
+ * its answer, the stage choices of its search: the stages the same search shows
+ * when grouped by stage (`loadStageChoices`). Sent by the online discard reload of
+ * an ungrouped small-screen list only (`CrmKanbanModel`).
+ */
+export const CRM_STAGE_CHOICES_KEY = "crm_stage_choices";
 
 /**
  * A new delivery key (`CRM_OFFLINE_CREATE_KEY`): 128 random bits as 32 lowercase
@@ -1164,6 +1186,59 @@ export function newCrmOfflineCreateKey() {
         key += byte.toString(16).padStart(2, "0");
     }
     return key;
+}
+
+/** Format of a delivery key (`CRM_OFFLINE_CREATE_KEY`) the server accepts. */
+const CRM_OFFLINE_CREATE_KEY_FORMAT = /^[0-9a-f]{32}$/;
+
+/**
+ * Whether `key` is a delivery key (`CRM_OFFLINE_CREATE_KEY`) in the format the server
+ * accepts: 32 lowercase hexadecimal digits.
+ *
+ * @param {unknown} key
+ * @returns {boolean}
+ */
+export function isCrmOfflineCreateKey(key) {
+    return typeof key === "string" && CRM_OFFLINE_CREATE_KEY_FORMAT.test(key);
+}
+
+/**
+ * Whether a call is a lead create: a `crm.lead` `web_save` without ids.
+ *
+ * @param {string} model
+ * @param {string} method
+ * @param {any[]} [args]
+ * @returns {boolean}
+ */
+function isCrmLeadCreate(model, method, args) {
+    return (
+        model === "crm.lead" &&
+        method === "web_save" &&
+        Array.isArray(args?.[0]) &&
+        args[0].length === 0
+    );
+}
+
+/**
+ * The delivery key context of a lead create queued without a valid key, under the
+ * queue key `id`: the key of the create already queued under that key, with the
+ * later-save flag (`CRM_OFFLINE_CREATE_WRITE`), since the create queued again holds
+ * values that may extend a version of the lead already delivered; otherwise a new
+ * key.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {string} [id] queue key the create is queued under
+ * @returns {Object}
+ */
+function queuedLeadCreateKeyContext(plugin, id) {
+    const queued =
+        id === undefined || id === null ? undefined : untrack(() => plugin._ormToSync()[id]);
+    const value = queued?.value;
+    const key = value?.kwargs?.context?.[CRM_OFFLINE_CREATE_KEY];
+    if (isCrmLeadCreate(value?.model, value?.method, value?.args) && isCrmOfflineCreateKey(key)) {
+        return { [CRM_OFFLINE_CREATE_KEY]: key, [CRM_OFFLINE_CREATE_WRITE]: true };
+    }
+    return { [CRM_OFFLINE_CREATE_KEY]: newCrmOfflineCreateKey() };
 }
 
 /**
@@ -1194,9 +1269,11 @@ async function removeReplayedFromStore(plugin, key) {
  * Every other outcome is the framework's: the call is sent unchanged, a lost
  * connection stops the replay and keeps the entry, and any other error parks it.
  * A lead or activity create whose answer is lost is therefore sent again,
- * verbatim: it carries the delivery key of its quick create, lead form or
+ * verbatim: it carries the delivery key of its quick create, lead record or
  * scheduled activity (`CRM_OFFLINE_CREATE_KEY`), by which the server answers a
- * create it already made instead of making it twice.
+ * create it already made instead of making it twice, and writes nothing on it
+ * unless the create is flagged as a later save of the lead
+ * (`CRM_OFFLINE_CREATE_WRITE`).
  *
  * @param {OfflinePlugin} plugin
  * @param {Object} silentOrm the plugin's silent ORM, with the settings of the ORM
@@ -1310,8 +1387,16 @@ patch(OfflinePlugin.prototype, {
      * module replay the shared offline store without the filter above, in their
      * own session, and the server refuses a call whose context names another
      * user than the caller. Only queued calls carry the key: online calls are
-     * sent unchanged. Its model, method and args are queued, and replayed,
-     * unchanged; the caller's kwargs and options are not modified.
+     * sent unchanged.
+     *
+     * A lead create (`crm.lead` `web_save` without ids) queued without a valid
+     * delivery key (`CRM_OFFLINE_CREATE_KEY`) gets one, whoever queues it: the key
+     * of the lead create already queued under the same queue key (`options.id`),
+     * flagged as a later save of that lead (`CRM_OFFLINE_CREATE_WRITE`), or else a
+     * new key. Its replay, sent again whenever its answer is lost, then creates the
+     * lead once. A valid key the caller sent is kept as it is, and saves with ids
+     * and calls of other models get none. Its model, method and args are queued,
+     * and replayed, unchanged; the caller's kwargs and options are not modified.
      *
      * @param {string} model
      * @param {string} method
@@ -1332,6 +1417,18 @@ patch(OfflinePlugin.prototype, {
                 kwargs = {
                     ...kwargs,
                     context: { ...kwargs?.context, [CRM_OFFLINE_UID_KEY]: user.userId },
+                };
+            }
+            if (
+                isCrmLeadCreate(model, method, args) &&
+                !isCrmOfflineCreateKey(kwargs.context[CRM_OFFLINE_CREATE_KEY])
+            ) {
+                kwargs = {
+                    ...kwargs,
+                    context: {
+                        ...kwargs.context,
+                        ...queuedLeadCreateKeyContext(this, options?.id),
+                    },
                 };
             }
         }
@@ -1702,6 +1799,16 @@ export function useCrmOffline() {
             (await readDecryptableCache(plugin.readMany2XRecords("crm.stage", keys))) || [];
         return stages.filter((stage) => stage.display_name);
     };
+
+    /**
+     * Stores stage choices the server listed (`loadStageChoices`, or a root reload
+     * that asked for them, `CRM_STAGE_CHOICES_KEY`) in the framework
+     * relational-field cache, where `getCachedStages()` reads them offline.
+     *
+     * @param {{id: number, display_name: string}[]} stages
+     * @returns {Promise<void>}
+     */
+    const cacheStageChoices = (stages) => plugin.cacheMany2XSearch("crm.stage", stages);
 
     return {
         isOffline,
@@ -2116,7 +2223,7 @@ export function useCrmOffline() {
                     const stages = groups
                         .filter((group) => group.stage_id)
                         .map(({ stage_id: [id, display_name] }) => ({ id, display_name }));
-                    await plugin.cacheMany2XSearch("crm.stage", stages);
+                    await cacheStageChoices(stages);
                     return { stages, cached: false };
                 } catch (error) {
                     if (!(error instanceof ConnectionLostError)) {
@@ -2126,6 +2233,8 @@ export function useCrmOffline() {
             }
             return { stages: await getCachedStages(), cached: true };
         },
+
+        cacheStageChoices,
 
         /**
          * The session user first, then the cached users, each once; the session user
@@ -2244,9 +2353,11 @@ export function useCrmOffline() {
          * key included (queued with its user, `CRM_OFFLINE_UID_KEY`, as every CRM call
          * is): a save whose answer was lost may have created the lead, and
          * its replay (any tab, after a reload) is then answered with that lead rather
-         * than creating it twice. Online save errors propagate; committed writes
-         * resolve even when refresh fails, with errors reported through
-         * `crmReportError`.
+         * than creating it twice. Every delivery is that same create, so none carries
+         * the later-save flag (`CRM_OFFLINE_CREATE_WRITE`): a repeated one writes
+         * nothing, and a save of the lead made since by its id keeps its values.
+         * Online save errors propagate; committed writes resolve even when refresh
+         * fails, with errors reported through `crmReportError`.
          *
          * @param {Object} list the pipeline root list
          * @param {Object} vals server values (`stage_id` is an id)

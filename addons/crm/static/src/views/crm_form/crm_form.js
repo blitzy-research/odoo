@@ -23,6 +23,7 @@ import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { usePopover } from "@web/core/popover/popover_hook";
 import { pick } from "@web/core/utils/objects";
 import { patch } from "@web/core/utils/patch";
+import { Record } from "@web/model/relational_model/record";
 import {
     addFieldDependencies,
     getScheduleORMExtras,
@@ -42,9 +43,11 @@ import { FollowerSubtypeDialog } from "@mail/core/web/follower_subtype_dialog";
 import {
     CRM_MOBILE_ACTIVITY_LIMIT,
     CRM_OFFLINE_CREATE_KEY,
+    CRM_OFFLINE_CREATE_WRITE,
     crmReportError,
     crmReturnFocusFromSheet,
     getCrmActivitySubfields,
+    isCrmOfflineCreateKey,
     isCrmOfflineQueueBlocked,
     isFieldMapping,
     newCrmOfflineCreateKey,
@@ -58,9 +61,6 @@ const ARCHIVE_METHODS = Object.freeze(["action_archive", "action_unarchive"]);
 
 /** Field types whose record value is a list (its change is a list of commands). */
 const X2MANY_TYPES = Object.freeze(["one2many", "many2many"]);
-
-/** Format of a lead create's delivery key (`CRM_OFFLINE_CREATE_KEY`) the server accepts. */
-const CRM_CREATE_KEY_FORMAT = /^[0-9a-f]{32}$/;
 
 /** Lead contact fields the CRM save forces, each with the flag that decides it. */
 const FORCED_CONTACT_FLAGS = Object.freeze({
@@ -113,13 +113,59 @@ function crmWrittenLeadFields(value) {
     }
 }
 
-class CrmFormRecord extends formView.Model.Record {
+/**
+ * Context of a delivery of the create of the still-new lead `record`: `context` with
+ * the lead's delivery key (`_crmCreateKey`), and the later-save flag
+ * (`CRM_OFFLINE_CREATE_WRITE`) when the delivery is a later save of the lead. A keyed
+ * save decides that once, at its start (`_crmCreateWrite`), so that its request and
+ * the create queued when its answer is lost agree; a create queued by a save that
+ * sent no key is a later save once a delivery of the key was sent or queued
+ * (`_crmCreateKeyDelivered`).
+ *
+ * @param {Record} record a `crm.lead` record without id holding a delivery key
+ * @param {Object} [context]
+ * @returns {Object}
+ */
+function crmLeadCreateContext(record, context) {
+    const raw = toRaw(record);
+    const laterSave = raw._crmCreateWrite ?? Boolean(raw._crmCreateKeyDelivered);
+    return {
+        ...context,
+        [CRM_OFFLINE_CREATE_KEY]: raw._crmCreateKey,
+        ...(laterSave ? { [CRM_OFFLINE_CREATE_WRITE]: true } : {}),
+    };
+}
+
+/**
+ * Delivery keys of lead creates (`CRM_OFFLINE_CREATE_KEY`) for every record of a
+ * `crm.lead` without id: the lead form's (`CrmFormRecord`) and a framework record's,
+ * such as the desktop kanban quick create's. The framework sends a save also while
+ * the connection is reported lost, and queues it when its request is lost; a request
+ * whose answer was lost may have created the lead, and the queued create, replayed at
+ * least once, would create it again. The server's `crm.lead` `web_save` creates a
+ * lead once per key, answers every later delivery of the key with it, and writes the
+ * values of a delivery on it only when flagged as a later save of the lead
+ * (`CRM_OFFLINE_CREATE_WRITE`).
+ *
+ * A lead enters this offline flow when a save of it starts while the connection is
+ * reported lost (an urgent save excepted), or when a request of its save is lost. It
+ * then holds a key (`_crmCreateKey`, on the raw record), drawn before the first
+ * request that may create the lead, and sends it with every delivery of its create:
+ * that request, the create queued when its answer is lost, and every later save of
+ * the still-new lead, queued or online, flagged as a later save once a delivery of the
+ * key was sent or queued (`_crmCreateKeyDelivered`). A lead restored from its queued
+ * create takes that create's key (`CrmFormRecord._crmAdoptCreateKey`). A lead that
+ * never entered the flow (saved while the connection is reported up, its requests
+ * answered) sends no key and no flag. Every other record, and a lead with an id, is
+ * saved and queued as the framework does.
+ */
+patch(Record.prototype, {
     /**
      * @override
-     * While a create of the still-new lead is built synchronously (its queued create,
-     * its page-close beacon: `_crmSendsCreateKey`), the context carries the lead's
-     * delivery key (`_crmCreateKey`), so every delivery of that create names the same
-     * lead. Every other read is the parent's context, unchanged.
+     * While a create of a still-new lead holding a delivery key is built
+     * synchronously (its queued create, its page-close beacon: `_crmSendsCreateKey`),
+     * the context carries that key, and the later-save flag of the delivery
+     * (`crmLeadCreateContext`). Every other read is the parent's context, unchanged.
      */
     get context() {
         const context = super.context;
@@ -127,9 +173,172 @@ class CrmFormRecord extends formView.Model.Record {
         if (!record._crmSendsCreateKey || !record._crmCreateKey || this.resId) {
             return context;
         }
-        return { ...context, [CRM_OFFLINE_CREATE_KEY]: record._crmCreateKey };
-    }
+        return crmLeadCreateContext(record, context);
+    },
 
+    /**
+     * @override
+     * A save of a still-new lead runs through `_crmSaveSendingCreateKey`; every other
+     * save is the parent's.
+     */
+    _save() {
+        if (this.resModel !== "crm.lead" || this.resId) {
+            return super._save(...arguments);
+        }
+        return this._crmSaveSendingCreateKey(() => super._save(...arguments));
+    },
+
+    /**
+     * @override
+     * The queued create of a still-new lead carries its delivery key in its context
+     * (`context`): the key its save sent with its request, or one drawn now when that
+     * request carried none (the save started while the connection was reported up),
+     * with the later-save flag of the save. The framework sends that create again
+     * whenever its answer is lost, and the lead's later saves name the same lead, so
+     * the server creates it once. A key drawn here is dropped again when nothing is
+     * queued (a non-secure origin has no queue, and the CRM never queues some
+     * records); a key a request already sent is kept for the lead's later saves.
+     * Every other offline save is the parent's.
+     *
+     * @returns {boolean}
+     */
+    _offlineSave() {
+        if (this.resModel !== "crm.lead" || this.resId) {
+            return super._offlineSave(...arguments);
+        }
+        const record = toRaw(this);
+        const drawsKey = !record._crmCreateKey;
+        if (drawsKey) {
+            record._crmCreateKey = newCrmOfflineCreateKey();
+            record._crmCreateKeyDelivered = false;
+        }
+        const sendsKey = record._crmSendsCreateKey;
+        record._crmSendsCreateKey = true;
+        let queued;
+        try {
+            queued = super._offlineSave(...arguments);
+        } catch (error) {
+            if (drawsKey) {
+                record._crmCreateKey = undefined;
+            }
+            throw error;
+        } finally {
+            record._crmSendsCreateKey = sendsKey;
+        }
+        if (queued === false) {
+            if (drawsKey) {
+                record._crmCreateKey = undefined;
+            }
+        } else {
+            record._crmCreateKeyDelivered = true;
+        }
+        return queued;
+    },
+
+    /**
+     * Whether the own queued create (`offlineId`) of this new lead is pending (queued,
+     * not parked). It reads the plugin's queue signal.
+     *
+     * @returns {boolean}
+     */
+    _crmIsOwnCreatePending() {
+        const entry = this._offlineId && this.model.offlinePlugin._ormToSync()[this._offlineId];
+        return Boolean(entry) && !entry.value.extras?.error;
+    },
+
+    /**
+     * Runs `save`, the parent save of this still-new lead, so that the create it sends
+     * carries the lead's delivery key (`_crmCreateKey`). A save of a lead without a
+     * key that starts while the connection is reported lost (an urgent save
+     * excepted) draws one first: its first request, which may reach the server and
+     * create the lead although its answer is lost, already names the lead. A key that
+     * is then neither sent nor queued (the record was invalid) is dropped. A lead
+     * without a key otherwise is saved as the parent saves it, unchanged.
+     *
+     * Whether the save is a later save of the lead (`CRM_OFFLINE_CREATE_WRITE`) is
+     * decided at its start (`_crmCreateWrite`): it is once a delivery of the key was
+     * sent or queued (`_crmCreateKeyDelivered`), by an earlier save of the record or
+     * by the queued create it was restored from. The save's request, its page-close
+     * beacon and the create queued when its answer is lost (`_offlineSave`) carry
+     * that decision, so the create queued after a first request repeats it without
+     * the flag: sent again, it writes nothing over a save made since by the lead's id.
+     * Every later save of the still-new lead writes its values on the lead the key
+     * created.
+     *
+     * The online create is sent only once the lead's own queued create has left the
+     * queue (replayed, or discarded) or is parked. While that create is still pending
+     * (a replay that stopped on a lost answer, or one not started yet), sending the
+     * save would let that older create, replayed later, write its values over the
+     * save's: the save is queued into it instead (`_offlineSave`, through the
+     * framework's lost-connection fallback), which replays the lead's create once,
+     * with the save's values, in its place in the queue.
+     *
+     * The model's ORM is replaced until the parent save settles: its wrapper handles a
+     * `crm.lead` `web_save` without ids as above and forwards every other call to the
+     * model's ORM. The create-key context flag (`_crmSendsCreateKey`) is set only while
+     * `save` builds its synchronous calls (the page-close beacon).
+     *
+     * @param {() => Promise<boolean>} save
+     * @returns {Promise<boolean>}
+     */
+    async _crmSaveSendingCreateKey(save) {
+        const record = toRaw(this);
+        const model = toRaw(this.model);
+        const drawsKey =
+            !record._crmCreateKey &&
+            !model._urgentSave &&
+            untrack(() => model.offlinePlugin.isOffline());
+        if (drawsKey) {
+            record._crmCreateKey = newCrmOfflineCreateKey();
+            record._crmCreateKeyDelivered = false;
+        }
+        if (!record._crmCreateKey) {
+            return save();
+        }
+        const orm = model.orm;
+        const keyedOrm = Object.assign(Object.create(orm), {
+            webSave(resModel, resIds, values, kwargs) {
+                if (resModel !== "crm.lead" || resIds.length) {
+                    return orm.webSave(...arguments);
+                }
+                if (untrack(() => record._crmIsOwnCreatePending())) {
+                    throw new ConnectionLostError(`/web/dataset/call_kw/${resModel}/web_save`);
+                }
+                const context = crmLeadCreateContext(record, kwargs?.context);
+                record._crmCreateKeyDelivered = true;
+                return orm.webSave(resModel, resIds, values, { ...kwargs, context });
+            },
+        });
+        model.orm = keyedOrm;
+        const previousWrite = record._crmCreateWrite;
+        record._crmCreateWrite = Boolean(record._crmCreateKeyDelivered);
+        const sendsKey = record._crmSendsCreateKey;
+        record._crmSendsCreateKey = true;
+        let promise;
+        try {
+            promise = save();
+        } finally {
+            record._crmSendsCreateKey = sendsKey;
+        }
+        if (model._urgentSave && !record.dirty) {
+            // The page-close beacon was sent, with the key.
+            record._crmCreateKeyDelivered = true;
+        }
+        try {
+            return await promise;
+        } finally {
+            if (model.orm === keyedOrm) {
+                model.orm = orm;
+            }
+            record._crmCreateWrite = previousWrite;
+            if (drawsKey && !record._crmCreateKeyDelivered) {
+                record._crmCreateKey = undefined;
+            }
+        }
+    },
+});
+
+class CrmFormRecord extends formView.Model.Record {
      /**
      * override of record _save mechanism intended to affect the main form record
      * We check if the stage_id field was altered and if we need to display a rainbowman
@@ -191,12 +400,13 @@ class CrmFormRecord extends formView.Model.Record {
 
         // Read after the replay hold above, which the end of the replay releases, also
         // when the replay stopped on a lost connection. A save queued this way needs a
-        // lead id, and only a save of a still-new lead sends its delivery key, so at
-        // most one of the two paths changes the save.
+        // lead id, and only a save of a still-new lead sends its delivery key (the
+        // parent's `_save`, through `_crmSaveSendingCreateKey`), so at most one of the
+        // two changes the save.
         const queues = untrack(() => this._crmQueuesSave());
         const res = queues
             ? await this._crmQueueSave(() => super._save(...arguments))
-            : await this._crmSaveSendingCreateKey(() => super._save(...arguments));
+            : await super._save(...arguments);
         // The rainbowman lookup is decorative: offline it is neither issued nor queued.
         // The signal is read after the save, because a connection lost during the save
         // turns the plugin offline before the queued (offline) save resolves. A save
@@ -230,9 +440,10 @@ class CrmFormRecord extends formView.Model.Record {
      * A new lead (no id, so no queued write targets it) is held the same way while
      * its own queued create (`offlineId`) is pending: saving it before that create's
      * replay would create the lead a second time. Once the create has left the queue,
-     * the save, which carries the create's delivery key (`_crmSaveSendingCreateKey`),
-     * reaches the server after it and writes its values on the lead it created; when
-     * the replay ends with the create still queued, the save is queued into it.
+     * the save, which carries the create's delivery key flagged as a later save of
+     * the lead (`_crmSaveSendingCreateKey`), reaches the server after it and writes
+     * its values on the lead it created; when the replay ends with the create still
+     * queued, the save is queued into it.
      *
      * Nothing is held for an urgent save (the page is being left, and its beacon
      * cannot wait), when no replay runs, or for a save without an edit of the user
@@ -329,7 +540,8 @@ class CrmFormRecord extends formView.Model.Record {
      *
      * Every other save is sent as before: online (the replay hold applies), for a
      * record without an id (no queued write targets it; a still-new lead's save is
-     * queued into its own pending create by `_crmSaveSendingCreateKey` instead), for
+     * queued into its own pending create by the parent's `_crmSaveSendingCreateKey`
+     * instead), for
      * an urgent save (its beacon cannot wait, and a queue entry could not be stored
      * before the page is left), and while no pending queued call writes the lead.
      *
@@ -387,83 +599,6 @@ class CrmFormRecord extends formView.Model.Record {
             }
             if (queued) {
                 model.offlinePlugin.checkConnection();
-            }
-        }
-    }
-
-    /**
-     * Whether the own queued create (`offlineId`) of this new lead is pending (queued,
-     * not parked). It reads the plugin's queue signal.
-     *
-     * @returns {boolean}
-     */
-    _crmIsOwnCreatePending() {
-        const entry = this._offlineId && this.model.offlinePlugin._ormToSync()[this._offlineId];
-        return Boolean(entry) && !entry.value.extras?.error;
-    }
-
-    /**
-     * Runs `save`, the parent save of this record, so that the create of the
-     * still-new lead it sends carries the lead's delivery key (`_crmCreateKey`): the
-     * key of the lead's queued create, which a lead has once it queued one. Its online
-     * `web_save` then names the lead its queued create names, so the server creates
-     * that lead once and writes the values of the later delivery on it. The page-close
-     * beacon (built synchronously by `save`) and a save queued when the connection is
-     * lost (`_offlineSave`) carry it through the record's context (`context`). A lead
-     * with an id, or without a key (no queued create), is saved as the parent saves it.
-     *
-     * The online create is sent only once the lead's own queued create has left the
-     * queue (replayed, or discarded) or is parked. While that create is still pending
-     * (a replay that stopped on a lost answer, or one not started yet), sending the
-     * save would let that older create, replayed later, write its values over the
-     * save's: the save is queued into it instead (`_offlineSave`, through the
-     * framework's lost-connection fallback), which replays the lead's create once,
-     * with the save's values, in its place in the queue.
-     *
-     * The form model's ORM is replaced until the save has sent its request, by one
-     * handling a `crm.lead` `web_save` without ids as above; every other call goes to
-     * the model's ORM.
-     *
-     * @param {() => Promise<boolean>} save
-     * @returns {Promise<boolean>}
-     */
-    async _crmSaveSendingCreateKey(save) {
-        const key = !this.resId && this._crmCreateKey;
-        if (!key) {
-            return save();
-        }
-        const record = toRaw(this);
-        const model = toRaw(this.model);
-        const orm = model.orm;
-        const keyedOrm = Object.assign(Object.create(orm), {
-            webSave(resModel, resIds, values, kwargs) {
-                if (resModel !== "crm.lead" || resIds.length) {
-                    return orm.webSave(...arguments);
-                }
-                if (untrack(() => record._crmIsOwnCreatePending())) {
-                    throw new ConnectionLostError(`/web/dataset/call_kw/${resModel}/web_save`);
-                }
-                kwargs = {
-                    ...kwargs,
-                    context: { ...kwargs?.context, [CRM_OFFLINE_CREATE_KEY]: key },
-                };
-                return orm.webSave(resModel, resIds, values, kwargs);
-            },
-        });
-        model.orm = keyedOrm;
-        const sendsKey = record._crmSendsCreateKey;
-        record._crmSendsCreateKey = true;
-        let promise;
-        try {
-            promise = save();
-        } finally {
-            record._crmSendsCreateKey = sendsKey;
-        }
-        try {
-            return await promise;
-        } finally {
-            if (model.orm === keyedOrm) {
-                model.orm = orm;
             }
         }
     }
@@ -770,7 +905,8 @@ class CrmFormRecord extends formView.Model.Record {
      * the form shows as a later queued write instead (`crmShowQueuedWrites`).
      *
      * A new lead restored from its queued create takes that create's delivery key
-     * (`_crmCreateKey`), so its later saves, queued or online, name the same lead.
+     * (`_crmAdoptCreateKey`), so its later saves, queued or online, name the same
+     * lead, each as a later save of it.
      *
      * @param {string} [id] queue key of the save to restore (offline systray)
      */
@@ -814,10 +950,8 @@ class CrmFormRecord extends formView.Model.Record {
      * framework's.
      *
      * The queued create of a new lead carries the lead's delivery key in its context
-     * (`CRM_OFFLINE_CREATE_KEY`), drawn at its first queued create and kept by the
-     * record (`_crmCreateKey`): the framework sends it again whenever its answer is
-     * lost, and the form's online save of the still-new lead sends it as well
-     * (`_crmSaveSendingCreateKey`), so the server creates that lead once.
+     * (`CRM_OFFLINE_CREATE_KEY`), through the parent's `_offlineSave`, so the server
+     * creates that lead once.
      */
     _offlineSave() {
         this._crmForgetUnqueuedOfflineSave();
@@ -826,25 +960,7 @@ class CrmFormRecord extends formView.Model.Record {
         if (plan.timeStamp) {
             this._offlineTimeStamp = plan.timeStamp;
         }
-        const drawsKey = this.resModel === "crm.lead" && !this.resId && !this._crmCreateKey;
-        if (drawsKey) {
-            this._crmCreateKey = newCrmOfflineCreateKey();
-        }
-        const record = toRaw(this);
-        const sendsKey = record._crmSendsCreateKey;
-        record._crmSendsCreateKey = true;
-        let result;
-        try {
-            result = super._offlineSave(...arguments);
-        } catch (error) {
-            // Nothing was queued (a non-secure origin has no queue): no create to name.
-            if (drawsKey) {
-                this._crmCreateKey = undefined;
-            }
-            throw error;
-        } finally {
-            record._crmSendsCreateKey = sendsKey;
-        }
+        const result = super._offlineSave(...arguments);
         if (plan.followUp) {
             this._crmQueueFollowUpWrite(plan.followUp);
         }
@@ -853,8 +969,11 @@ class CrmFormRecord extends formView.Model.Record {
 
     /**
      * Takes the delivery key (`CRM_OFFLINE_CREATE_KEY`) of the queued create this new
-     * lead was just restored from (`offlineId`), when it has a valid one; a queued
-     * create without one leaves the record as it is.
+     * lead was just restored from (`offlineId`), when it has a valid one: that create
+     * is a delivery of the key (`_crmCreateKeyDelivered`), so every later save of the
+     * still-new lead, queued or online, is a later save of the lead it names
+     * (`CRM_OFFLINE_CREATE_WRITE`). A queued create without one leaves the record as
+     * it is.
      */
     _crmAdoptCreateKey() {
         if (this.resModel !== "crm.lead" || this.resId || !this._offlineId) {
@@ -862,8 +981,10 @@ class CrmFormRecord extends formView.Model.Record {
         }
         const entry = this.model.offlinePlugin._ormToSync()[this._offlineId];
         const key = entry?.value.kwargs?.context?.[CRM_OFFLINE_CREATE_KEY];
-        if (typeof key === "string" && CRM_CREATE_KEY_FORMAT.test(key)) {
-            this._crmCreateKey = key;
+        if (isCrmOfflineCreateKey(key)) {
+            const record = toRaw(this);
+            record._crmCreateKey = key;
+            record._crmCreateKeyDelivered = true;
         }
     }
 
@@ -2157,8 +2278,8 @@ export class CrmFormController extends formView.Controller {
      * discarded first: the user did not save them, and leaving would. Nothing happens
      * once the controller is destroyed or the model shows another record, nor once
      * the record has an id: the user saved it during the replay, and that save
-     * (`CrmFormRecord._crmSaveSendingCreateKey`) wrote on the created lead, which the
-     * form now shows.
+     * (`Record._crmSaveSendingCreateKey`, flagged as a later save of the lead) wrote
+     * on the created lead, which the form now shows.
      *
      * @param {Object} root the new record whose create was replayed
      * @returns {Promise<void>}

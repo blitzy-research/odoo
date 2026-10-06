@@ -112,6 +112,17 @@ function ignoreConnectionLost(error) {
 }
 
 /**
+ * Search of an ungrouped list whose stage choices are loaded once
+ * (`crmStageChoicesLoad`): its domain and context.
+ *
+ * @param {Object} list the ungrouped root list
+ * @returns {string}
+ */
+function stageChoicesKey(list) {
+    return JSON.stringify([list.domain, list.context]);
+}
+
+/**
  * Whether the framework queue holds lead or activity calls its next replay sends:
  * queued and not parked (a parked call is only sent again from the systray).
  *
@@ -644,6 +655,15 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
         });
         /** @type {HTMLElement|null} control that opened the quick create */
         this.crmQuickCreateOpener = null;
+        /**
+         * Stages the open quick create offers: the reactive array given to the sheet
+         * as its `stages`, kept equal to `stages` while it is open
+         * (`crmSyncQuickCreateStages`); `null` while no sheet is open.
+         *
+         * @type {{id: number, display_name: string}[]|null}
+         */
+        this.crmQuickCreateStages = null;
+        onPatched(() => this.crmSyncQuickCreateStages());
         /** @type {Set<string>} ids of the stage groups whose "Load more" is loading */
         this.crmLoadingMore = proxy(new Set());
         /** @type {{x: number, y: number}|null} start of the current touch gesture */
@@ -1050,16 +1070,17 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
 
     /**
      * Mobile-only load of the ungrouped list's stage choices, when mounted, once
-     * per search (domain and context), and again at an online discard reload
-     * (`crmReloadAfterDiscard`): a wide screen and a grouped list issue no
-     * request. Errors other than a lost connection are reported once.
+     * per search (domain and context, `stageChoicesKey`); an online discard reload
+     * receives them with its root instead (`crmReloadAfterDiscard`). A wide screen
+     * and a grouped list issue no request. Errors other than a lost connection are
+     * reported once.
      */
     crmMaybeLoadStageChoices() {
         const { list } = this.props;
         if (!this.crmMounted || !this.isMobile || list.isGrouped) {
             return;
         }
-        const key = JSON.stringify([list.domain, list.context]);
+        const key = stageChoicesKey(list);
         if (this.crmStageChoicesLoad.request?.key === key) {
             return;
         }
@@ -1104,6 +1125,35 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     }
 
     /**
+     * Stage choices the online discard reload of the ungrouped list received with
+     * its records (`crmReloadAfterDiscard`), for the search of `request`: the
+     * server listed them, so they replace the current ones and are stored in the
+     * relational-field cache, as a load of the choices does (`crmLoadStageChoices`).
+     * Without them (`null`: the reload was sent offline or failed, or the answer
+     * lists none), they are loaded as for a new search (`crmMaybeLoadStageChoices`),
+     * offline from the cache with no request. A request other than the last one
+     * started changes nothing.
+     *
+     * @param {{key: string}} request
+     * @param {{id: number, display_name: string}[]|null} stages
+     */
+    crmTakeStageChoices(request, stages) {
+        const load = this.crmStageChoicesLoad;
+        if (request !== load.request || status(this) === "destroyed") {
+            return;
+        }
+        if (!stages) {
+            load.request = null;
+            this.crmMaybeLoadStageChoices();
+            return;
+        }
+        load.online = true;
+        load.offline = false;
+        this.crmStageChoices.set(stages);
+        crmOwnEffectPromise(this.crmOffline.cacheStageChoices(stages));
+    }
+
+    /**
      * Reloads the root through the existing model on a small screen (served from
      * the cache offline).
      *
@@ -1125,7 +1175,9 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      *   emptied, on a reload of the same search (`crmServerGroups`, see
      *   `CrmKanbanModel._getNextConfig`), and the stage shown stays shown
      *   (`crmKeepShownStage`);
-     * - an ungrouped list reads its stage choices again, alongside its root.
+     * - an ungrouped list's root request also lists its stage choices
+     *   (`crmStageChoices`, see `CrmKanbanModel._loadUngroupedList`), so the reload
+     *   issues that one request (`crmTakeStageChoices`).
      * A list grouped by another field reloads as the framework reloads it. Offline,
      * the root is served from the cache as the framework serves it, its stages
      * included.
@@ -1142,9 +1194,13 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
             return this.crmReloadIfMobile();
         }
         if (!list.isGrouped) {
-            this.crmStageChoicesLoad.request = null;
-            this.crmMaybeLoadStageChoices();
-            return this.crmReloadIfMobile();
+            // The choices of this search come with the reload: none is read apart
+            // (`crmMaybeLoadStageChoices`) meanwhile.
+            const request = { key: stageChoicesKey(list) };
+            this.crmStageChoicesLoad.request = request;
+            return list.model
+                .load({ crmStageChoices: (stages) => this.crmTakeStageChoices(request, stages) })
+                .catch(ignoreConnectionLost);
         }
         const group = this.activeGroup;
         const shown = group
@@ -2392,13 +2448,16 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                 stageGroup.aggregates = {};
             }
         }
+        const stages = proxy(this.stages);
         this.quickCreate.open(target || this.rootRef(), {
-            stages: this.stages,
+            stages,
             defaultStageId: group.value,
             onSave: (values) => this.onQuickCreateSave(values),
         });
-        // Once opened: opening closes a sheet still open, which forgets its opener.
+        // Once opened: opening closes a sheet still open, which forgets its opener
+        // and its stages.
         this.crmQuickCreateOpener = target || null;
+        this.crmQuickCreateStages = stages;
     }
 
     /**
@@ -2408,7 +2467,39 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
     crmOnQuickCreateClosed() {
         const opener = this.crmQuickCreateOpener;
         this.crmQuickCreateOpener = null;
+        this.crmQuickCreateStages = null;
         crmReturnFocusFromSheet([opener, ...this.crmHeaderFocusTargets()]);
+    }
+
+    /**
+     * After each patch of the pipeline, gives the open quick create the current
+     * `stages`: a reload listing other stages (a stage deleted on the server, at a
+     * discard reload, `crmReloadAfterDiscard`, or a search leaving stages out)
+     * changes the choices of the open sheet, which then selects another stage when
+     * its own is no longer offered, its draft kept (`CrmMobileQuickCreate`). The
+     * sheet's array is changed in place, and only when a stage was added, removed,
+     * moved or renamed: a patch leaving the stages as they were changes nothing and
+     * renders nothing more.
+     */
+    crmSyncQuickCreateStages() {
+        untrack(() => {
+            const offered = this.crmQuickCreateStages;
+            if (!offered) {
+                return;
+            }
+            const stages = this.stages;
+            const current = toRaw(offered);
+            const unchanged =
+                stages.length === current.length &&
+                stages.every(
+                    (stage, index) =>
+                        stage.id === current[index].id &&
+                        stage.display_name === current[index].display_name
+                );
+            if (!unchanged) {
+                offered.splice(0, current.length, ...stages);
+            }
+        });
     }
 
     /**
@@ -2431,8 +2522,10 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * Creates the lead: online it is saved and the pipeline reloads; offline it is
      * queued with its display values (the provisional card). An online server error
      * rejects, so the sheet keeps the entered values. Then shows the chosen stage.
-     * The sheet keeps the stages it opened with, so a stage no longer among the
-     * current ones (`false` only while none is) is refused before any request.
+     * The sheet's stages follow the current ones after each patch of the pipeline
+     * (`crmSyncQuickCreateStages`), so a stage no longer among them (`false` only
+     * while none is), chosen before the patch showing a reload that left it out,
+     * is refused before any request.
      *
      * @param {Object} values the six quick-create values (`stage_id` is an id)
      * @returns {Promise<false|undefined>} `false` when the stage is refused

@@ -1,4 +1,13 @@
-import { Component, onMounted, onPatched, proxy, signal, status } from "@odoo/owl";
+import {
+    Component,
+    onMounted,
+    onPatched,
+    proxy,
+    signal,
+    status,
+    untrack,
+    useEffect,
+} from "@odoo/owl";
 import { currencies } from "@web/core/currency";
 import { _t } from "@web/core/l10n/translation";
 import { user } from "@web/core/user";
@@ -31,7 +40,8 @@ function trimmed(value) {
  * is needed. Save requires a nonempty name, an expected revenue within
  * ±`revenueLimit` and an offered stage, closes on resolution and preserves the
  * draft on rejection; `onSave` resolving `false` refuses the stage. Opened only
- * by the small-screen pipeline.
+ * by the small-screen pipeline, which keeps `stages` (a reactive array) current
+ * while the sheet is open.
  */
 export class CrmMobileQuickCreate extends Component {
     static template = "crm.CrmMobileQuickCreate";
@@ -81,11 +91,28 @@ export class CrmMobileQuickCreate extends Component {
             phone: "",
             email_from: "",
             expected_revenue: "",
-            stage_id: this.props.defaultStageId || this.props.stages[0]?.id || false,
+            stage_id: this.openingStageId(),
             invalidName: false,
             invalidRevenue: false,
             invalidStage: false,
             isSaving: false,
+        });
+        // The opener may change the offered `stages` while the sheet is open (a stage
+        // deleted on the server and no longer listed after a reload): a selected stage
+        // no longer offered gives way to the stage the sheet opens with, its refusal
+        // cleared and the draft kept, so that the stage select and the saved value
+        // agree. Only a change of the offered stages is followed, not the selection:
+        // a chosen value that is not an offered stage (a tampered page) is refused by
+        // Save, not replaced, while the offered stages stay as they are.
+        useEffect(() => {
+            const offeredIds = this.props.stages.map(({ id }) => id);
+            untrack(() => {
+                const stageId = this.state.stage_id;
+                if (stageId === false ? offeredIds.length : !offeredIds.includes(stageId)) {
+                    this.state.stage_id = this.openingStageId();
+                    this.state.invalidStage = false;
+                }
+            });
         });
         // Set once the sheet has asked to close (`closeSheet`).
         this.closed = false;
@@ -119,6 +146,21 @@ export class CrmMobileQuickCreate extends Component {
                 this.revealElement(this.focusedRow());
             }
         });
+    }
+
+    /**
+     * Stage the sheet selects when it opens, and when its selected stage is no
+     * longer offered: `defaultStageId` when offered, else the first offered stage,
+     * else `false` (no stage is offered).
+     *
+     * @returns {number|false}
+     */
+    openingStageId() {
+        const { stages, defaultStageId } = this.props;
+        if (defaultStageId && stages.some(({ id }) => id === defaultStageId)) {
+            return defaultStageId;
+        }
+        return stages[0]?.id || false;
     }
 
     /**

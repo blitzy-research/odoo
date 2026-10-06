@@ -24,7 +24,14 @@ import {
     waitFor,
     waitUntil,
 } from "@odoo/hoot-dom";
-import { onMounted, onPatched, onWillDestroy, onWillPatch, toRaw } from "@odoo/owl";
+import {
+    onMounted,
+    onPatched,
+    onWillDestroy,
+    onWillPatch,
+    onWillUpdateProps,
+    toRaw,
+} from "@odoo/owl";
 import { mailModels } from "@mail/../tests/mail_test_helpers";
 import {
     contains,
@@ -55,7 +62,9 @@ import {
 } from "@crm/mobile/crm_mobile_pipeline/crm_mobile_pipeline";
 import {
     CRM_OFFLINE_CREATE_KEY,
+    CRM_OFFLINE_CREATE_WRITE,
     CRM_OFFLINE_UID_KEY,
+    CRM_STAGE_CHOICES_KEY,
     isQuickCreateDeepLink,
     quickCreateDeepLink,
 } from "@crm/mobile/crm_offline_hooks";
@@ -4707,6 +4716,89 @@ test("mobile pipeline lists no stage deleted on the server after a discard reloa
 });
 
 test.tags("mobile");
+test("mobile quick create left open across a discard reload offers no stage deleted on the server and keeps its draft", async () => {
+    const propositionId = await addEmptyStage();
+    const negotiationId = MockServer.env["crm.stage"].create({ name: "Negotiation", sequence: 5 });
+    expandStageGroups();
+    // The server refuses the replayed move of "Desk Upgrade" only.
+    onRpc("crm.lead", "web_save", ({ args }) => {
+        if (args[0][0] === 3) {
+            throw makeServerError({ message: "Stage is locked" });
+        }
+    });
+    const saves = receivedCalls("crm.lead", "web_save");
+    const setOffline = mockOffline();
+    await mountWithCleanup(WebClient);
+    await openAction(ACTION_ID);
+    const field = (name) => `form.o_crm_mobile_quick_create [name=${name}]`;
+    const stageNames = () => queryAllTexts(`${QUICK_CREATE_STAGE} option`);
+
+    // Offline, a card moves "Desk Upgrade", whose replay the server refuses: parked.
+    await setOffline(true);
+    await contains(`${card("Desk Upgrade")} .o_crm_mobile_lead_stage`).select(String(QUALIFIED));
+    await reconnect(setOffline);
+    const [parked] = queued("crm.lead");
+    expect(queued("crm.lead")).toHaveLength(1);
+    expect(parked.extras.error).toInclude("Stage is locked");
+
+    // Online, the sheet is opened on "Proposition", filled, and "Negotiation" chosen.
+    await showStageNamed("Proposition");
+    await contains(".o_crm_mobile_pipeline_new").click();
+    await contains(field("name")).edit("Open Lead", { confirm: false });
+    await contains(field("contact_name")).edit("Ann Lee", { confirm: false });
+    await contains(field("phone")).edit("+1 555 0100", { confirm: false });
+    await contains(field("email_from")).edit("ann@example.com", { confirm: false });
+    await contains(field("expected_revenue")).edit("45", { confirm: false });
+    await contains(QUICK_CREATE_STAGE).select(String(negotiationId));
+    expect(stageNames()).toEqual(["New", "Qualified", "Won", "Proposition", "Negotiation"]);
+
+    // Both stages are deleted on the server, then the parked move is discarded online
+    // while the sheet stays open, as the offline systray's confirmed discard does.
+    MockServer.env["crm.stage"].unlink([propositionId, negotiationId]);
+    getService(OfflinePlugin).removeScheduledORM(parked.key);
+    await animationFrame();
+    await animationFrame();
+    expect(queued("crm.lead")).toEqual([]);
+
+    // The reload refreshes the open sheet: it offers the stages the server lists and,
+    // its chosen and opening stages gone, selects the first one, every one selectable,
+    // with the draft kept and no refusal shown.
+    expect(".o_bottom_sheet form.o_crm_mobile_quick_create").toHaveCount(1);
+    expect(stageNames()).toEqual(["New", "Qualified", "Won"]);
+    expect(`${QUICK_CREATE_STAGE} option:disabled`).toHaveCount(0);
+    expect(QUICK_CREATE_STAGE).toBeEnabled();
+    expect(QUICK_CREATE_STAGE).toHaveValue(String(NEW));
+    expect(QUICK_CREATE_STAGE).not.toHaveClass("is-invalid");
+    expect(field("name")).toHaveValue("Open Lead");
+    expect(field("contact_name")).toHaveValue("Ann Lee");
+    expect(field("phone")).toHaveValue("+1 555 0100");
+    expect(field("email_from")).toHaveValue("ann@example.com");
+    expect(field("expected_revenue")).toHaveValue(45);
+
+    // Save creates the lead online, once, in the stage the sheet shows selected.
+    await contains(".o_crm_mobile_quick_create_save").click();
+    await animationFrame();
+    expect(".o_bottom_sheet").toHaveCount(0);
+    expect(saves.filter(({ args }) => !args[0].length).map(({ args }) => args)).toEqual([
+        [
+            [],
+            {
+                name: "Open Lead",
+                contact_name: "Ann Lee",
+                phone: "+1 555 0100",
+                email_from: "ann@example.com",
+                expected_revenue: 45,
+                stage_id: NEW,
+            },
+        ],
+    ]);
+    expect(
+        MockServer.env["crm.lead"].search_read([["name", "=", "Open Lead"]], ["stage_id"])
+    ).toEqual([{ id: 8, stage_id: [NEW, "New"] }]);
+    expect(queued("crm.lead")).toEqual([]);
+});
+
+test.tags("mobile");
 test("[Offline] mobile pipeline keeps the cached stages at a discard reload", async () => {
     expect.errors(1);
     const propositionId = await addEmptyStage();
@@ -4739,6 +4831,14 @@ test("[Offline] mobile pipeline keeps the cached stages at a discard reload", as
 
 test.tags("mobile");
 test("mobile pipeline offers no stage deleted on the server on an ungrouped list after a discard reload", async () => {
+    expect.errors(1);
+    let controller = null;
+    patchWithCleanup(CrmMobilePipelineController.prototype, {
+        setup() {
+            super.setup(...arguments);
+            controller = this;
+        },
+    });
     const propositionId = await addPropositionStage();
     const stageGroups = expandStageChoices();
     onRpc("crm.lead", "web_save", ({ args }) => {
@@ -4746,12 +4846,26 @@ test("mobile pipeline offers no stage deleted on the server on an ungrouped list
             throw makeServerError({ message: "Invalid lead" });
         }
     });
+    // The stage-choice flag of each `crm.lead` `web_search_read` sent to the
+    // network, online or offline (a request served from the RPC cache is sent too).
+    const sentFlags = [];
+    const { _rpc } = rpc;
+    patchWithCleanup(rpc, {
+        _rpc(url, params, settings) {
+            if (!settings?.cache && url.endsWith("/crm.lead/web_search_read")) {
+                sentFlags.push(params.kwargs.context?.[CRM_STAGE_CHOICES_KEY]);
+            }
+            return _rpc.call(this, url, params, settings);
+        },
+    });
     const setOffline = mockOffline();
+    const calls = trackCalls();
     const options = (name) => queryAllTexts(`${card(name)} .o_crm_mobile_lead_stage option`);
     await mountWithCleanup(WebClient);
     await openAction(UNGROUPED_LEADS_ACTION_ID);
     await animationFrame();
     expect(stageGroups).toHaveLength(1);
+    expect(sentFlags).toEqual([undefined]);
     expect(options("Lamps")).toEqual(STAGES_IN_ORDER);
 
     // Offline, a card moves "Lamps", whose replay the server refuses: it is parked.
@@ -4762,17 +4876,49 @@ test("mobile pipeline offers no stage deleted on the server on an ungrouped list
     expect(`${card("Lamps")} .o_crm_mobile_pending_sync`).toHaveText("Sync failed");
 
     // "Proposition" is deleted on the server, then the move is discarded online: the
-    // stage choices are read again with the root, without the deleted stage.
+    // root reload, the one request it issues, lists the stage choices with the
+    // records, without the deleted stage.
     MockServer.env["crm.stage"].unlink([propositionId]);
+    calls.length = 0;
+    sentFlags.length = 0;
     await discardFirstQueuedCall();
     await animationFrame();
     expect(queued("crm.lead")).toEqual([]);
-    expect(stageGroups).toHaveLength(2);
-    expect(stageGroups[1].context.read_group_expand).toBe(true);
+    expect(calls).toEqual(["crm.lead/web_search_read"]);
+    expect(sentFlags).toEqual([true]);
+    expect(stageGroups).toHaveLength(1);
     expect(options("Lamps")).toEqual(["New", "Qualified", "Won"]);
     expect(options("Office Design")).toEqual(["New", "Qualified", "Won"]);
     expect(`${card("Lamps")} .o_crm_mobile_lead_stage`).toHaveValue(String(QUALIFIED));
     expect(`${card("Lamps")} .o_crm_mobile_pending_sync`).toHaveCount(0);
+
+    // A later reload of the search sends its request without the flag, and reads
+    // no stage choice.
+    calls.length = 0;
+    sentFlags.length = 0;
+    await controller.model.load();
+    await animationFrame();
+    expect(calls).toEqual(["crm.lead/web_search_read"]);
+    expect(sentFlags).toEqual([undefined]);
+    expect(options("Lamps")).toEqual(["New", "Qualified", "Won"]);
+
+    // Offline, a discarded move reloads the root from the cache without the flag, and
+    // reads no stage choice: the cards keep the stages the server listed.
+    await setOffline(true);
+    await contains(`${card("Lamps")} .o_crm_mobile_lead_stage`).select(String(NEW));
+    expect(queued("crm.lead")).toHaveLength(1);
+    calls.length = 0;
+    sentFlags.length = 0;
+    await discardFirstQueuedCall();
+    await animationFrame();
+    expect(queued("crm.lead")).toEqual([]);
+    expect(calls).toEqual(["crm.lead/web_search_read"]);
+    expect(sentFlags).toEqual([undefined]);
+    expect(stageGroups).toHaveLength(1);
+    expect(options("Lamps")).toEqual(["New", "Qualified", "Won"]);
+    expect(`${card("Lamps")} .o_crm_mobile_lead_stage`).toHaveValue(String(QUALIFIED));
+    // The framework's own cached root load offline: the reload after the discard.
+    expect.verifyErrors(["/web/dataset/call_kw/crm.lead/web_search_read"]);
 });
 
 // -----------------------------------------------------------------------------
@@ -5589,23 +5735,38 @@ test("New Lead deep link: only crm_quick_create=1 opens the quick create, once",
  * context answers one group per `crm.stage`, in stage order (`sequence`, then
  * `id`), as `_read_group_stage_ids` does for stages of no sales team. Records the
  * kwargs of every `crm.lead` `formatted_read_group` it answers or passes on.
+ * Emulates the server's `crm.lead` `web_search_read` too: with
+ * `CRM_STAGE_CHOICES_KEY` in its context, its answer lists those stages under that
+ * key, as `{id, display_name}`.
  *
  * @returns {Object[]} the recorded kwargs, in arrival order
  */
 function expandStageChoices() {
     const requests = [];
+    const stagesInOrder = (env) =>
+        env["crm.stage"]
+            .search_read([], ["display_name", "sequence"])
+            .sort((a, b) => a.sequence - b.sequence || a.id - b.id);
     onRpc("crm.lead", "formatted_read_group", function expandStages({ kwargs }) {
         requests.push(JSON.parse(JSON.stringify(kwargs)));
         if (!kwargs.context?.read_group_expand || kwargs.groupby[0] !== "stage_id") {
             return;
         }
-        return this.env["crm.stage"]
-            .search_read([], ["display_name", "sequence"])
-            .sort((a, b) => a.sequence - b.sequence || a.id - b.id)
-            .map((stage) => ({
-                stage_id: [stage.id, stage.display_name],
-                __extra_domain: [["stage_id", "=", stage.id]],
-            }));
+        return stagesInOrder(this.env).map((stage) => ({
+            stage_id: [stage.id, stage.display_name],
+            __extra_domain: [["stage_id", "=", stage.id]],
+        }));
+    });
+    onRpc("crm.lead", "web_search_read", async function listStageChoices({ kwargs, parent }) {
+        if (!kwargs.context?.[CRM_STAGE_CHOICES_KEY]) {
+            return;
+        }
+        const result = await parent();
+        result[CRM_STAGE_CHOICES_KEY] = stagesInOrder(this.env).map(({ id, display_name }) => ({
+            id,
+            display_name,
+        }));
+        return result;
     });
     return requests;
 }
@@ -8371,11 +8532,13 @@ test("mobile quick create keeps the values on a server error and queues on a dro
  * Emulates the server's lead create by delivery key (the `crm.lead` `web_save`
  * override): a create (`web_save` without ids) whose context carries the key
  * (`CRM_OFFLINE_CREATE_KEY`) of a lead already created answers with that lead and
- * creates nothing. The mock server also loses the answer of the next lead creates,
- * one per value pushed to the returned `losses`: the server handles the create, then
- * its answer reaches the page as a lost connection (a 502). Each create is stepped
- * as `create <name>`, or `create <name> (delivered)` when its key answered it, with
- * ` (answer lost)` appended when its answer is lost; its payload (`ormCall`) is
+ * creates nothing; it writes its values on that lead only when flagged as a later
+ * save of it (`CRM_OFFLINE_CREATE_WRITE`). The mock server also loses the answer of
+ * the next lead creates, one per value pushed to the returned `losses`: the server
+ * handles the create, then its answer reaches the page as a lost connection (a 502).
+ * Each create is stepped as `create <name>`, `create <name> (delivered)` when its key
+ * answered it, or `create <name> (delivered, written)` when it also wrote its values,
+ * with ` (answer lost)` appended when its answer is lost; its payload (`ormCall`) is
  * appended to `received`.
  *
  * @returns {{losses: true[], received: Object[]}}
@@ -8393,8 +8556,14 @@ function mockLeadCreatesByKey() {
         let step = `create ${args[1].name}`;
         let result;
         if (leadIdsByKey.has(key)) {
-            step += " (delivered)";
-            result = [{ id: leadIdsByKey.get(key) }];
+            const id = leadIdsByKey.get(key);
+            if (kwargs.context[CRM_OFFLINE_CREATE_WRITE] === true) {
+                MockServer.env["crm.lead"].write([id], args[1]);
+                step += " (delivered, written)";
+            } else {
+                step += " (delivered)";
+            }
+            result = [{ id }];
         } else {
             result = await parent();
             if (typeof key === "string") {
@@ -8646,12 +8815,21 @@ test("mobile quick create refuses a stage value that is not an offered stage", a
 });
 
 test.tags("mobile");
-test("mobile quick create refuses a stage removed from the pipeline while the sheet is open", async () => {
+test("mobile quick create follows a stage removed from the pipeline while the sheet is open, refused until the pipeline shows the removal", async () => {
     let controller = null;
     patchWithCleanup(CrmMobilePipelineController.prototype, {
         setup() {
             super.setup(...arguments);
             controller = this;
+        },
+    });
+    // While held, the cards wait at their props update: the pipeline is given the
+    // reloaded root, but its patch showing that root waits for them.
+    let cardsHeld = null;
+    patchWithCleanup(CrmMobileLeadCard.prototype, {
+        setup() {
+            super.setup(...arguments);
+            onWillUpdateProps(() => cardsHeld?.promise);
         },
     });
     const saves = trackQuickCreateSaves();
@@ -8668,7 +8846,9 @@ test("mobile quick create refuses a stage removed from the pipeline while the sh
     await contains(QUICK_CREATE_STAGE).select(String(WON));
 
     // The pipeline reloads with a search that leaves "Won" out (a same-search
-    // reload keeps its emptied groups): the open sheet still lists it.
+    // reload keeps its emptied groups). Until its patch shows that root, the open
+    // sheet still lists "Won".
+    cardsHeld = Promise.withResolvers();
     await controller.model.load({ domain: [["stage_id", "!=", WON]] });
     await animationFrame();
     expect(controller.model.root.groups.map(({ value }) => value)).toEqual([NEW, QUALIFIED]);
@@ -8686,6 +8866,23 @@ test("mobile quick create refuses a stage removed from the pipeline while the sh
     await contains(".o_crm_mobile_quick_create_save").click();
     expectStageRefused("Late Lead", 30);
     expect(queued("crm.lead")).toEqual([]);
+
+    // Once the pipeline shows the reloaded root, the sheet lists its stages: "Won"
+    // is gone, and the stage the sheet opened with is selected, its refusal cleared
+    // and the values kept.
+    cardsHeld.resolve();
+    cardsHeld = null;
+    // The pipeline's patch, then the sheet's render of the stages it was given.
+    await animationFrame();
+    await animationFrame();
+    expect(queryAllTexts(`${QUICK_CREATE_STAGE} option`)).toEqual(["New", "Qualified"]);
+    expect(QUICK_CREATE_STAGE).toHaveValue(String(NEW));
+    expect(QUICK_CREATE_STAGE).not.toHaveClass("is-invalid");
+    expect(QUICK_CREATE_STAGE).not.toHaveAttribute("aria-invalid");
+    expect(".o_crm_mobile_quick_create .invalid-feedback").toHaveCount(0);
+    expect("form.o_crm_mobile_quick_create input[name=name]").toHaveValue("Late Lead");
+    expect("form.o_crm_mobile_quick_create input[name=expected_revenue]").toHaveValue(30);
+    expect(saves).toEqual([WON, WON]);
 
     // Back online, a current stage creates the lead there, once.
     await setOffline(false);
