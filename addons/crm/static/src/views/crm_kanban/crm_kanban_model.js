@@ -3,11 +3,14 @@ import {
     CRM_STAGE_CHOICES_KEY,
     crmContextWithOrigin,
     crmLeadWriteTurn,
+    crmOwnEffectPromise,
     crmPendingLeadWrites,
     crmReplayQueued,
+    crmReportError,
     crmTurnWriteTimeStamp,
 } from "@crm/mobile/crm_offline_hooks";
 import { checkRainbowmanMessage } from "@crm/views/check_rainbowman_message";
+import { serializeDate, serializeDateTime } from "@web/core/l10n/dates";
 import { ConnectionLostError } from "@web/core/network/rpc";
 import { RelationalModel } from "@web/model/relational_model/relational_model";
 
@@ -66,17 +69,94 @@ function isCurrentRoot(datapoint) {
 }
 
 /**
+ * The values of `fieldNames` that a lead record shows when a save of them is held for
+ * its turn in the replay (`CrmKanbanModel.crmHoldWrite`), in the format the server
+ * reads them in, the one `Record._applyValues` takes: so that a datapoint of the lead
+ * built meanwhile from server data, which the save has not reached yet, shows them
+ * too (`CrmKanbanModel._crmShowHeldSaves`). A many2one value is copied, a date or
+ * datetime serialized. A field whose value a datapoint cannot take so (one2many,
+ * many2many, properties, reference), which no card saves, is left out.
+ *
+ * @param {Object} record
+ * @param {string[]} fieldNames
+ * @returns {Object}
+ */
+function heldSaveValues(record, fieldNames) {
+    const { data, fields } = toRaw(record);
+    const values = {};
+    for (const fieldName of fieldNames) {
+        const field = fields[fieldName];
+        if (!field || !(fieldName in data)) {
+            continue;
+        }
+        const value = data[fieldName];
+        switch (field.type) {
+            case "one2many":
+            case "many2many":
+            case "properties":
+            case "reference":
+            case "many2one_reference":
+                break;
+            case "date":
+                values[fieldName] = value ? serializeDate(value) : false;
+                break;
+            case "datetime":
+                values[fieldName] = value ? serializeDateTime(value) : false;
+                break;
+            case "many2one":
+                values[fieldName] = value ? { ...value } : false;
+                break;
+            default:
+                values[fieldName] = value;
+        }
+    }
+    return values;
+}
+
+/**
+ * Whether `group` holds the records whose value of its group-by field is `value`, in
+ * a record's format: the many2one id, the date or datetime in the group's range (no
+ * value in the group without one), any other value equal to the group's. `undefined`
+ * when the grouping cannot tell (a many2many or tags field, whose record is in a group
+ * per value, or no group-by field).
+ *
+ * @param {Object} group
+ * @param {any} value
+ * @returns {boolean|undefined}
+ */
+function groupHoldsValue(group, value) {
+    switch (group.groupByField?.type) {
+        case undefined:
+        case "many2many":
+        case "tags":
+            return undefined;
+        case "many2one":
+            return group.value === (value ? value.id : false);
+        case "date":
+        case "datetime":
+            if (!group.range) {
+                return !value && !group.value;
+            }
+            return Boolean(value) && value >= group.range.from && value < group.range.to;
+        default:
+            return group.value === value;
+    }
+}
+
+/**
  * Offline, the framework queues the `unlink` of deleted records and returns
  * without removing them from the list. This removes the given records that the
  * list still holds, so that their cards disappear at once and the counts drop.
  * Ids are datapoint ids, not `resId`s. A delete of a selection (no `records`)
  * has nothing to remove here. Online, the delete has reloaded the model, so
- * nothing is done, unless the `unlink` was queued instead of sent (`queued`).
+ * nothing is done, unless the `unlink` was queued instead of sent (`queued`), or
+ * waits for its turn in the replay (`deleteInTurn`, which gives the records it
+ * deletes, the selected ones included).
  *
  * @param {Object} list `CrmKanbanDynamicRecordList` or `CrmKanbanDynamicGroupList`
  * @param {Object[]} records the records passed to `_deleteRecords`
  * @param {boolean} [queued] the delete was queued without being sent
- *  (`deleteQueued`)
+ *  (`deleteQueued`), or waits for its turn (`deleteInTurn`)
  */
 async function removeRecordsDeletedOffline(list, records, queued = false) {
     if (!queued && !list.model.offlinePlugin.isOffline()) {
@@ -198,6 +278,108 @@ async function sendWithOrigin(model, origin, resModel, method, resId, send) {
 }
 
 /**
+ * Delete, from `list` (`deleteRecords`), of `records`, else of the selected records,
+ * whose leads the replay has still to send queued calls of (`deleteTurn`): it waits
+ * for its turn outside the model's mutex, so that the confirmation asking for it
+ * ends at once, as the card's other writes do. The deleted cards are removed at once,
+ * in an action of the mutex of their own, each group decrementing its count. At its
+ * turn, once the held writes of those records are done (a card save made before the
+ * delete is sent before it), the framework delete `del` of those records runs in an
+ * action of the mutex of its own (`CrmKanbanModel.crmExecHeld`): queued only after the
+ * leads' queued calls when the turn ended so (`deleteQueued`), sent with the user who
+ * made it and the database of their session otherwise (`sendWithOrigin`), whose
+ * reload of the model then shows the server's records. The delete is tracked as a held
+ * write (`_crmTrackHeldWrite`), so that the root loads started meanwhile and the server
+ * answers of cached root loads give way to it, and do not show the deleted cards
+ * again. A load that cannot give way to it (one run in another action of the mutex,
+ * such as the reload of a delete sent at once) reads the leads from the server before
+ * the delete is sent: until the delete ends, every list built or loaded meanwhile
+ * leaves them out (`CrmKanbanModel._crmHideHeldDelete`), each group then counting
+ * them out as well. A delete the server refuses, or that deletes nothing (`false`),
+ * stops hiding them, then shows the cards again by reloading the root while online
+ * (as the file's other reloads, `notify`), and its error is handed, unchanged, to the
+ * framework's error handling (`crmReportError`); a lost request is queued by the
+ * framework, the cards staying removed, as for any delete queued offline.
+ *
+ * A delete of a selection made of the whole domain (`isDomainSelected`), whose
+ * records the framework reads from the server at its run, is not held here.
+ *
+ * @param {Object} list `CrmKanbanDynamicRecordList` or `CrmKanbanDynamicGroupList`
+ * @param {Object[]} records the records given to `deleteRecords`
+ * @param {(records: Object[]) => Promise<boolean>} del the framework delete
+ *  (`DynamicList._deleteRecords`) of the given records
+ * @returns {Promise<boolean>|undefined} `undefined` when the delete need not wait (the
+ *  framework's `deleteRecords` then runs it); else resolved once the cards are removed
+ */
+function deleteInTurn(list, records, del) {
+    if (!records.length && list.isDomainSelected) {
+        return undefined;
+    }
+    const turn = deleteTurn(list, records);
+    if (!turn) {
+        return undefined;
+    }
+    const targets = records.length ? records : list.selection;
+    const model = list.model;
+    const removed = model.mutex.exec(() => removeRecordsDeletedOffline(list, targets, true));
+    const running = { isSave: false };
+    const result = Promise.all([turn, removed]).then(async ([outcome]) => {
+        await Promise.all(targets.map((record) => toRaw(record)._crmHeldWrite));
+        return model.crmExecHeld(running, () =>
+            outcome.queueOnly
+                ? deleteQueued(list, () => del(targets))
+                : sendWithOrigin(model, outcome.origin, list.resModel, "unlink", null, () =>
+                      del(targets)
+                  )
+        );
+    });
+    running.settled = result.then(
+        () => {},
+        () => {}
+    );
+    model._crmTrackHeldWrite(running.settled);
+    const endHiding = model._crmHideHeldDelete(targets, running.settled);
+    crmOwnEffectPromise(
+        result.then(
+            (deleted) => {
+                endHiding();
+                return deleted === false && restoreDeletedCards(model);
+            },
+            (error) => {
+                endHiding();
+                crmReportError(error);
+                return restoreDeletedCards(model);
+            }
+        )
+    );
+    return removed.then(() => true);
+}
+
+/**
+ * Shows again the cards of a held delete that deleted nothing (`deleteInTurn`): the
+ * root is loaded again, then the view rendered (`notify`), while online and while the
+ * view owning the model is not destroyed (`crmDestroyed`). A lost connection ends the
+ * reload with the root as it was.
+ *
+ * @param {Object} model
+ * @returns {Promise<void>}
+ */
+async function restoreDeletedCards(model) {
+    if (model.crmDestroyed() || model.offlinePlugin.isOffline()) {
+        return;
+    }
+    try {
+        await model.load();
+    } catch (error) {
+        if (!(error instanceof ConnectionLostError)) {
+            throw error;
+        }
+        return;
+    }
+    model.notify();
+}
+
+/**
  * CRM kanban model, also used by `crm_mobile_pipeline` and, through
  * `ForecastKanbanModel`, by the forecast kanban.
  *
@@ -215,9 +397,20 @@ async function sendWithOrigin(model, origin, resModel, method, resId, send) {
  * (`sendWithOrigin`); a connection reported lost, or the end of the view, while it
  * waits makes it queued after them instead of sent. A card save made while the
  * connection is reported lost and such a write is pending is queued after it as well
- * (`CrmKanbanRecord`). Root loads started meanwhile (`load`), and server answers of
- * cached root loads read before such a write (`_getCacheParams`), give way to it: the
- * root then shows what it saved.
+ * (`CrmKanbanRecord`). A card save or delete waits outside the model's mutex
+ * (`CrmKanbanRecord.update`, `deleteInTurn`), then runs in an action of its own
+ * (`crmExecHeld`): the pipeline's other card writes, of leads the replay has nothing
+ * to send before, and its loads go on meanwhile. A card save decides whether it waits
+ * in its action of the mutex, so that a save made before a replay starts and run once
+ * it has started waits outside the mutex as well. The card already shows the save,
+ * and a deleted card is removed at once. Root loads started meanwhile (`load`), and
+ * server answers of cached root loads read before such a write (`_getCacheParams`),
+ * give way to it: the root then shows what it saved. A load that cannot give way to
+ * it (one run in another action of the mutex) reads the server before the write is
+ * sent: every list built or loaded while the write is held still shows it, the
+ * deleted leads left out (`_crmHideHeldDelete`) and the values a held save writes
+ * shown on the lead's records (`_crmShowHeldSaves`, `_crmPlaceHeldSaves`), until the
+ * root is loaded again once the write is done (`_crmReloadAfterHeldWrites`).
  */
 export class CrmKanbanModel extends RelationalModel {
     setup(params, { effect }) {
@@ -243,6 +436,29 @@ export class CrmKanbanModel extends RelationalModel {
         this._crmHeldWriteCount = 0;
         /** @type {Object|null} token of the root load (`load`) running, if any */
         this._crmRootLoad = null;
+        /**
+         * The held lead write running in the model's mutex (`crmExecHeld`), if any.
+         *
+         * @type {{isSave: boolean, settled?: Promise<void>}|null}
+         */
+        this._crmRunningHeld = null;
+        /**
+         * The lead saves held for their turn and not done yet (`crmHoldWrite`), in the
+         * order they were held: the lead, the values the save writes as the server
+         * reads them (`heldSaveValues`), the record's mark (`crmTurnWrite`), the
+         * records showing them (the held one, and those `_crmShowHeldSaves` built
+         * since) and the settlement of the save.
+         *
+         * @type {Set<{resId: number, values: Object, mark: Object, shownOn: Set<Object>, settled?: Promise<void>}>}
+         */
+        this._crmHeldSaves = new Set();
+        /**
+         * The card deletes held for their turn and not done yet (`_crmHideHeldDelete`):
+         * the `resId`s of the leads each deletes, and its settlement.
+         *
+         * @type {Set<{resIds: Set<number>, settled: Promise<void>}>}
+         */
+        this._crmHeldDeletes = new Set();
     }
 
     /**
@@ -263,7 +479,7 @@ export class CrmKanbanModel extends RelationalModel {
      * lead queued or replayed when it is made, even one stamped past the clock
      * (`crmTurnWriteTimeStamp`), while it waits and once it is done, until a reload
      * replaces the record; a write that fails or saves nothing (`false`) drops the
-     * mark. Root loads started meanwhile wait for the held write (`load`), so that
+     * mark. Root loads started meanwhile give way to the held write (`load`), so that
      * the reload ending a replay reads what it wrote.
      *
      * @template T
@@ -277,29 +493,338 @@ export class CrmKanbanModel extends RelationalModel {
         if (!turn) {
             return write();
         }
+        return this.crmHoldWrite(record, fieldNames, turn, write);
+    }
+
+    /**
+     * Holds `write`, a write of the lead `record` setting `fieldNames`, until `turn`
+     * (`crmLeadWriteTurn`, pending) gives it its outcome, then runs it with that
+     * outcome, as `crmWriteInTurn` describes: the record is marked (`crmTurnWrite`)
+     * meanwhile, the mark is dropped when the write fails or saves nothing (`false`),
+     * and the hold is tracked (`_crmTrackHeldWrite`) on the model and on the record
+     * (`_crmHeldWrite`), so that root loads and a delete of the lead made meanwhile
+     * give way to it. Nothing is awaited here: the caller decides where it waits, so
+     * that a card save held outside the model's mutex (`CrmKanbanRecord.update`)
+     * leaves the mutex free for the pipeline's other writes and loads while it waits.
+     *
+     * Until it is done, the write's values of `fieldNames`, as the record shows them,
+     * and its mark are kept (`_crmHeldSaves`), so that the lead's records built
+     * meanwhile from server data the write has not reached show them as well
+     * (`_crmShowHeldSaves`); the mark is then dropped from those records too when the
+     * write fails or saves nothing. A record already carrying the mark of a held write
+     * not done yet (a record built meanwhile shows it) keeps showing the fields of that
+     * mark: the new mark names them as well.
+     *
+     * @template T
+     * @param {Object} record
+     * @param {string[]} fieldNames
+     * @param {Promise<import("@crm/mobile/crm_offline_hooks").CrmWriteTurn>} turn
+     * @param {(turn: import("@crm/mobile/crm_offline_hooks").CrmWriteTurn) => Promise<T>} write
+     * @returns {Promise<T>} the result of `write`
+     */
+    crmHoldWrite(record, fieldNames, turn, write) {
+        const model = toRaw(this);
+        const carried = toRaw(record.crmTurnWrite);
+        const carriedFields =
+            carried && [...model._crmHeldSaves].some((held) => held.mark === carried)
+                ? carried.fieldNames
+                : [];
         const mark = {
             timeStamp: crmTurnWriteTimeStamp(this.offlinePlugin, record),
-            fieldNames: [...fieldNames],
+            fieldNames: [...new Set([...fieldNames, ...carriedFields])],
         };
         record.crmTurnWrite = mark;
-        const dropMark = () => {
-            if (toRaw(record.crmTurnWrite) === mark) {
-                record.crmTurnWrite = undefined;
+        const held = {
+            resId: record.resId,
+            values: heldSaveValues(record, fieldNames),
+            mark,
+            shownOn: new Set([record]),
+        };
+        model._crmHeldSaves.add(held);
+        const end = (failed) => {
+            model._crmHeldSaves.delete(held);
+            if (!failed) {
+                return;
+            }
+            for (const shown of held.shownOn) {
+                if (toRaw(shown.crmTurnWrite) === mark) {
+                    shown.crmTurnWrite = undefined;
+                }
             }
         };
         const result = turn.then(write);
         const settled = result.then(
-            (saved) => {
-                if (saved === false) {
-                    dropMark();
-                }
-            },
-            dropMark
+            (saved) => end(saved === false),
+            () => end(true)
         );
+        held.settled = settled;
+        this._crmTrackHeldWrite(settled);
+        toRaw(record)._crmHeldWrite = settled;
+        return result;
+    }
+
+    /**
+     * Hides the leads of `records`, whose card delete waits for its turn in the replay
+     * (`deleteInTurn`), from every list built or loaded from server data until the
+     * returned function is called (`_crmWithoutHeldDeletes`): such data, read before
+     * the delete is sent, still holds them.
+     *
+     * @param {Object[]} records
+     * @param {Promise<void>} settled the settlement of the delete
+     * @returns {() => void} ends the hiding
+     */
+    _crmHideHeldDelete(records, settled) {
+        const model = toRaw(this);
+        const held = {
+            resIds: new Set(records.map((record) => record.resId).filter(Boolean)),
+            settled,
+        };
+        model._crmHeldDeletes.add(held);
+        return () => {
+            model._crmHeldDeletes.delete(held);
+        };
+    }
+
+    /**
+     * Settlements of the held card writes not done yet that the lists built now still
+     * show (`_crmHeldSaves`, `_crmHeldDeletes`): a root built now is loaded again once
+     * they are done (`load`).
+     *
+     * @returns {Promise<void>[]}
+     */
+    _crmShownHeldWrites() {
+        const model = toRaw(this);
+        return [...model._crmHeldSaves, ...model._crmHeldDeletes].map(({ settled }) => settled);
+    }
+
+    /**
+     * `data`, the server data of a list (`{records, length}`) or of a group of records
+     * (`{records, length, count, ...}`), without the leads a held card delete hides
+     * (`_crmHideHeldDelete`), its `length` and `count` lowered as many: a copy, the
+     * server data is left as it is. `data` itself when it holds none of them, and on
+     * sample data.
+     *
+     * @param {Object} data
+     * @returns {Object}
+     */
+    _crmWithoutHeldDeletes(data) {
+        const model = toRaw(this);
+        if (
+            !model._crmHeldDeletes.size ||
+            model.useSampleModel ||
+            model.orm?.isSample ||
+            !Array.isArray(data?.records)
+        ) {
+            return data;
+        }
+        const deleted = [...model._crmHeldDeletes];
+        const records = data.records.filter(
+            (rec) => !deleted.some(({ resIds }) => resIds.has(rec?.id))
+        );
+        const hidden = data.records.length - records.length;
+        if (!hidden) {
+            return data;
+        }
+        const shown = { ...data, records };
+        if (typeof data.length === "number") {
+            shown.length = data.length - hidden;
+        }
+        if (typeof data.count === "number") {
+            shown.count = data.count - hidden;
+        }
+        return shown;
+    }
+
+    /**
+     * The held saves not done yet of the lead `resId`, in the order they were held.
+     *
+     * @param {number|false} resId
+     * @returns {Object[]} entries of `_crmHeldSaves`
+     */
+    _crmHeldSavesOf(resId) {
+        return resId ? [...toRaw(this)._crmHeldSaves].filter((held) => held.resId === resId) : [];
+    }
+
+    /**
+     * Shows, on the records of `list` just built from server data, the values of the
+     * held saves of their leads not done yet (`_crmHeldSaves`), which that data may
+     * not hold: they are applied as values of the record (`_applyValues`), so that it
+     * shows them without being dirty or saving anything, the latest last. The record
+     * carries the mark of the lead's latest held save (`crmTurnWrite`) and its
+     * settlements (`_crmHeldWrite`, which a delete of the lead waits for). Nothing is
+     * done on sample data.
+     *
+     * @param {Object} list a `CrmKanbanDynamicRecordList`
+     */
+    _crmShowHeldSaves(list) {
+        const model = toRaw(this);
+        if (!model._crmHeldSaves.size || model.useSampleModel || model.orm?.isSample) {
+            return;
+        }
+        for (const record of list.records) {
+            const held = this._crmHeldSavesOf(record.resId);
+            if (!held.length) {
+                continue;
+            }
+            record._applyValues(Object.assign({}, ...held.map(({ values }) => values)));
+            record.crmTurnWrite = held.at(-1).mark;
+            toRaw(record)._crmHeldWrite = Promise.all(held.map(({ settled }) => settled)).then(
+                () => {}
+            );
+            for (const { shownOn } of held) {
+                shownOn.add(record);
+            }
+        }
+    }
+
+    /**
+     * Places, in the groups of `list` just built from server data, the records whose
+     * held save not done yet writes the group-by field (`_crmShowHeldSaves` shows its
+     * value): a record a group holds although its value is another group's is moved
+     * to the top of that group, as a card move puts it there before saving
+     * (`DynamicGroupList.moveRecord`), each group counting it as it moves. A record
+     * whose value no group holds, or a grouping that cannot tell
+     * (`groupHoldsValue`), stays where the server put it.
+     *
+     * @param {Object} list a `CrmKanbanDynamicGroupList`
+     */
+    _crmPlaceHeldSaves(list) {
+        const model = toRaw(this);
+        const fieldName = list.groupByField?.name;
+        if (
+            !model._crmHeldSaves.size ||
+            !fieldName ||
+            model.useSampleModel ||
+            model.orm?.isSample
+        ) {
+            return;
+        }
+        for (const group of [...list.groups]) {
+            if (group.list.isGrouped) {
+                continue;
+            }
+            for (const record of [...group.list.records]) {
+                if (!this._crmHeldSavesOf(record.resId).some(({ values }) => fieldName in values)) {
+                    continue;
+                }
+                const value = record.data[fieldName];
+                if (groupHoldsValue(group, value) !== false) {
+                    continue;
+                }
+                const target = list.groups.find((other) => groupHoldsValue(other, value));
+                if (!target || target.list.isGrouped) {
+                    continue;
+                }
+                group._removeRecords([record.id]);
+                if (!target.list.records.some((other) => other.resId === record.resId)) {
+                    target._addRecord(record, 0);
+                }
+            }
+        }
+    }
+
+    /**
+     * Keeps in place, in `list`, the list of a group of the current root just loaded
+     * again from server data (a "Load more", the reload of the group a card move
+     * left), the leads whose held save not done yet writes the group-by field: that
+     * data still places them by the value they had. A record whose shown value
+     * (`_crmShowHeldSaves`) another group of the root holds and shows (a card move, or
+     * `_crmPlaceHeldSaves`, put it there) is left out of `list`, so that the lead is not
+     * shown twice. A record of `previous`, the records `list` showed before, whose
+     * shown value the group holds and that the data left out is shown again at its
+     * place. Only the list's own count changes: the group already counts the lead
+     * where it shows.
+     *
+     * @param {Object} list a `CrmKanbanDynamicRecordList`
+     * @param {Object[]} previous the records `list` showed before the data was set
+     */
+    _crmKeepHeldPlaces(list, previous) {
+        const model = toRaw(this);
+        const root = model.root;
+        const fieldName = root?.groupByField?.name;
+        if (
+            !model._crmHeldSaves.size ||
+            !fieldName ||
+            !Array.isArray(root.groups) ||
+            model.useSampleModel ||
+            model.orm?.isSample
+        ) {
+            return;
+        }
+        const holder = root.groups.find((group) => toRaw(group.list) === toRaw(list));
+        if (!holder) {
+            return;
+        }
+        const movesLead = (record) =>
+            this._crmHeldSavesOf(record.resId).some(({ values }) => fieldName in values);
+        const shownElsewhere = (record) =>
+            root.groups.some(
+                (group) =>
+                    group !== holder &&
+                    group.list.records.some((other) => other.resId === record.resId)
+            );
+        const dropped = list.records.filter(
+            (record) =>
+                movesLead(record) &&
+                groupHoldsValue(holder, record.data[fieldName]) === false &&
+                shownElsewhere(record)
+        );
+        if (dropped.length) {
+            list._removeRecords(dropped.map(({ id }) => id));
+        }
+        previous.forEach((record, index) => {
+            if (
+                movesLead(record) &&
+                groupHoldsValue(holder, record.data[fieldName]) === true &&
+                !list.records.some((other) => other.resId === record.resId)
+            ) {
+                list._addRecord(record, Math.min(index, list.records.length));
+            }
+        });
+    }
+
+    /**
+     * Tracks a lead write held for its turn in the replay (a card save, a stage choice
+     * or a card delete) until `settled`, its settlement, which never rejects: the root
+     * loads started meanwhile (`load`) and the server answers of cached root loads
+     * (`_getCacheParams`) give way to it.
+     *
+     * @param {Promise<void>} settled
+     */
+    _crmTrackHeldWrite(settled) {
         this._crmHeldWrites.add(settled);
         this._crmHeldWriteCount++;
         settled.then(() => this._crmHeldWrites.delete(settled));
-        return result;
+    }
+
+    /**
+     * Runs `fn`, a lead write held for its turn in the replay and now due, in its own
+     * action of the model's mutex, as the framework runs the write it belongs to (a
+     * record save, a list delete), after the actions queued before it. `running`
+     * (`_crmRunningHeld`) describes it while it runs: a held save never
+     * loads the root, so a root load started meanwhile runs outside the mutex and may
+     * wait for the held writes; a held delete does load it, inside its action
+     * (`DynamicList._deleteRecords`), and that load must not wait for the held writes,
+     * which need the mutex, nor for the delete's own settlement (`settled`), which
+     * needs the load (`load`).
+     *
+     * @template T
+     * @param {{isSave: boolean, settled?: Promise<void>}} running
+     * @param {() => Promise<T>} fn
+     * @returns {Promise<T>} the result of `fn`
+     */
+    crmExecHeld(running, fn) {
+        const model = toRaw(this);
+        return model.mutex.exec(async () => {
+            model._crmRunningHeld = running;
+            try {
+                return await fn();
+            } finally {
+                if (model._crmRunningHeld === running) {
+                    model._crmRunningHeld = null;
+                }
+            }
+        });
     }
 
     /**
@@ -322,18 +847,38 @@ export class CrmKanbanModel extends RelationalModel {
      * `_crmLoadRoot` reads it, so a load makes at most four attempts. The
      * server-value snapshot needs no handling here: it belongs to the root the load
      * builds. A load started while card writes wait for their turn in the replay
-     * (`crmWriteInTurn`) first waits for them, whatever their outcome, so that it
-     * reads what they wrote; otherwise it starts at once. Until the last load
-     * started ends, `_crmRootLoad` tells that one is running (a load the framework
-     * supersedes never ends), so that a server answer of a cached root load read
-     * before held card writes gives way to it (`_crmReloadOverCacheUpdate`).
+     * (`crmHoldWrite`) first waits for them, whatever their outcome, so that it
+     * reads what they wrote; otherwise it starts at once. A held card save or delete
+     * runs in the model's mutex at its turn (`crmExecHeld`), and the framework loads
+     * the root inside its own mutex actions (a delete, a duplicate, an archive): a
+     * load started while the mutex runs any action but a held save (which never loads
+     * the root) may be that action's own, and waiting would never end. Such a load
+     * starts at once, and the root it builds from the server's data, which the held
+     * writes have not reached, still shows them (`_crmShowHeldSaves`,
+     * `_crmPlaceHeldSaves`, `_crmWithoutHeldDeletes`). The root is loaded again once
+     * the held writes pending at its start, and those it shows, are done (but the
+     * running held delete, whose own reload it is: `_crmReloadAfterHeldWrites`). Until
+     * the last load started ends, `_crmRootLoad` tells that one is running (a load the
+     * framework supersedes never ends), so that a server answer of a cached root load
+     * read before held card writes gives way to it (`_crmReloadOverCacheUpdate`).
      */
     async load(params = {}) {
+        // The token is kept and compared raw: read through the model's reactive proxy
+        // (a load a datapoint starts), it would be a proxy of itself.
+        const model = toRaw(this);
         const rootLoad = {};
-        this._crmRootLoad = rootLoad;
+        model._crmRootLoad = rootLoad;
+        const running = this._crmRunningHeld;
+        const heldWrites = [];
         try {
             if (this._crmHeldWrites.size) {
-                await Promise.all(this._crmHeldWrites);
+                if (!this.mutex._queueSize || running?.isSave) {
+                    await Promise.all(this._crmHeldWrites);
+                } else {
+                    heldWrites.push(
+                        ...[...this._crmHeldWrites].filter((held) => held !== running?.settled)
+                    );
+                }
             }
             try {
                 await this._crmLoadRoot(...arguments);
@@ -344,10 +889,54 @@ export class CrmKanbanModel extends RelationalModel {
                 await this._crmLoadRoot(...arguments);
             }
         } finally {
-            if (this._crmRootLoad === rootLoad) {
-                this._crmRootLoad = null;
+            if (model._crmRootLoad === rootLoad) {
+                model._crmRootLoad = null;
             }
         }
+        for (const held of this._crmShownHeldWrites()) {
+            if (held !== running?.settled && !heldWrites.includes(held)) {
+                heldWrites.push(held);
+            }
+        }
+        if (heldWrites.length) {
+            crmOwnEffectPromise(this._crmReloadAfterHeldWrites(heldWrites, this.root));
+        }
+    }
+
+    /**
+     * Ends a root load that did not wait for the held card writes pending at its
+     * start, or that shows held card writes not done when it was built (`load`),
+     * `heldWrites`, and loaded `root`: once they are done, the root is
+     * loaded again, so that it shows what they wrote, and the view is then rendered,
+     * as after the view's own loads (`notify`). The reload only runs while `root` is
+     * still the model's root, no root load is running (which reads what they wrote as
+     * well), the view owning the model is not destroyed (`crmDestroyed`) and the
+     * connection is up; otherwise the root keeps what it shows. A lost connection ends
+     * the reload with the root as it was, as the file's other reloads end.
+     *
+     * @param {Promise<void>[]} heldWrites settlements of the held writes
+     * @param {Object} root the root the load built
+     * @returns {Promise<void>}
+     */
+    async _crmReloadAfterHeldWrites(heldWrites, root) {
+        await Promise.all(heldWrites);
+        if (
+            root?.id !== this.root?.id ||
+            this._crmRootLoad ||
+            this.crmDestroyed() ||
+            this.offlinePlugin.isOffline()
+        ) {
+            return;
+        }
+        try {
+            await this.load();
+        } catch (error) {
+            if (!(error instanceof ConnectionLostError)) {
+                throw error;
+            }
+            return;
+        }
+        this.notify();
     }
 
     /**
@@ -356,15 +945,16 @@ export class CrmKanbanModel extends RelationalModel {
      * A root load served from the RPC cache gets the server's answer afterwards; the
      * framework sets it on the root when it differs from the cached one (`callback`),
      * rebuilding its groups and records. A card write held in the replay
-     * (`crmWriteInTurn`) that is pending when that answer arrives, or was made since
-     * the load was requested, may be missing from it: set on the root, the answer
-     * would show the lead as it was before the write (a moved card back in its former
-     * stage) and drop the held move's records, whose rainbowman lookup and mobile
-     * projection follow them. Such an answer is not set: the framework still records
-     * the view as available offline and caches the answer's many2x values, as for an
-     * unchanged answer, and the root is loaded again once the held writes are done
-     * (`_crmReloadOverCacheUpdate`). Every other answer, and every answer while no
-     * card write was held, is handled by the framework at once, as before.
+     * (`crmHoldWrite`, `deleteInTurn`) that is pending when that answer arrives, or was
+     * made since the load was requested, may be missing from it: set on the root, the
+     * answer would show the lead as it was before the write (a moved card back in its
+     * former stage, a deleted card again) and drop the held move's records, whose
+     * rainbowman lookup and mobile projection follow them. Such an answer is not set:
+     * the framework still records the view as available offline and caches the
+     * answer's many2x values, as for an unchanged answer, and the root is loaded again
+     * once the held writes are done (`_crmReloadOverCacheUpdate`). Every other answer,
+     * and every answer while no card write was held, is handled by the framework at
+     * once, as before.
      *
      * @param {Object} config
      * @param {Promise<{root: Object, loadId: string}>} rootLoadProm
@@ -592,6 +1182,14 @@ export class CrmKanbanRecord extends RelationalModel.Record {
      * database of their session (`sendWithOrigin`). Urgent saves (page close) are
      * never held or queued here, and online with no replay running every save is
      * sent at once, as before.
+     *
+     * A save held here keeps the action of the model's mutex it runs in until its
+     * turn. The card saves of a lead, made through `update` and `save`, never wait
+     * here: those decide in their action whether the save waits, and hold it outside
+     * the mutex (`_crmHoldSave`), so that by the time they call this, in the same
+     * synchronous step, the save has nothing to wait for. This hold serves the
+     * other callers, such as the retry of a save the framework's error dialog offers,
+     * which runs outside the mutex.
      */
     _save() {
         if (this.model._urgentSave || this.resModel !== "crm.lead") {
@@ -599,22 +1197,164 @@ export class CrmKanbanRecord extends RelationalModel.Record {
         }
         const args = arguments;
         toRaw(this)._crmSaveQueued = false;
-        return this.model.crmWriteInTurn(this, Object.keys(this._changes), (turn) => {
-            if (untrack(() => this._crmQueuesSave(Boolean(turn?.queueOnly)))) {
-                return this._crmQueueSave(() => super._save(...args));
+        return this.model.crmWriteInTurn(this, Object.keys(this._changes), (turn) =>
+            this._crmSaveAtTurn(turn, args)
+        );
+    }
+
+    /**
+     * The framework save (`Record._save`) of the lead given `args`, run at the turn
+     * of the save in the replay, `turn` (`crmLeadWriteTurn`; `undefined` for a save
+     * that waited for nothing): queued after the lead's pending queued writes without
+     * being sent (`_crmQueueSave`) while one remains and the connection is reported
+     * lost or the turn ended "queue only" (`_crmQueuesSave`); otherwise sent, with the
+     * user who made it and the database of their session when it was held
+     * (`sendWithOrigin`), as is when it was not.
+     *
+     * @param {import("@crm/mobile/crm_offline_hooks").CrmWriteTurn|undefined} turn
+     * @param {ArrayLike<any>} args the arguments of the save
+     * @returns {Promise<boolean>} the result of the framework save
+     */
+    _crmSaveAtTurn(turn, args) {
+        if (untrack(() => this._crmQueuesSave(Boolean(turn?.queueOnly)))) {
+            return this._crmQueueSave(() => super._save(...args));
+        }
+        if (!turn) {
+            return super._save(...args);
+        }
+        return sendWithOrigin(this.model, turn.origin, this.resModel, "web_save", this.resId, () =>
+            super._save(...args)
+        );
+    }
+
+    /**
+     * @override
+     *
+     * A card save of a lead (a stage move, by drag or by the mobile stage select, a
+     * colour, any field a card saves on update) runs, as in the framework, in an
+     * action of the model's mutex, which applies the changes, so that the card shows
+     * them at once, and saves them. Whether the save waits is decided in that action,
+     * when it runs, not when the update is made: an update made before a replay starts
+     * may run once it has started. When the replay has still to send queued writes of
+     * a field of the lead, the save waits for its turn (`_crmHoldSave`) outside that
+     * action, which ends at once: the pipeline's other writes, such as the card saves
+     * of leads the replay has nothing to send before, which are sent at once, and its
+     * loads go on meanwhile. At its turn the save runs in an action of its own
+     * (`CrmKanbanModel.crmExecHeld`). The returned promise resolves with the save's
+     * result once it is done, so that a stage move the save refuses is undone by the
+     * framework (`DynamicGroupList.moveRecord`). Further updates of the record while
+     * it waits apply at once as well; the first save done at the turn saves all of
+     * them, and the later ones find nothing left to save.
+     *
+     * A save that need not wait, which is every save with no replay running, runs in
+     * the action exactly as the framework's update runs it (the changes applied, then
+     * `_save`): the same requests, in the same order; only the returned promise
+     * resolves a microtask later. For an urgent save (page close) and for any other
+     * model, the framework's update runs, unchanged.
+     *
+     * @param {Object} changes
+     * @returns {Promise<boolean|undefined>}
+     */
+    update(changes) {
+        if (!this._crmMayHoldSave()) {
+            return super.update(...arguments);
+        }
+        let held;
+        const applied = this.model.mutex.exec(async () => {
+            const save = !this.isInEdition && this.canSaveOnUpdate;
+            await this._update(changes, { withoutOnchange: save });
+            if (!save) {
+                return;
             }
-            if (!turn) {
-                return super._save(...args);
+            held = this._crmHoldSave([]);
+            if (!held) {
+                return this._save();
             }
-            return sendWithOrigin(
-                this.model,
-                turn.origin,
-                this.resModel,
-                "web_save",
-                this.resId,
-                () => super._save(...args)
-            );
         });
+        return applied.then((result) => (held ? held : result));
+    }
+
+    /**
+     * @override
+     *
+     * Decided in its action of the model's mutex, as for a card save on update
+     * (`update`): when the replay has still to send queued writes of a field of the
+     * lead, the save waits for its turn outside the mutex (`_crmHoldSave`), and
+     * resolves with its result once done. A save that need not wait, which is every
+     * save with no replay running, runs as the framework's save runs it (the
+     * changes asked, then `_save` in the action), its promise resolving a microtask
+     * later. For an urgent save and for any other model, the framework's save runs,
+     * unchanged.
+     *
+     * @param {Object} [options]
+     * @returns {Promise<boolean>}
+     */
+    save(options) {
+        if (!this._crmMayHoldSave()) {
+            return super.save(...arguments);
+        }
+        return this._crmSaveOutsideMutex(arguments);
+    }
+
+    /**
+     * The framework's save (`Record.save`) of the lead given `args`, its save held
+     * outside the model's mutex until its turn when it has to wait (`_crmHoldSave`).
+     *
+     * @param {ArrayLike<any>} args the arguments of the save
+     * @returns {Promise<boolean>}
+     */
+    async _crmSaveOutsideMutex(args) {
+        await this.model._askChanges();
+        let held;
+        const saved = await this.model.mutex.exec(() => {
+            held = this._crmHoldSave(args);
+            if (!held) {
+                return this._save(...args);
+            }
+        });
+        return held ? held : saved;
+    }
+
+    /**
+     * Whether a save of the record goes through the CRM `update` and `save`, which
+     * decide in their action of the model's mutex whether it waits for its turn in a
+     * replay (`_crmHoldSave`): a lead's save other than an urgent one, whatever the
+     * replay state when it is made. Otherwise the framework's update and save run
+     * unchanged.
+     *
+     * @returns {boolean}
+     */
+    _crmMayHoldSave() {
+        return !this.model._urgentSave && this.resModel === "crm.lead";
+    }
+
+    /**
+     * Run inside an action of the model's mutex, with the record's changes applied:
+     * when the replay has still to send queued writes of a field of the lead the save
+     * must follow (`crmLeadWriteTurn`), holds the save of those changes, given `args`,
+     * until its turn without waiting here (`CrmKanbanModel.crmHoldWrite`, which marks
+     * the record and tracks the hold), and returns the promise of its result: at its
+     * turn the save runs in an action of the mutex of its own (`crmExecHeld`,
+     * `_crmSaveAtTurn`). `undefined` when the save may run now, in the calling action:
+     * an urgent save (a page closed since the save was asked), or nothing to wait for.
+     *
+     * @param {ArrayLike<any>} args the arguments of the save
+     * @returns {Promise<boolean>|undefined}
+     */
+    _crmHoldSave(args) {
+        if (this.model._urgentSave) {
+            return undefined;
+        }
+        const fieldNames = Object.keys(this._changes);
+        const model = this.model;
+        const turn = crmLeadWriteTurn(model.offlinePlugin, [this], fieldNames, model.crmDestroyed);
+        if (!turn) {
+            return undefined;
+        }
+        toRaw(this)._crmSaveQueued = false;
+        return model.crmHoldWrite(this, fieldNames, turn, (outcome) =>
+            model.crmExecHeld({ isSave: true }, () => this._crmSaveAtTurn(outcome, args))
+        );
     }
 
     /**
@@ -826,13 +1566,16 @@ export class CrmKanbanDynamicGroupList extends RelationalModel.DynamicGroupList 
      * Fresh server data set on the current grouped root outside a root load gives
      * the root a new server-value snapshot: the groups, and with them every
      * group's record list, are then built by `super` bound to that map. Any other
-     * list keeps the snapshot it was built with.
+     * list keeps the snapshot it was built with. Once the groups are built, a record
+     * showing a held card save of the group-by field is placed in the group of the
+     * value it shows (`CrmKanbanModel._crmPlaceHeldSaves`).
      */
     _setData(data) {
         if (this.config.isRoot && isCurrentRoot(this)) {
             this._crmServerValues = new Map();
         }
         super._setData(...arguments);
+        this.model._crmPlaceHeldSaves(this);
     }
 
     /**
@@ -840,29 +1583,54 @@ export class CrmKanbanDynamicGroupList extends RelationalModel.DynamicGroupList 
      *
      * Builds the group, and with it the group's list, bound to this list's
      * server-value snapshot, so that the lists of a root all record into that
-     * root's map.
+     * root's map. The group is built without the leads a held card delete hides,
+     * counting them out (`CrmKanbanModel._crmWithoutHeldDeletes`); their server
+     * stage and revenue are still recorded into the snapshot (`recordCrmServerValues`),
+     * which the group's aggregates include, as for a card removed by a delete.
      */
     _createGroupDatapoint(data) {
-        return this.model._crmBuildWith(this._crmServerValues, () =>
-            super._createGroupDatapoint(...arguments)
-        );
+        return this.model._crmBuildWith(this._crmServerValues, () => {
+            const shown = this.model._crmWithoutHeldDeletes(data);
+            if (shown !== data) {
+                recordCrmServerValues(this, data.records);
+            }
+            return super._createGroupDatapoint(shown);
+        });
     }
 
     /**
      * @override
      *
      * The kanban card menu deletes through the root (`model.root.deleteRecords`),
-     * which is this list when grouped: offline, the deleted cards are removed from
-     * their groups at once, each group decrementing its own count. Online, during a
-     * replay that has still to send queued calls of the deleted leads, the delete
-     * is sent after them (`deleteTurn`), with the user who made it and the database
-     * of their session (`sendWithOrigin`), or queued after them when its turn ends
-     * "queue only" (`deleteQueued`), and the cards are then removed at once as well.
-     * A queued `unlink` (offline, its request lost, or queue only) is stamped as it is
-     * queued after every queued call, pending or parked, of each lead it deletes, the
-     * latest of all of them for several leads (the CRM `OfflinePlugin.scheduleORM`):
-     * the replay sends those calls first, even when they are stamped ahead of the
-     * clock.
+     * which is this list when grouped. During a replay that has still to send queued
+     * calls of the deleted leads, the delete waits for its turn outside the model's
+     * mutex (`deleteInTurn`): the confirmation ends and the cards are removed at once,
+     * and the pipeline's other writes and loads go on meanwhile. Every other delete is
+     * the framework's, unchanged.
+     *
+     * @param {Object[]} [records]
+     * @returns {Promise<boolean>}
+     */
+    deleteRecords(records = []) {
+        const held = deleteInTurn(this, records, (targets) => super._deleteRecords(targets));
+        return held || super.deleteRecords(...arguments);
+    }
+
+    /**
+     * @override
+     *
+     * Offline, the deleted cards are removed from their groups at once, each group
+     * decrementing its own count. Online, during a replay that has still to send
+     * queued calls of the deleted leads, a delete that reaches it (one `deleteRecords`
+     * does not hold: of the whole domain, or a replay started between its call and its
+     * run in the mutex) is sent after them (`deleteTurn`), with the user who made it
+     * and the database of their session (`sendWithOrigin`), or queued after them when
+     * its turn ends "queue only" (`deleteQueued`), and the cards are then removed at
+     * once as well. A queued `unlink` (offline, its request lost, or queue only) is
+     * stamped as it is queued after every queued call, pending or parked, of each lead
+     * it deletes, the latest of all of them for several leads (the CRM
+     * `OfflinePlugin.scheduleORM`): the replay sends those calls first, even when they
+     * are stamped ahead of the clock.
      */
     async _deleteRecords(records) {
         const pending = deleteTurn(this, records);
@@ -891,6 +1659,8 @@ export class CrmKanbanDynamicRecordList extends RelationalModel.DynamicRecordLis
     setup(config, data) {
         this._crmServerValues = this.model._crmLoadingServerValues || new Map();
         super.setup(...arguments);
+        /** Set once built: its data set again later is a reload (`_setData`). */
+        this._crmSetUp = true;
     }
 
     /**
@@ -902,14 +1672,26 @@ export class CrmKanbanDynamicRecordList extends RelationalModel.DynamicRecordLis
      * outside a root load first gives the root a new snapshot. During a
      * `crmLoadMissingRecords` load, first notes the root's opening-info flag,
      * which the model sets right after this commit.
+     *
+     * The records are built without the leads a held card delete hides, its count
+     * lowered as many (`CrmKanbanModel._crmWithoutHeldDeletes`), and show the values of
+     * the held card saves of their leads (`_crmShowHeldSaves`): the server data was
+     * read before those writes were sent. A group's list loaded again (a "Load more",
+     * the reload of the group a card move left) then keeps in place the leads a held
+     * save moves between groups (`_crmKeepHeldPlaces`).
      */
     _setData(data) {
         this._crmBeforeCommit?.();
         if (this.config.isRoot && isCurrentRoot(this)) {
             this._crmServerValues = new Map();
         }
+        const previous = this._crmSetUp && !this.config.isRoot ? [...this.records] : null;
         recordCrmServerValues(this, data.records);
-        super._setData(...arguments);
+        super._setData(this.model._crmWithoutHeldDeletes(data));
+        this.model._crmShowHeldSaves(this);
+        if (previous) {
+            this.model._crmKeepHeldPlaces(this, previous);
+        }
     }
 
     /**
@@ -985,13 +1767,32 @@ export class CrmKanbanDynamicRecordList extends RelationalModel.DynamicRecordLis
     /**
      * @override
      *
+     * A delete through this list as the ungrouped root (`model.root.deleteRecords`)
+     * made during a replay that has still to send queued calls of the deleted leads
+     * waits for its turn outside the model's mutex (`deleteInTurn`): the confirmation
+     * ends and the records are removed at once, and the view's other writes and loads
+     * go on meanwhile. Every other delete is the framework's, unchanged.
+     *
+     * @param {Object[]} [records]
+     * @returns {Promise<boolean>}
+     */
+    deleteRecords(records = []) {
+        const held = deleteInTurn(this, records, (targets) => super._deleteRecords(targets));
+        return held || super.deleteRecords(...arguments);
+    }
+
+    /**
+     * @override
+     *
      * Offline, the deleted records are removed from the list at once (ungrouped
      * root, or a group's list through `Group.deleteRecords`, the group then
      * decrementing its own count). Online, `super` reloads the model; during a
-     * replay that has still to send queued calls of the deleted leads, the delete
-     * is sent after them (`deleteTurn`), with the user who made it and the database
-     * of their session (`sendWithOrigin`), or queued after them when its turn ends
-     * "queue only" (`deleteQueued`), and the records are then removed at once as well.
+     * replay that has still to send queued calls of the deleted leads, a delete that
+     * reaches it (one `deleteRecords` does not hold: through a group, of the whole
+     * domain, or a replay started between its call and its run in the mutex) is sent
+     * after them (`deleteTurn`), with the user who made it and the database of their
+     * session (`sendWithOrigin`), or queued after them when its turn ends "queue
+     * only" (`deleteQueued`), and the records are then removed at once as well.
      * A queued `unlink` (offline, its request lost, or queue only) is stamped as it is
      * queued after every queued call, pending or parked, of each lead it deletes, the
      * latest of all of them for several leads (the CRM `OfflinePlugin.scheduleORM`):

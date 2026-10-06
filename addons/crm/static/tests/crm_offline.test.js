@@ -15884,23 +15884,24 @@ test("[Online] card stage move and colour picked during the replay of the lead's
 
     // The lead's writes made online meanwhile are not sent ahead of its queued colour,
     // although that write names the colour only: the server may recompute fields a
-    // write does not name. The card shows the move at once; the colour picked next
-    // waits for its turn behind it.
+    // write does not name. The card shows the move at once, and the colour picked next
+    // as well: both wait for their turn.
     await contains(lead1).dragAndDrop(".o_kanban_group:eq(1)");
     await animationFrame();
     expect(`.o_kanban_group:eq(1) ${lead1}`).toHaveCount(1);
     expect.verifySteps([]);
     await pickColour(lead1, 5);
     await animationFrame();
+    expect(`.o_kanban_group:eq(1) ${lead1}`).toHaveClass("o_kanban_color_5");
     expect.verifySteps([]);
 
     // The queued colour replays one second later, then the card's move and colour are
-    // sent: the stage is kept, and the colour picked last wins.
+    // sent, in the one save of the card's changes: the stage is kept, and the colour
+    // picked last wins. Nothing else is sent for them.
     await releaseLead2Rename(plugin, lead2Write, renameKey);
     await expect.waitForSteps([
         `web_save [1] ${JSON.stringify({ color: 3 })}`,
-        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
-        `web_save [1] ${JSON.stringify({ color: 5 })}`,
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED, color: 5 })}`,
     ]);
     await runAllTimers();
     await animationFrame();
@@ -15970,6 +15971,574 @@ test("[Online] card delete during the replay of the lead's queued form save is s
     expect(MockServer.env["crm.lead"].search_count([["id", "=", 1]])).toBe(0);
     expect(".o_kanban_record:contains(Lead 1)").toHaveCount(0);
     expect(".o_menu_systray .o_offline_systray .fa-exclamation-circle").toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+// A card write held for its turn in the replay waits outside the pipeline model's
+// mutex: the card writes of the leads the replay has nothing to send before, and the
+// pipeline's loads, are not held behind it.
+
+/**
+ * Opens "My Pipeline" and lets its start-up sync run, then, offline, queues a rename of
+ * lead 2 (`queueLead2RenameFirst`) and, a minute later, the lead form's save of lead 1
+ * in stage B (Qualified), back on the pipeline (served from the cache: one error).
+ * Reconnected, the replay sends the rename first and is held there
+ * (`stepLeadWritesHoldingLead2`), with the form save still to be sent.
+ *
+ * @returns {Promise<{plugin: OfflinePlugin, lead2Write: PromiseWithResolvers<void>,
+ *  renameKey: string}>}
+ */
+async function holdReplayBeforeLead1FormSave() {
+    const lead2Write = stepLeadWritesHoldingLead2();
+    mockDate("2026-10-02 09:00:00");
+    const setOffline = mockOffline();
+    await openPipeline();
+    await flushStartupSync();
+    await openLead(1);
+    const plugin = getService(OfflinePlugin);
+    await setOffline(true);
+    const renameKey = queueLead2RenameFirst(plugin);
+    await selectStage(STAGE_QUALIFIED, "Qualified");
+    await contains(".o_form_button_save").click();
+    await goBack();
+    expect.verifyErrors([LEAD_GROUPS_LOAD]);
+    const formSave = queued("crm.lead").find(({ key }) => key !== renameKey);
+    expect(formSave.value.args).toEqual([[1], { stage_id: STAGE_QUALIFIED }]);
+    await setOffline(false);
+    await expect.waitForSteps([LEAD_2_RENAME_STEP]);
+    expect(plugin.syncingORM()).toBe(true);
+    return { plugin, lead2Write, renameKey };
+}
+
+/**
+ * Holds the replay before the queued form save of lead 1
+ * (`holdReplayBeforeLead1FormSave`), then moves the card of lead 1 to C (Won): its
+ * save waits for that form save, and nothing is sent.
+ *
+ * @returns {Promise<{plugin: OfflinePlugin, lead2Write: PromiseWithResolvers<void>,
+ *  renameKey: string}>}
+ */
+async function holdLead1CardMoveInReplay() {
+    const held = await holdReplayBeforeLead1FormSave();
+    await moveLeadCard("Lead 1", STAGE_WON, 2);
+    await animationFrame();
+    expect.verifySteps([]);
+    return held;
+}
+
+test("[Online] card stage move of a lead with nothing queued is sent at once while another lead's card move waits for the replay", async () => {
+    // Offline root load served from the cache: the pipeline groups (back from the form).
+    expect.errors(1);
+    stepRainbowman();
+    const { plugin, lead2Write, renameKey } = await holdLead1CardMoveInReplay();
+
+    // The card of lead 3, which the replay has nothing to send before, moves it to B
+    // (Qualified): its save, and the rainbowman lookup of the move, are sent at once,
+    // although the move of lead 1 still waits for its turn.
+    await moveLeadCard("Lead 3", STAGE_QUALIFIED, 1);
+    expect.verifySteps([
+        `web_save [3] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+        "get_rainbowman_message",
+    ]);
+    expect(MockServer.env["crm.lead"].browse(3)[0].stage_id).toBe(STAGE_QUALIFIED);
+    expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(STAGE_NEW);
+
+    // The move of lead 1 is still sent only after the lead's queued form save, and its
+    // stage, chosen last, is the one the server keeps.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_WON })}`,
+        "get_rainbowman_message",
+    ]);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(STAGE_WON);
+    expect(MockServer.env["crm.lead"].browse(3)[0].stage_id).toBe(STAGE_QUALIFIED);
+    const lead1Card = await revealLeadCard("Lead 1");
+    if (isSmall()) {
+        expect(`${lead1Card} select.o_crm_mobile_lead_stage`).toHaveValue(`${STAGE_WON}`);
+    } else {
+        expect(`.o_kanban_group:eq(2) ${lead1Card}`).toHaveCount(1);
+    }
+    const lead3Card = await revealLeadCard("Lead 3");
+    if (isSmall()) {
+        expect(`${lead3Card} select.o_crm_mobile_lead_stage`).toHaveValue(`${STAGE_QUALIFIED}`);
+    } else {
+        expect(`.o_kanban_group:eq(1) ${lead3Card}`).toHaveCount(1);
+    }
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] card delete of a lead with nothing queued is sent at once and reloads the pipeline while another lead's card move waits for the replay", async () => {
+    // Offline root load served from the cache: the pipeline groups (back from the form).
+    expect.errors(1);
+    stepLeadUnlinks();
+    let groupLoads = 0;
+    onRpc("crm.lead", "web_read_group", () => {
+        groupLoads++;
+    });
+    const { plugin, lead2Write, renameKey } = await holdLead1CardMoveInReplay();
+    const loadsBefore = groupLoads;
+
+    // Deleted from its card menu, lead 3, which the replay has nothing to send before,
+    // is deleted at once: the dialog closes and the pipeline is reloaded, inside the
+    // delete, without waiting for the move of lead 1.
+    await deleteLeadCard("Lead 3");
+    expect.verifySteps(["unlink [3]"]);
+    expect(".modal").toHaveCount(0);
+    expect(".o_kanban_record:contains(Lead 3)").toHaveCount(0);
+    expect(MockServer.env["crm.lead"].search_count([["id", "=", 3]])).toBe(0);
+    expect(groupLoads).toBe(loadsBefore + 1);
+
+    // The move of lead 1 is sent at its turn, after the lead's queued form save, and
+    // the pipeline, loaded again once it is saved, shows it.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_WON })}`,
+    ]);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(groupLoads).toBeGreaterThan(loadsBefore + 1);
+    expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(STAGE_WON);
+    expect(".o_kanban_group:eq(2) .o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(".o_kanban_record:contains(Lead 3)").toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+/** Opens the menu of the card of `name` and confirms its Delete. */
+async function confirmCardDelete(name) {
+    await contains(`.o_kanban_record:contains(${name}) .o_dropdown_kanban .dropdown-toggle`, {
+        visible: false,
+    }).click();
+    await contains(".o-dropdown--menu .dropdown-item:contains(Delete)").click();
+    await contains(".modal-footer .btn-danger").click();
+    await animationFrame();
+}
+
+test.tags("desktop");
+test("[Online] card delete waiting for the replay closes its confirmation and removes the card at once", async () => {
+    // Offline root load served from the cache: the pipeline groups (back from the form).
+    expect.errors(1);
+    stepLeadUnlinks();
+    const { plugin, lead2Write, renameKey } = await holdReplayBeforeLead1FormSave();
+    expect(".o_kanban_group:eq(0) .o_column_title").toHaveText("New\n(3)");
+
+    // Deleted from its card menu, the lead waits for its queued form save, but the
+    // confirmation closes and the card leaves its column at once.
+    await confirmCardDelete("Lead 1");
+    expect(".modal").toHaveCount(0);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveCount(0);
+    expect(".o_kanban_group:eq(0) .o_column_title").toHaveText("New\n(2)");
+    expect.verifySteps([]);
+
+    // The pipeline stays usable meanwhile: the colour of a lead the replay has nothing
+    // to send before is sent at once.
+    await contains(".o_kanban_record:contains(Lead 3) .o_dropdown_kanban .dropdown-toggle", {
+        visible: false,
+    }).click();
+    await contains(".o-dropdown--menu .o_colorlist_item_color_6").click();
+    expect.verifySteps([`web_save [3] ${JSON.stringify({ color: 6 })}`]);
+    expect(".o_kanban_record:contains(Lead 3)").toHaveClass("o_kanban_color_6");
+
+    // The queued form save replays one second later, then the delete is sent: the
+    // lead is deleted, and its card stays away.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+        "unlink [1]",
+    ]);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].search_count([["id", "=", 1]])).toBe(0);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveCount(0);
+    expect(".o_kanban_group:eq(0) .o_column_title").toHaveText("New\n(2)");
+    expect(".o_menu_systray .o_offline_systray .fa-exclamation-circle").toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] card delete waiting for the replay and refused by the server shows the card again and reports the error, nothing parked", async () => {
+    // Offline root load served from the cache (back from the form), then the
+    // framework's error dialog of the refused delete.
+    expect.errors(2);
+    onRpc("crm.lead", "unlink", () => {
+        throw makeServerError({ message: "Deletion refused" });
+    });
+    // Registered after the refusal, so that it runs first: the refused call too.
+    stepLeadUnlinks();
+    const { plugin, lead2Write, renameKey } = await holdReplayBeforeLead1FormSave();
+
+    // Deleted from its card menu, the lead waits for its queued form save; the
+    // confirmation closes and the card leaves its column at once.
+    await confirmCardDelete("Lead 1");
+    expect(".modal").toHaveCount(0);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveCount(0);
+    expect(".o_kanban_group:eq(0) .o_column_title").toHaveText("New\n(2)");
+    expect.verifySteps([]);
+
+    // Sent after the queued form save, the delete is refused: the framework shows its
+    // error, and the card is back in its column, as the server keeps the lead.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+        "unlink [1]",
+    ]);
+    await waitFor(".o_error_dialog");
+    expect(queryFirst(".o_error_dialog").textContent).toInclude("Deletion refused");
+    expect.verifyErrors(["Deletion refused"]);
+    await runAllTimers();
+    await animationFrame();
+    expect(MockServer.env["crm.lead"].search_count([["id", "=", 1]])).toBe(1);
+    expect(".o_kanban_group:eq(1) .o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveCount(1);
+
+    // Nothing is queued or parked: the delete was sent online, and refused.
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(".o_menu_systray .o_offline_systray .fa-exclamation-circle").toHaveCount(0);
+    expect(".o_error_dialog").toHaveCount(1);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] card save made before the replay starts and run once it has started waits for its turn outside the pipeline model's mutex", async () => {
+    // Offline root load served from the cache: the pipeline groups (back from the form).
+    expect.errors(1);
+    const models = [];
+    patchWithCleanup(CrmKanbanModel.prototype, {
+        setup() {
+            super.setup(...arguments);
+            models.push(this);
+        },
+    });
+    const lead2Write = stepLeadWritesHoldingLead2();
+    // The clock is set before the views and the cache are created (see the tests above).
+    mockDate("2026-10-02 09:00:00");
+    const setOffline = mockOffline();
+    await openPipeline();
+    await flushStartupSync();
+    await openLead(1);
+    const plugin = getService(OfflinePlugin);
+
+    // Offline: a write of another lead is queued, then, a minute later, the lead form
+    // saves stage B (Qualified).
+    await setOffline(true);
+    const renameKey = queueLead2RenameFirst(plugin);
+    await selectStage(STAGE_QUALIFIED, "Qualified");
+    await contains(".o_form_button_save").click();
+    await goBack();
+    expect.verifyErrors([LEAD_GROUPS_LOAD]);
+    const model = models.at(-1);
+    const lead1 = model.root.records.find((record) => record.resId === 1);
+    const lead3 = model.root.records.find((record) => record.resId === 3);
+
+    // An action keeps the pipeline model's mutex busy. Colour 5 is given to the card of
+    // lead 1 meanwhile, before any replay: its save runs only once that action is done.
+    const gate = Promise.withResolvers();
+    const busy = model.mutex.exec(() => gate.promise);
+    await microTick();
+    expect(plugin.syncingORM()).toBe(false);
+    const lead1Save = lead1.update({ color: 5 });
+
+    // Reconnected: the replay sends the other lead's write first, and is held there.
+    // The busy action ends, and the colour's save runs: lead 1 has its form save still
+    // to replay, so the save waits for it, without keeping the mutex.
+    await setOffline(false);
+    await expect.waitForSteps([LEAD_2_RENAME_STEP]);
+    gate.resolve();
+    await busy;
+    await animationFrame();
+    expect(model._crmHeldWrites.size).toBe(1);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveClass("o_kanban_color_5");
+    expect.verifySteps([]);
+
+    // The colour of lead 3, which the replay has nothing to send before, is sent at
+    // once, although the save of lead 1 still waits for its turn.
+    const lead3Save = lead3.update({ color: 6 });
+    await animationFrame();
+    expect.verifySteps([`web_save [3] ${JSON.stringify({ color: 6 })}`]);
+    expect(MockServer.env["crm.lead"].browse(3)[0].color).toBe(6);
+    expect(MockServer.env["crm.lead"].browse(1)[0].color).not.toBe(5);
+
+    // The queued form save replays one second later, then the colour of lead 1 is sent.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+        `web_save [1] ${JSON.stringify({ color: 5 })}`,
+    ]);
+    expect(await lead1Save).toBe(true);
+    expect(await lead3Save).toBe(true);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    const [serverLead] = MockServer.env["crm.lead"].browse(1);
+    expect(serverLead.color).toBe(5);
+    expect(serverLead.stage_id).toBe(STAGE_QUALIFIED);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveClass("o_kanban_color_5");
+    expect(".o_kanban_record:contains(Lead 3)").toHaveClass("o_kanban_color_6");
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+// A pipeline load that runs in another action of the model's mutex (the reload a card
+// delete sent at once makes) cannot wait for the card writes held for the replay, and
+// reads the server before they are sent: the root it builds still shows them.
+
+test.tags("desktop");
+test("[Online] card delete waiting for the replay stays removed when another card's delete reloads the pipeline", async () => {
+    // Offline root load served from the cache: the pipeline groups (back from the form).
+    expect.errors(1);
+    stepLeadUnlinks();
+    const { plugin, lead2Write, renameKey } = await holdReplayBeforeLead1FormSave();
+    expect(".o_kanban_group:eq(0) .o_column_title").toHaveText("New\n(3)");
+
+    // Deleted from its card menu, lead 1 waits for its queued form save; its card
+    // leaves its column at once.
+    await confirmCardDelete("Lead 1");
+    expect(".modal").toHaveCount(0);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveCount(0);
+    expect(".o_kanban_group:eq(0) .o_column_title").toHaveText("New\n(2)");
+    expect.verifySteps([]);
+
+    // Lead 3, which the replay has nothing to send before, is deleted at once, and the
+    // pipeline is reloaded inside its delete, from the server, which still holds lead 1:
+    // the card of lead 1 stays away, and its column does not count it.
+    await deleteLeadCard("Lead 3");
+    expect.verifySteps(["unlink [3]"]);
+    expect(plugin.syncingORM()).toBe(true);
+    expect(MockServer.env["crm.lead"].search_count([["id", "=", 1]])).toBe(1);
+    expect(".o_kanban_record:contains(Lead 3)").toHaveCount(0);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveCount(0);
+    expect(".o_kanban_group:eq(0) .o_kanban_record").toHaveCount(1);
+    expect(".o_kanban_group:eq(0) .o_column_title").toHaveText("New\n(1)");
+
+    // The queued form save replays one second later, then the delete of lead 1 is
+    // sent: the lead is deleted, and its card stays away.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+        "unlink [1]",
+    ]);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].search_count([["id", "=", 1]])).toBe(0);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveCount(0);
+    expect(".o_kanban_group:eq(0) .o_column_title").toHaveText("New\n(1)");
+    expect(".o_menu_systray .o_offline_systray .fa-exclamation-circle").toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] card stage move waiting for the replay stays shown when another card's delete reloads the pipeline", async () => {
+    // Offline root load served from the cache: the pipeline groups (back from the form).
+    expect.errors(1);
+    stepLeadUnlinks();
+    stepRainbowman();
+    const models = [];
+    patchWithCleanup(CrmKanbanModel.prototype, {
+        setup() {
+            super.setup(...arguments);
+            models.push(this);
+        },
+    });
+    // The card of lead 1 moves it to C (Won): its save waits for the lead's queued form
+    // save, and the card shows the move at once.
+    const { plugin, lead2Write, renameKey } = await holdLead1CardMoveInReplay();
+    expect(".o_kanban_group:eq(2) .o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(".o_kanban_group:eq(0) .o_column_title").toHaveText("New\n(2)");
+    expect(".o_kanban_group:eq(2) .o_column_title").toHaveText("Won\n(2)");
+
+    // Lead 3, which the replay has nothing to send before, is deleted at once, and the
+    // pipeline is reloaded inside its delete, from the server, where lead 1 is still in
+    // A (New): the card of lead 1 stays in C, with nothing saved or sent for it, and
+    // keeps the mark of its held move.
+    await deleteLeadCard("Lead 3");
+    expect.verifySteps(["unlink [3]"]);
+    expect(plugin.syncingORM()).toBe(true);
+    expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(STAGE_NEW);
+    expect(".o_kanban_record:contains(Lead 3)").toHaveCount(0);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(".o_kanban_group:eq(2) .o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(".o_kanban_group:eq(0) .o_column_title").toHaveText("New\n(1)");
+    expect(".o_kanban_group:eq(2) .o_column_title").toHaveText("Won\n(2)");
+    const model = models.at(-1);
+    const shownLead1 = model.root.records.find((record) => record.resId === 1);
+    expect(shownLead1.data.stage_id.id).toBe(STAGE_WON);
+    expect(shownLead1.dirty).toBe(false);
+    expect(shownLead1.crmTurnWrite?.fieldNames).toEqual(["stage_id"]);
+    expect(model.root.groups[2].records.includes(shownLead1)).toBe(true);
+
+    // The queued form save replays one second later, then the move is sent, followed by
+    // its rainbowman lookup: the server keeps C, and the pipeline, loaded again once the
+    // move is saved, shows lead 1 in C.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_WON })}`,
+        "get_rainbowman_message",
+    ]);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(STAGE_WON);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(".o_kanban_group:eq(2) .o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(".o_kanban_group:eq(0) .o_column_title").toHaveText("New\n(1)");
+    expect(".o_kanban_group:eq(2) .o_column_title").toHaveText("Won\n(2)");
+    const reloadedLead1 = model.root.records.find((record) => record.resId === 1);
+    expect(reloadedLead1).not.toBe(shownLead1);
+    expect(reloadedLead1.data.stage_id.id).toBe(STAGE_WON);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] card stage move waiting for the replay and refused by the server shows the lead's server stage again after another card's delete reloaded the pipeline", async () => {
+    // Offline root load served from the cache (back from the form), then the
+    // framework's error dialog of the refused move.
+    expect.errors(2);
+    onRpc("crm.lead", "web_save", ({ args }) => {
+        if (args[0][0] === 1 && args[1].stage_id === STAGE_WON) {
+            throw makeServerError({ message: "Move refused" });
+        }
+    });
+    // Registered after the refusal, so that they run first: the refused call too.
+    stepLeadUnlinks();
+    const models = [];
+    patchWithCleanup(CrmKanbanModel.prototype, {
+        setup() {
+            super.setup(...arguments);
+            models.push(this);
+        },
+    });
+    const { plugin, lead2Write, renameKey } = await holdLead1CardMoveInReplay();
+
+    // Lead 3 is deleted at once, and the pipeline reloaded inside its delete: the card of
+    // lead 1 stays in C (Won), where its held move puts it.
+    await deleteLeadCard("Lead 3");
+    expect.verifySteps(["unlink [3]"]);
+    expect(".o_kanban_group:eq(2) .o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    const model = models.at(-1);
+    const shownLead1 = model.root.records.find((record) => record.resId === 1);
+
+    // The queued form save replays (B, Qualified), then the move is sent and refused:
+    // the framework shows its error, the record shown since drops the move's mark, and
+    // the pipeline, loaded again, shows the lead in the stage the server keeps.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_WON })}`,
+    ]);
+    await waitFor(".o_error_dialog");
+    expect(queryFirst(".o_error_dialog").textContent).toInclude("Move refused");
+    expect.verifyErrors(["Move refused"]);
+    expect(shownLead1.crmTurnWrite).toBe(undefined);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(STAGE_QUALIFIED);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(".o_kanban_group:eq(1) .o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(".o_kanban_group:eq(2) .o_column_title").toHaveText("Won\n(1)");
+    expect(".o_menu_systray .o_offline_systray .fa-exclamation-circle").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] card stage moves waiting for the replay keep their columns when a column loads more leads", async () => {
+    const lead2Write = stepLeadWritesHoldingLead2();
+    mockDate("2026-10-02 09:00:00");
+    const setOffline = mockOffline();
+    await mountWithCleanup(WebClient);
+    await getService("action").doAction(LIMITED_PIPELINE_ACTION);
+    await flushStartupSync();
+    const plugin = getService(OfflinePlugin);
+    const newColumn = ".o_kanban_group:eq(0)";
+    const qualifiedColumn = ".o_kanban_group:eq(1)";
+    // "New" holds three leads and loaded two of them.
+    expect(`${newColumn} .o_kanban_record`).toHaveCount(2);
+    expect(`${newColumn} .o_kanban_load_more`).toHaveCount(1);
+
+    // Offline: a write of another lead is queued, then, a minute apart, renames of
+    // leads 1 and 4.
+    await setOffline(true);
+    const renameKey = queueLead2RenameFirst(plugin);
+    const lead1RenameKey = queueLeadRename(plugin, 1, "Lead 1 renamed");
+    mockDate(
+        new Date(plugin._ormToSync()[lead1RenameKey].value.extras.timeStamp + 60_000).toISOString()
+    );
+    queueLeadRename(plugin, 4, "Lead 4 renamed");
+
+    // Reconnected: the replay sends the other lead's write first, and is held there.
+    // The cards move lead 1 from A (New) to B (Qualified), and lead 4 from B to A: both
+    // moves wait for the lead's queued rename, the cards showing them at once.
+    await setOffline(false);
+    await expect.waitForSteps([LEAD_2_RENAME_STEP]);
+    await contains(`${newColumn} .o_kanban_record:contains(Lead 1)`).dragAndDrop(qualifiedColumn);
+    await contains(`${qualifiedColumn} .o_kanban_record:contains(Lead 4)`).dragAndDrop(newColumn);
+    await animationFrame();
+    expect.verifySteps([]);
+    expect(`${qualifiedColumn} .o_kanban_record:contains(Lead 1)`).toHaveCount(1);
+    expect(`${newColumn} .o_kanban_record:contains(Lead 4)`).toHaveCount(1);
+    expect(`${newColumn} .o_kanban_load_more`).toHaveCount(1);
+
+    // "New" loads more leads from the server, where lead 1 is still in A and lead 4 in
+    // B: lead 1 stays in B only, and lead 4 stays in A.
+    await contains(`${newColumn} .o_kanban_load_more button`).click();
+    await animationFrame();
+    expect.verifySteps([]);
+    expect(`${newColumn} .o_kanban_record`).toHaveCount(3);
+    for (const name of ["Lead 2", "Lead 3", "Lead 4"]) {
+        expect(`${newColumn} .o_kanban_record:contains(${name})`).toHaveCount(1);
+    }
+    expect(`${newColumn} .o_column_title`).toHaveText("New\n(3)");
+    expect(`${newColumn} .o_kanban_load_more`).toHaveCount(0);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(`${qualifiedColumn} .o_kanban_record:contains(Lead 1)`).toHaveCount(1);
+    expect(`${qualifiedColumn} .o_column_title`).toHaveText("Qualified\n(1)");
+
+    // Each lead's rename replays, then its move is sent: the server keeps the stages
+    // the cards show.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ name: "Lead 1 renamed" })}`,
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+    ]);
+    await runAllTimers();
+    await expect.waitForSteps([
+        `web_save [4] ${JSON.stringify({ name: "Lead 4 renamed" })}`,
+        `web_save [4] ${JSON.stringify({ stage_id: STAGE_NEW })}`,
+    ]);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(STAGE_QUALIFIED);
+    expect(MockServer.env["crm.lead"].browse(4)[0].stage_id).toBe(STAGE_NEW);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(`${qualifiedColumn} .o_kanban_record:contains(Lead 1)`).toHaveCount(1);
+    expect(".o_kanban_record:contains(Lead 4)").toHaveCount(1);
+    expect(`${newColumn} .o_kanban_record:contains(Lead 4)`).toHaveCount(1);
     expect(".modal").toHaveCount(0);
     expect.verifySteps([]);
 });
