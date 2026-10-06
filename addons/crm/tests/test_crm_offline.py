@@ -10,7 +10,7 @@ from unittest.mock import patch
 from lxml import etree
 
 from odoo import fields
-from odoo.exceptions import AccessError
+from odoo.exceptions import AccessError, UserError
 from odoo.tests import HttpCase
 from odoo.tests.common import JsonRpcException, tagged
 from odoo.tools import file_open, mute_logger
@@ -613,6 +613,20 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
             ('res_model', '=', 'crm.lead'), ('res_id', '=', lead.id),
         ])
 
+    def _refused_delivery(self, exception_class, deliver, *args, **kwargs):
+        """ Call ``deliver(*args, **kwargs)`` and assert it raises
+        ``exception_class``. Unlike ``assertRaises``, no savepoint is rolled back
+        on the error, so whatever the delivery changed before being refused
+        stays visible to the assertions that it changed nothing.
+
+        :return: the exception raised
+        """
+        try:
+            deliver(*args, **kwargs)
+        except exception_class as error:
+            return error
+        raise self.failureException(f'The delivery was not refused with {exception_class.__name__}')
+
     def test_offline_activity_create_replay_same_key_creates_once(self):
         """ "Log a call" whose answer was lost (the server created the activity,
         then the connection dropped) is sent again verbatim with the same
@@ -764,44 +778,148 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self.assertEqual(self._log_call(salesman, lead, origin_key, uid=False), own)
         self.assertEqual(self._lead_activities(lead), foreign | own)
 
+    def test_offline_activity_create_replay_access_revoked(self):
+        """ A repeated delivery of a key is answered with its activity only while
+        its creator may still create that activity, its lead included, and read
+        it, as its first delivery required. Once they may not (read revoked, the
+        lead reassigned, then the activity too), it is refused with an
+        ``AccessError``, neither the refusal of a call queued by another user
+        nor of a key registered by another user, through the ORM and the web
+        client's JSON-RPC route alike, and creates and registers nothing. With
+        the access restored, it answers that activity again. """
+        salesman, other = self.user_sales_salesman, self.user_sales_leads
+        lead = self._create_salesman_opportunity('Revoked Access Activity Lead')
+        key = secrets.token_hex(16)
+        first = self._log_call(salesman, lead, key)
+        xmlid = self._quick_create_xmlids(key)
+        self.assertEqual(xmlid.res_id, first.id)
+
+        def caller_access(operation):
+            # as a request of its own sees it: no field or access value cached earlier
+            self.env.invalidate_all()
+            self.env.transaction.invalidate_access_cache()
+            return first.with_user(salesman).has_access(operation)
+
+        def assert_redelivery_refused():
+            error = self._refused_delivery(AccessError, self._log_call, salesman, lead, key)
+            self.assertNotIsInstance(error, CrmOfflineOriginError)
+            self.assertNotEqual(error.args[0], 'This activity was already created by another user.')
+            self.assertEqual(self._lead_activities(lead), first)
+            self.assertEqual(self._quick_create_xmlids(key), xmlid)
+            self.assertEqual(xmlid.res_id, first.id)
+
+        # read revoked on that activity (an administrator's restriction), its lead still the caller's
+        restriction = self.env['ir.access'].create({
+            'name': 'Delivered activity hidden',
+            'model_id': self.env['ir.model']._get_id('mail.activity'),
+            'operation': 'r',
+            'domain': f"[('id', '!=', {first.id})]",
+        })
+        self.assertEqual((caller_access('create'), caller_access('read')), (True, False))
+        assert_redelivery_refused()
+        restriction.unlink()
+        self.assertEqual((caller_access('create'), caller_access('read')), (True, True))
+        self.assertEqual(self._log_call(salesman, lead, key), first)
+
+        # the lead reassigned: its activities can no longer be created by the
+        # caller, who still reads the activity assigned to them
+        lead.user_id = other
+        self.assertEqual(first.user_id, salesman)
+        self.assertEqual((caller_access('create'), caller_access('read')), (False, True))
+        assert_redelivery_refused()
+
+        # the activity reassigned too: the caller may neither create nor read it
+        first.with_env(self.env).user_id = other
+        self.assertEqual((caller_access('create'), caller_access('read')), (False, False))
+        assert_redelivery_refused()
+
+        # the web client's JSON-RPC route: refused, the activity's id is not answered
+        self.authenticate(salesman.login, salesman.login)
+        call = {
+            'model': 'mail.activity',
+            'method': 'create',
+            'args': [[self._activity_call_vals(salesman, lead)]],
+            'kwargs': {'context': {'uid': salesman.id, 'crm_offline_uid': salesman.id, 'crm_offline_create_key': key}},
+        }
+        with self.assertRaises(JsonRpcException) as refused, mute_logger('odoo.http'):
+            self.make_jsonrpc_request('/web/dataset/call_kw/mail.activity/create', call)
+        # the JSON-RPC error's data.name
+        self.assertEqual(refused.exception.args[0], 'odoo.exceptions.AccessError')
+        self.assertEqual(self._lead_activities(lead), first)
+        self.assertEqual(self._quick_create_xmlids(key), xmlid)
+
+        # the lead given back: the caller may create its activities and read them
+        # through it, so the delivery answers the activity again, creating nothing
+        lead.user_id = salesman
+        self.assertEqual((caller_access('create'), caller_access('read')), (True, True))
+        self.assertEqual(self._log_call(salesman, lead, key), first)
+        self.assertEqual(self.make_jsonrpc_request('/web/dataset/call_kw/mail.activity/create', call), [first.id])
+        self.assertEqual(self._lead_activities(lead), first)
+        self.assertEqual(self._quick_create_xmlids(key), xmlid)
+        self.assertEqual(xmlid.res_id, first.id)
+
     def test_offline_activity_create_replay_invalid_key(self):
-        """ Without a well-formed delivery key, or for a create of several values
-        (a key names one scheduled activity), an activity create is a plain
-        create: every delivery creates its activities, and no external
-        identifier is registered. """
+        """ A delivery key names one scheduled activity. A supplied key that is
+        not 32 lowercase hexadecimal digits, or a valid key sent with the values
+        of no or several activities, is refused with a ``UserError`` at every
+        delivery, before anything is created or registered: repeated, it
+        duplicates nothing. Without a key (no context key, or one left unset:
+        ``None`` or ``False``), an activity create is a plain create: every
+        delivery creates its activity, and no external identifier is
+        registered. """
         salesman = self.user_sales_salesman
         lead = self._create_salesman_opportunity('Unkeyed Activity Lead')
+        registered = self.env['ir.model.data'].search([('module', '=', '__crm_offline__')])
         # fixed, with letters, so that its upper-case variant is not a valid key
         hex_key = '0123456789abcdef' * 2
         invalid_keys = [
             hex_key.upper(), hex_key[:-1], hex_key + '0', f'{hex_key[:-1]}g', f' {hex_key}',
-            f'{hex_key}\n', int(hex_key, 16), False, None,
+            f'{hex_key}\n', int(hex_key, 16), '',
         ]
         for key in invalid_keys:
             with self.subTest(key=key):
                 for _delivery in range(2):
+                    refused = self._refused_delivery(UserError, self._log_call, salesman, lead, key)
+                    self.assertEqual(
+                        refused.args[0],
+                        'This activity was not created: its delivery key is not 32 lowercase hexadecimal digits.',
+                    )
+                self.assertFalse(self._lead_activities(lead))
+        self.assertEqual(self.env['ir.model.data'].search([('module', '=', '__crm_offline__')]), registered)
+        self.assertFalse(self.env['ir.model.data'].search([('module', '=', '__crm_offline__'), ('name', 'ilike', hex_key[:-1])]))
+
+        # without a key: a context key left unset, or none
+        for key in (None, False):
+            with self.subTest(key=key):
+                for _delivery in range(2):
                     self._log_call(salesman, lead, key)
-        # without the context key
         for _delivery in range(2):
             self.env['mail.activity'].with_user(salesman).create([self._activity_call_vals(salesman, lead)])
         activities = self._lead_activities(lead)
-        self.assertEqual(len(activities), 2 * len(invalid_keys) + 2)
+        self.assertEqual(len(activities), 6)
         self.assertEqual(set(activities.mapped('summary')), {'Call'})
+        self.assertEqual(activities.sudo().res_model_id.mapped('model'), ['crm.lead'])
         self.assertFalse(self.env['ir.model.data'].search([('model', '=', 'mail.activity'), ('res_id', 'in', activities.ids)]))
-        self.assertFalse(self.env['ir.model.data'].search([('module', '=', '__crm_offline__'), ('name', 'ilike', hex_key[:-1])]))
+        self.assertEqual(self.env['ir.model.data'].search([('module', '=', '__crm_offline__')]), registered)
 
-        # a valid key sent with several values selects no delivery
+        # a valid key sent with the values of several activities, or of none
         batch_key = secrets.token_hex(16)
-        for _delivery in range(2):
-            batch = self.env['mail.activity'].with_user(salesman).with_context(crm_offline_create_key=batch_key).create([
-                self._activity_call_vals(salesman, lead, 'Batch Call'),
-                self._activity_call_vals(salesman, lead, 'Batch Follow-up'),
-            ])
-            self.assertEqual(batch.mapped('summary'), ['Batch Call', 'Batch Follow-up'])
-            self.assertEqual(batch.sudo().res_model_id.mapped('model'), ['crm.lead'])
-        batches = self._lead_activities(lead) - activities
-        self.assertEqual(len(batches), 4)
+        Activity = self.env['mail.activity'].with_user(salesman).with_context(crm_offline_create_key=batch_key)
+        batch = [
+            self._activity_call_vals(salesman, lead, 'Batch Call'),
+            self._activity_call_vals(salesman, lead, 'Batch Follow-up'),
+        ]
+        for vals_list in (batch, []):
+            with self.subTest(values=len(vals_list)):
+                for _delivery in range(2):
+                    refused = self._refused_delivery(UserError, Activity.create, copy.deepcopy(vals_list))
+                    self.assertEqual(
+                        refused.args[0],
+                        'These activities were not created: a delivery key is sent with the values of exactly one activity.',
+                    )
+        self.assertEqual(self._lead_activities(lead), activities)
         self.assertFalse(self._quick_create_xmlids(batch_key))
+        self.assertEqual(self.env['ir.model.data'].search([('module', '=', '__crm_offline__')]), registered)
 
     def test_offline_activity_create_replay_concurrent_delivery(self):
         """ A delivery whose lookup does not see the key a concurrent delivery

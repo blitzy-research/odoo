@@ -1,3 +1,4 @@
+import { ConnectionLostError, rpcBus } from "@web/core/network/rpc";
 import { registry } from "@web/core/registry";
 import { stepUtils } from "@web_tour/tour_utils";
 
@@ -44,12 +45,60 @@ function isConnectionLostLog(value) {
 }
 
 /**
+ * Ids (`data.id`) of the RPCs sent and not yet answered, tracked from the tour's
+ * first step until the connection is cut. The offline plugin takes its status
+ * from the latest `RPC:RESPONSE`: a request sent before the cut and answered
+ * after the plugin's failing offline check would set it back online.
+ */
+const rpcsInFlight = new Set();
+
+/** @param {CustomEvent} ev `RPC:REQUEST` */
+function onRpcRequest({ detail }) {
+    rpcsInFlight.add(detail.data.id);
+}
+
+/** @param {CustomEvent} ev `RPC:RESPONSE` */
+function onRpcResponse({ detail }) {
+    rpcsInFlight.delete(detail.data.id);
+}
+
+/**
+ * Starts tracking the RPCs in flight; `goOffline` stops it at the cut.
+ */
+function trackRpcsInFlight() {
+    rpcsInFlight.clear();
+    rpcBus.addEventListener("RPC:REQUEST", onRpcRequest);
+    rpcBus.addEventListener("RPC:RESPONSE", onRpcResponse);
+}
+
+/**
+ * While the connection is cut, checks it again after any response other than a
+ * lost connection: the answer to a request sent before tracking started, or an
+ * abort, sets the offline plugin online, and the check's failing ping sets it
+ * offline again. Deferred, so it runs after the plugin's own listener; skipped
+ * once `goOnline` has restored the connection.
+ *
+ * @param {CustomEvent} ev `RPC:RESPONSE`
+ */
+function recheckWhileCut({ detail }) {
+    if (!(detail.error instanceof ConnectionLostError)) {
+        setTimeout(() => {
+            if (window.__crmMobileOfflineTourSend) {
+                window.dispatchEvent(new Event("offline"));
+            }
+        });
+    }
+}
+
+/**
  * Cuts the connection: every later XMLHttpRequest fails with an asynchronous
- * `error` event, as a real network failure does. The window `offline` event makes
- * the offline plugin check the connection at once, instead of waiting for the
- * next request. HttpCase filters `ConnectionLostError` logs only after the tour
- * has ended, so until the queue-empty checkpoint the tour redirects only those
- * logs to `console.info`.
+ * `error` event, as a real network failure does. Once every request sent before
+ * the cut is answered, the window `offline` event makes the offline plugin check
+ * the connection at once, instead of waiting for the next request, so the failing
+ * ping is the last response it handles; until `goOnline`, any other response
+ * than a lost connection makes it check again (`recheckWhileCut`). HttpCase
+ * filters `ConnectionLostError` logs only after the tour has ended, so until the
+ * queue-empty checkpoint the tour redirects only those logs to `console.info`.
  *
  * @returns {Object} tour step
  */
@@ -57,7 +106,7 @@ function goOffline() {
     return {
         content: "Go offline: every request now fails like a lost network",
         trigger: ".o_crm_mobile_pipeline_header",
-        run() {
+        async run() {
             if (!window.__crmMobileOfflineTourSend) {
                 window.__crmMobileOfflineTourSend = XMLHttpRequest.prototype.send;
             }
@@ -75,16 +124,29 @@ function goOffline() {
             XMLHttpRequest.prototype.send = function () {
                 setTimeout(() => this.dispatchEvent(new Event("error")));
             };
+            rpcBus.removeEventListener("RPC:REQUEST", onRpcRequest);
+            await new Promise((resolve) => {
+                const resolveWhenAnswered = () => {
+                    if (!rpcsInFlight.size) {
+                        rpcBus.removeEventListener("RPC:RESPONSE", resolveWhenAnswered);
+                        rpcBus.removeEventListener("RPC:RESPONSE", onRpcResponse);
+                        resolve();
+                    }
+                };
+                rpcBus.addEventListener("RPC:RESPONSE", resolveWhenAnswered);
+                resolveWhenAnswered();
+            });
+            rpcBus.addEventListener("RPC:RESPONSE", recheckWhileCut);
             window.dispatchEvent(new Event("offline"));
         },
     };
 }
 
 /**
- * Restores the connection, then clicks the offline systray, whose click checks
- * the connection and so starts the replay. The plugin's own periodic ping may
- * reconnect first; the systray then stays while the queue replays, so it is
- * clicked only if still present.
+ * Ends the connection re-checks of `goOffline`, restores the connection, then
+ * clicks the offline systray, whose click checks the connection and so starts the
+ * replay. The plugin's own periodic ping may reconnect first; the systray then
+ * stays while the queue replays, so it is clicked only if still present.
  *
  * @returns {Object} tour step
  */
@@ -93,6 +155,7 @@ function goOnline() {
         content: "Go back online and check the connection from the offline systray",
         trigger: ".o_offline_systray",
         async run({ queryFirst, click }) {
+            rpcBus.removeEventListener("RPC:RESPONSE", recheckWhileCut);
             XMLHttpRequest.prototype.send = window.__crmMobileOfflineTourSend;
             delete window.__crmMobileOfflineTourSend;
             const el = queryFirst(".o_offline_systray");
@@ -148,8 +211,10 @@ registry.category("web_tour.tours").add("crm_mobile_offline", {
         {
             // toggleHomeMenu's first step is active only once the navbar toggle
             // exists, so it must be rendered before the steps below are reached.
+            // From here on, goOffline() knows which requests are still in flight.
             content: "Wait for the web client navbar",
             trigger: ".o_main_navbar .o_menu_toggle",
+            run: trackRpcsInFlight,
         },
         ...stepUtils
             .toggleHomeMenu()

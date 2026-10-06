@@ -2,7 +2,7 @@
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
 from odoo import api, models
-from odoo.exceptions import AccessError, ConcurrencyError
+from odoo.exceptions import AccessError, ConcurrencyError, UserError
 from odoo.tools import SQL
 
 from .crm_lead import (
@@ -36,28 +36,43 @@ class MailActivity(models.Model):
         queued one alike, a delivery key of 32 lowercase hexadecimal digits in the
         ``CRM_OFFLINE_CREATE_KEY`` context key, the same for every delivery of one scheduled
         activity, as the mobile quick create does for its leads (``crm.lead`` ``web_save``). The
-        first delivery of a single-value create creates the activity and registers the key as its
-        external identifier ``__crm_offline__.<key>``: an ``ir.model.data`` row, so the activity
-        model gains no field. A later delivery of that key by the activity's creator creates
-        nothing and answers with that activity, done (archived) or not; a key registered by
-        another user, or for another model, is refused. Of two concurrent deliveries of one key,
-        only the first registers it: the later one's registration fails with a serialization
-        failure, so the RPC layer rolls that delivery back with the activity it created and
-        retries it, and the retry answers with the activity the first one created.
+        first delivery of a key creates the activity and registers the key as its external
+        identifier ``__crm_offline__.<key>``: an ``ir.model.data`` row, so the activity model gains
+        no field. A later delivery of that key by the activity's creator creates nothing and
+        answers with that activity, done (archived) or not; a key registered by another user, or
+        for another model, is refused. Of two concurrent deliveries of one key, only the first
+        registers it: the later one's registration fails with a serialization failure, so the RPC
+        layer rolls that delivery back with the activity it created and retries it, and the retry
+        answers with the activity the first one created.
 
-        A keyed create whose context ``uid`` (sent by the web client with every call, its queued
-        ones included) names another user than the caller is refused (``CrmOfflineOriginError``)
-        before anything is looked up, created or registered. Everything runs under the caller's
-        rights except the ``ir.model.data`` lookup and registration, made as superuser on that
-        fixed module with a validated key. Deleting an activity deletes its external identifiers
-        (base ``unlink``), so a delivery after the deletion creates it again. Creates without a
-        valid key, or of several values (a key names one activity), keep the base behaviour. """
+        A key names one activity: a create whose context key holds anything but 32 lowercase
+        hexadecimal digits, or a keyed create of no or several values, is refused (``UserError``)
+        before anything is looked up, created or registered, so that no repeated delivery of it
+        duplicates its activities. A keyed create whose context ``uid`` (sent by the web client
+        with every call, its queued ones included) names another user than the caller is refused
+        (``CrmOfflineOriginError``) before anything is looked up, created or registered too.
+
+        Activity creation and the returned activity use the caller's environment: a later delivery
+        is answered only once the caller's current rights to create that activity, on its lead
+        included, and to read it are checked, as the first delivery's create checked them, and is
+        refused (``AccessError``) otherwise. Privileged access is limited to the ``ir.model.data``
+        lookup and registration of the key, on that fixed module with a validated key, to the
+        existence and creator check of the activity the key names, and to the cached
+        ``ir.model._get`` lookup; a matching creator elevates nothing. Deleting an activity deletes
+        its external identifiers (base ``unlink``), so a delivery after the deletion creates it
+        again. Creates without a key (none in the context, or one left unset: ``None`` or
+        ``False``) keep the base behaviour. """
         self.env['crm.lead']._check_offline_queue_origin()
         key = self.env.context.get(CRM_OFFLINE_CREATE_KEY)
-        keyed = len(vals_list) == 1 and isinstance(key, str) and bool(CRM_OFFLINE_CREATE_KEY_RE.fullmatch(key))
+        # a context value left unset (missing, null or false) sends no key
+        keyed = key is not None and key is not False
         activities = self
         data = None
         if keyed:
+            if not isinstance(key, str) or not CRM_OFFLINE_CREATE_KEY_RE.fullmatch(key):
+                raise UserError(self.env._("This activity was not created: its delivery key is not 32 lowercase hexadecimal digits."))
+            if len(vals_list) != 1:
+                raise UserError(self.env._("These activities were not created: a delivery key is sent with the values of exactly one activity."))
             origin_uid = self.env.context.get('uid')
             if isinstance(origin_uid, int) and not isinstance(origin_uid, bool) and origin_uid != self.env.uid:
                 raise CrmOfflineOriginError(self.env._("This offline change was sent in another user's session and was not applied."))
@@ -71,7 +86,12 @@ class MailActivity(models.Model):
                 if delivered is None or (delivered and delivered.create_uid.id != self.env.uid):
                     raise AccessError(self.env._("This activity was already created by another user."))
                 if delivered:
-                    return activities.browse(delivered.id)
+                    # answered as its create would be: only while the caller may
+                    # still create it (its lead included) and read it
+                    delivered = activities.browse(delivered.id)
+                    delivered.check_access('create')
+                    delivered.check_access('read')
+                    return delivered
 
         crm_lead_model_id = False
         for vals in vals_list:
