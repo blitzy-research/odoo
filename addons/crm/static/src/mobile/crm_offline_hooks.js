@@ -3191,7 +3191,9 @@ patch(ViewButton.prototype, {
      * `pe-none` and the CRM guard marker `o_crm_offline_guarded`. The framework rule
      * `.o_disabled_offline { pointer-events: auto !important }` cancels `pe-none`;
      * the marker scopes the CRM rule (`crm_mobile_pipeline.scss`) that keeps guarded
-     * links out of hit-testing, so hover and clicks pass to the element beneath.
+     * links out of hit-testing, so hover and clicks pass to the element beneath. A
+     * kanban card treats a click passing through such a link as the click on the link
+     * (`KanbanRecord.onGlobalClick` patch), so the card does not open either.
      * Unguarded buttons keep the original class list.
      */
     getClassName() {
@@ -4138,6 +4140,34 @@ function isCrmLeadFormUnavailableOffline(card) {
     );
 }
 
+/**
+ * Whether a viewport point lies on a guarded CRM view-button link inside `root`
+ * (`a.o_crm_offline_guarded.o_disabled_offline`, the links the CRM rule in
+ * `crm_mobile_pipeline.scss` keeps out of hit-testing) or on one of its descendants,
+ * whose boxes can overflow an inline link's own (an inline-block badge) and inherit
+ * its `pointer-events`. A click there passes through the link to the card beneath.
+ *
+ * @param {HTMLElement|null} root
+ * @param {number} x client X coordinate
+ * @param {number} y client Y coordinate
+ * @returns {boolean}
+ */
+function isPointOnCrmOfflineGuardedLink(root, x, y) {
+    if (!root || !Number.isFinite(x) || !Number.isFinite(y)) {
+        return false;
+    }
+    for (const link of root.querySelectorAll("a.o_crm_offline_guarded.o_disabled_offline")) {
+        for (const el of [link, ...link.querySelectorAll("*")]) {
+            for (const rect of el.getClientRects()) {
+                if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 patch(KanbanRecord.prototype, {
     /**
      * Whether the card-menu toggle carries `data-available-offline` (`web.KanbanMenu`
@@ -4229,6 +4259,29 @@ patch(KanbanRecord.prototype, {
             return;
         }
         return super.triggerAction(...arguments);
+    },
+
+    /**
+     * Offline, a click passing through a guarded CRM view-button link of the card
+     * (`isPointOnCrmOfflineGuardedLink`), such as the campaign lead counter, is the
+     * click on that link: as the framework does for a click on any `<a>`
+     * (`CANCEL_GLOBAL_CLICK`), the card neither opens its record or action nor toggles
+     * its selection, so the click is as inert as the guarded link. Scope tested first;
+     * online, on other models and elsewhere on the card the framework's click runs.
+     *
+     * @param {MouseEvent} ev
+     * @param {boolean} newWindow
+     */
+    onGlobalClick(ev, newWindow) {
+        const { resModel } = this.props.record;
+        if (
+            (CRM_VIEW_BUTTON_MODELS.has(resModel) || resModel === "utm.campaign") &&
+            this.offlinePlugin.isOffline() &&
+            isPointOnCrmOfflineGuardedLink(this.rootRef(), ev?.clientX, ev?.clientY)
+        ) {
+            return;
+        }
+        return super.onGlobalClick(...arguments);
     },
 });
 

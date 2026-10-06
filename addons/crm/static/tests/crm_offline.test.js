@@ -11157,11 +11157,12 @@ async function callTagColorHandlers(tagField, tagEl) {
 const LEAD_FORM_TAG = ".o_form_view .o_field_widget[name=tag_ids] .o_tag:contains(Hot)";
 
 test("[Offline] campaign and tag-colour controls inert", async () => {
-    // Lost loads of the campaign card clicked offline through its lead counter.
-    expect.errors(2);
     const tagFields = captureLeadTagFields();
     const setOffline = mockOffline();
     stepRoutes((route) => route.includes("/crm.tag/") || route.startsWith("/web/dataset/call_button/"));
+    // Every `utm.campaign` request, stepped while the campaign kanban is offline.
+    const campaignRoutes = stepRoutes((route) => route.includes("/utm.campaign/"));
+    campaignRoutes.active = false;
     await mountWithCleanup(WebClient);
     await getService("action").doAction(CAMPAIGN_ACTION.id);
     await flushStartupSync();
@@ -11172,20 +11173,19 @@ test("[Offline] campaign and tag-colour controls inert", async () => {
     // Campaign kanban lead counter.
     expectUnguarded(counter, 1);
     await setOffline(true);
+    campaignRoutes.active = true;
     expectGuarded(counter, 1);
-    // The counter is out of hit-testing, so a pointer click on it reaches its card,
-    // which the framework opens as it does on any other click of the card. The form
-    // was never visited, so its load and the reload of the kanban it falls back to are
-    // lost requests; the counter's own action is not issued.
+    // The counter is out of hit-testing, so a pointer on it reaches its card, which
+    // takes that click as the counter's own: the campaign does not open, no campaign
+    // load is attempted and the counter's action is not issued.
+    await expectPointerPassesThrough(counter);
     await activateByPointerAndKeyboard(counter);
     await callButton({ resModel: "utm.campaign", name: "action_redirect_to_leads_opportunities", resId: 1 });
     await settle();
     expect(currentView()).toBe("utm.utm_campaign_action/kanban");
+    expect(".o_form_view").toHaveCount(0);
     expect.verifySteps([]);
-    expect.verifyErrors([
-        "/web/dataset/call_kw/utm.campaign/web_read",
-        "/web/dataset/call_kw/utm.campaign/web_search_read",
-    ]);
+    campaignRoutes.active = false;
 
     // Campaign form lead counter, the form being opened online.
     await setOffline(false);

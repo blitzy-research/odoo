@@ -282,8 +282,11 @@ a.o_quick_assign.o_disabled_offline.pe-none {
 // `crm_offline_hooks.js`), such as the lead form's AI-probability switch, the Sales
 // Teams dashboard links and the campaign lead counter: they would still take hover
 // and clicks. They keep the framework's dimmed, not-allowed state and are kept out of
-// hit-testing. Guarded `<button>`s are `disabled` and keep the framework's pointer
-// events, like every button the framework disables offline.
+// hit-testing. A kanban card treats a click passing through a guarded link as the
+// click on the link (`KanbanRecord.onGlobalClick` patch in `crm_offline_hooks.js`), so
+// the campaign card does not open through its lead counter. Guarded `<button>`s are
+// `disabled` and keep the framework's pointer events, like every button the
+// framework disables offline.
 a.o_crm_offline_guarded.o_disabled_offline {
     pointer-events: none !important;
 }
