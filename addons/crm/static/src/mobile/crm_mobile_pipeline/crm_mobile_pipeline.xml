@@ -398,16 +398,18 @@
 
     <!--
         Command palette results of the same menus (crmOfflineCommandDisabled,
-        crm_offline_hooks.js) are dimmed and aria-disabled offline, and their "new tab"
-        hint is hidden, as Ctrl+Enter opens nothing. Online, and for every other
-        command, the link keeps the framework's class, aria-disabled is absent and the
-        hint is the framework's.
+        crm_offline_hooks.js) are dimmed and aria-disabled offline, their link carries
+        no href, so a middle click or "open in new tab" opens nothing, and their
+        "new tab" hint is hidden, as Ctrl+Enter opens nothing. Online, and for every
+        other command, the link keeps the framework's class and href, aria-disabled is
+        absent and the hint is the framework's.
     -->
     <t t-inherit="web.CommandPalette" t-inherit-mode="extension">
         <xpath expr="//div[hasclass('o_command')]" position="attributes">
             <attribute name="t-att-aria-disabled">this.crmOfflineCommandDisabled(command) ? 'true' : false</attribute>
         </xpath>
         <xpath expr="//div[hasclass('o_command')]/a" position="attributes">
+            <attribute name="t-att-href">this.crmOfflineCommandHref(command)</attribute>
             <attribute name="t-att-class">this.crmOfflineCommandClass(command)</attribute>
         </xpath>
         <xpath expr="//small[hasclass('o_command_focus')]" position="attributes">

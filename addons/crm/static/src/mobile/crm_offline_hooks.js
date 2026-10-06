@@ -2886,7 +2886,7 @@ patch(NavBar.prototype, {
      * @returns {Object}
      */
     crmOfflineMenuAttrs(menu, attrs) {
-        if (this.offlinePlugin.isOffline() && CRM_OFFLINE_DISABLED_MENUS.has(menu?.xmlid)) {
+        if (CRM_OFFLINE_DISABLED_MENUS.has(menu?.xmlid) && this.offlinePlugin.isOffline()) {
             return { ...attrs, "aria-disabled": "true" };
         }
         return attrs;
@@ -2914,42 +2914,54 @@ patch(NavBar.prototype, {
 // -----------------------------------------------------------------------------
 
 /**
- * Identifies a command of the palette's menu provider (`menu_providers.js`) by what
- * the provider gives it: its category (`apps` or `menu_items`), its name (an app's
- * label, a menu item's path and label) and its `href`, both taken from
- * `computeAppsAndMenuItems`.
+ * `disabledMenuCommands` indexes, by the root menu they were computed from.
  *
- * @param {string} category
- * @param {string} name
- * @param {string} href
- * @returns {string}
+ * @type {WeakMap<Object, Map<string, { category: string, name: string, xmlid: string }[]>>}
  */
-function menuCommandKey(category, name, href) {
-    return JSON.stringify([category, name, href]);
-}
+const disabledMenuCommandIndexes = new WeakMap();
 
 /**
- * The `xmlid` of each `CRM_OFFLINE_DISABLED_MENUS` menu the menu provider lists, by
- * the `menuCommandKey` of its command.
+ * The commands the palette's menu provider (`menu_providers.js`) lists for the
+ * `CRM_OFFLINE_DISABLED_MENUS` menus, by `href`, each with its category (`apps` or
+ * `menu_items`), its name (an app's label, a menu item's path and label) and its
+ * menu's `xmlid`, all taken from `computeAppsAndMenuItems` as the provider does.
+ * Several menus may open the same action, so one `href` can hold several commands.
+ *
+ * The menu service returns the same root menu until its menus are replaced (a
+ * reload, or fetched menus differing from the stored ones), so the index is computed
+ * once per root menu.
  *
  * @param {Object} menuService
- * @returns {Map<string, string>}
+ * @returns {Map<string, { category: string, name: string, xmlid: string }[]>}
  */
-function disabledMenuCommandKeys(menuService) {
-    const { apps, menuItems } = computeAppsAndMenuItems(menuService.getMenuAsTree("root"));
-    const keys = new Map();
+function disabledMenuCommands(menuService) {
+    const root = menuService.getMenuAsTree("root");
+    let index = disabledMenuCommandIndexes.get(root);
+    if (index) {
+        return index;
+    }
+    index = new Map();
+    const add = (href, category, name, xmlid) => {
+        const commands = index.get(href);
+        if (commands) {
+            commands.push({ category, name, xmlid });
+        } else {
+            index.set(href, [{ category, name, xmlid }]);
+        }
+    };
+    const { apps, menuItems } = computeAppsAndMenuItems(root);
     for (const app of apps) {
         if (CRM_OFFLINE_DISABLED_MENUS.has(app.xmlid)) {
-            keys.set(menuCommandKey("apps", app.label, app.href), app.xmlid);
+            add(app.href, "apps", app.label, app.xmlid);
         }
     }
     for (const item of menuItems) {
         if (CRM_OFFLINE_DISABLED_MENUS.has(item.xmlid)) {
-            const name = `${item.parents} / ${item.label}`;
-            keys.set(menuCommandKey("menu_items", name, item.href), item.xmlid);
+            add(item.href, "menu_items", `${item.parents} / ${item.label}`, item.xmlid);
         }
     }
-    return keys;
+    disabledMenuCommandIndexes.set(root, index);
+    return index;
 }
 
 /**
@@ -2963,13 +2975,20 @@ patch(registry.category("command_provider").get("menu"), {
         // Resolved before the first `await`: the palette's scope ends there.
         const menuService = useService("menu");
         const commands = await super.provide(...arguments);
-        const keys = disabledMenuCommandKeys(menuService);
-        if (keys.size) {
-            for (const command of commands) {
-                const xmlid = keys.get(menuCommandKey(command.category, command.name, command.href));
-                if (xmlid) {
-                    command.crmOfflineMenu = xmlid;
-                }
+        if (!commands.length) {
+            return commands;
+        }
+        const index = disabledMenuCommands(menuService);
+        if (!index.size) {
+            return commands;
+        }
+        for (const command of commands) {
+            const { category, href, name } = command;
+            const match = index
+                .get(href)
+                ?.find((entry) => entry.category === category && entry.name === name);
+            if (match) {
+                command.crmOfflineMenu = match.xmlid;
             }
         }
         return commands;
@@ -2978,10 +2997,12 @@ patch(registry.category("command_provider").get("menu"), {
 
 /**
  * Offline, a tagged command (`crmOfflineMenu`) renders dimmed and `aria-disabled`,
- * without the "new tab" hint (`web.CommandPalette` extension), and selecting it by
- * click, Enter, Ctrl+Enter or its item's `executeCommand` does nothing: the palette
- * stays open, no action runs, no tab opens and no request is issued. Online, and for
- * every other command, the framework's markup and behaviour are kept.
+ * without the "new tab" hint, and its link carries no `href`, so a middle click or
+ * the browser's "open in new tab" opens nothing (`web.CommandPalette` extension).
+ * Selecting it by click, Enter, Ctrl+Enter or its item's `executeCommand` does
+ * nothing: the palette stays open, no action runs, no tab opens and no request is
+ * issued. Online, and for every other command, the framework's markup and behaviour
+ * are kept.
  */
 patch(CommandPalette.prototype, {
     setup() {
@@ -2990,15 +3011,17 @@ patch(CommandPalette.prototype, {
     },
 
     /**
-     * Read during render, so an open palette follows the connection.
+     * Read during render, so an open palette follows the connection. The signal is
+     * read only for a tagged command, so a palette listing none is not rendered
+     * again when the connection changes.
      *
      * @param {Object} [command]
      * @returns {boolean}
      */
     crmOfflineCommandDisabled(command) {
         return (
-            this.crmOfflinePlugin.isOffline() &&
-            CRM_OFFLINE_DISABLED_MENUS.has(command?.crmOfflineMenu)
+            CRM_OFFLINE_DISABLED_MENUS.has(command?.crmOfflineMenu) &&
+            this.crmOfflinePlugin.isOffline()
         );
     },
 
@@ -3007,13 +3030,28 @@ patch(CommandPalette.prototype, {
      * `o_disabled_offline` added while `crmOfflineCommandDisabled` holds.
      *
      * @param {Object} command
-     * @returns {string|Object}
+     * @returns {string|Object|undefined}
      */
     crmOfflineCommandClass(command) {
         if (this.crmOfflineCommandDisabled(command)) {
             return mergeClasses(command.className, "o_disabled_offline");
         }
         return command.className;
+    },
+
+    /**
+     * The `href` of a command's link: none while `crmOfflineCommandDisabled` holds,
+     * so the browser has no link to follow (`false` removes the attribute), the
+     * framework's `href` otherwise.
+     *
+     * @param {Object} command
+     * @returns {string|false|undefined}
+     */
+    crmOfflineCommandHref(command) {
+        if (this.crmOfflineCommandDisabled(command)) {
+            return false;
+        }
+        return command.href;
     },
 
     executeCommand(command) {
@@ -3023,12 +3061,39 @@ patch(CommandPalette.prototype, {
         return super.executeCommand(...arguments);
     },
 
-    async executeSelectedCommand() {
-        await this.searchValuePromise;
-        if (this.crmOfflineCommandDisabled(this.state.selectedCommand)) {
-            return;
+    /**
+     * Enter goes to the framework's method unchanged: its one wait for the search,
+     * then `executeCommand` on the selected command, which the guard above checks at
+     * the call. Ctrl+Enter goes to `crmOfflineOpenSelectedCommand`, as the
+     * framework's new-tab branch calls `window.open` directly, through no method a
+     * patch could guard after its wait.
+     *
+     * @param {boolean} [ctrlKey]
+     * @returns {Promise<void>}
+     */
+    executeSelectedCommand(ctrlKey) {
+        if (!ctrlKey) {
+            return super.executeSelectedCommand(...arguments);
         }
-        return super.executeSelectedCommand(...arguments);
+        return this.crmOfflineOpenSelectedCommand();
+    },
+
+    /**
+     * The framework's Ctrl+Enter branch, with the same single wait for the search:
+     * the command selected once it settles opens its `href` in a new tab. The guard
+     * is checked in that same continuation, right before `window.open`, so a
+     * disconnection or a new selection during the wait is seen. Offline, a command
+     * of a `CRM_OFFLINE_DISABLED_MENUS` menu opens nothing. Online, and for every
+     * other command, this is the framework's behaviour.
+     *
+     * @returns {Promise<void>}
+     */
+    async crmOfflineOpenSelectedCommand() {
+        await this.searchValuePromise;
+        const selectedCommand = this.state.selectedCommand;
+        if (selectedCommand?.href && !this.crmOfflineCommandDisabled(selectedCommand)) {
+            window.open(selectedCommand.href, "_blank");
+        }
     },
 });
 
@@ -3699,19 +3764,37 @@ const CRM_OFFLINE_AVATAR_MODELS = freezeSet(["crm.lead", "crm.team"]);
 const CRM_AVATAR_RECORD_MODEL = Symbol("crmAvatarRecordModel");
 
 /**
+ * @param {object} env
+ * @returns {string|undefined} the model scoping the avatars rendered under `env`: the
+ *     record model a user avatar field handed down, otherwise the view's root model
+ */
+function crmAvatarScope(env) {
+    return env[CRM_AVATAR_RECORD_MODEL] ?? env.model?.root?.resModel;
+}
+
+/**
  * The user avatar fields (`many2one_avatar_user` in forms and lists, CRM's
  * `many2one_avatar_leader_user` through inheritance, `card.many2one_avatar_user` on
  * kanban cards) expose their record's model to their avatar. The record, not the
  * view's root, is what scopes the avatar guard below: a lead list inside another
  * model's form (the merge and mass-convert wizards' lead lists) shows lead avatars,
- * and a lead view may embed records of other models. The env only gains a key, so
- * the fields render and behave as before.
+ * and a lead view may embed records of other models. A field adds the key only where
+ * it changes that scope: on a lead or team record, or on another model's record
+ * rendered where the inherited scope is a lead or a team (an activity list inside a
+ * lead form). Any other field leaves the env untouched, as its avatar already
+ * resolves the same scope from it; the fields render and behave as before.
  */
 for (const AvatarUserField of [Many2OneAvatarUserField, CardMany2OneAvatarUserField]) {
     patch(AvatarUserField.prototype, {
         setup() {
             super.setup(...arguments);
-            useSubEnv({ [CRM_AVATAR_RECORD_MODEL]: this.props.record?.resModel });
+            const recordModel = this.props.record?.resModel;
+            if (
+                CRM_OFFLINE_AVATAR_MODELS.has(recordModel) ||
+                CRM_OFFLINE_AVATAR_MODELS.has(crmAvatarScope(this.env))
+            ) {
+                useSubEnv({ [CRM_AVATAR_RECORD_MODEL]: recordModel });
+            }
         },
     });
 }
@@ -3737,8 +3820,10 @@ patch(Avatar.prototype, {
 
     /** True for a lead's or a team's avatar while offline (scope tested first). */
     get crmOfflineAvatarGuarded() {
-        const recordModel = this.env[CRM_AVATAR_RECORD_MODEL] ?? this.env.model?.root?.resModel;
-        return CRM_OFFLINE_AVATAR_MODELS.has(recordModel) && this.crmOfflinePlugin.isOffline();
+        return (
+            CRM_OFFLINE_AVATAR_MODELS.has(crmAvatarScope(this.env)) &&
+            this.crmOfflinePlugin.isOffline()
+        );
     },
 
     get canOpenPopover() {

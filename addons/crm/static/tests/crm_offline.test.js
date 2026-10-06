@@ -102,6 +102,7 @@ import { CrmShareTargetItem } from "@crm/webclient/share_target/crm_share_target
 import { AutoComplete } from "@web/core/autocomplete/autocomplete";
 import { browser } from "@web/core/browser/browser";
 import { router } from "@web/core/browser/router";
+import { CommandPalette } from "@web/core/commands/command_palette";
 import { ConnectionLostError, RPCError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { registry } from "@web/core/registry";
@@ -6652,23 +6653,29 @@ test("[Offline] command palette results of blocked CRM menus are dimmed and aria
     const commandsOf = (section) => blockedCommands.filter((command) => command.section === section);
 
     // Online, the results are the framework's: visited, so not dimmed, never
-    // aria-disabled, and the selected one shows the "new tab" hint.
+    // aria-disabled, linked to their action, and the selected one shows the "new tab"
+    // hint.
     const selectedHint = ".o_command_palette .o_command[aria-selected='true'] .o_command_focus";
+    const hrefs = new Map();
     await searchCommandPalette("/Reporting");
     for (const { name } of commandsOf("Reporting")) {
         expect(paletteCommand(name)).toHaveCount(1);
         expect(paletteCommand(name)).not.toHaveAttribute("aria-disabled");
         expect(`${paletteCommand(name)} > a`).not.toHaveClass("o_disabled_offline");
+        expect(`${paletteCommand(name)} > a`).toHaveAttribute("href", /^\/odoo\/./);
+        hrefs.set(name, queryFirst(`${paletteCommand(name)} > a`).getAttribute("href"));
     }
     expect(selectedHint).toHaveCount(1);
 
-    // A palette opened online follows the connection, and the selected blocked result
-    // loses its hint, as Ctrl+Enter opens nothing.
+    // A palette opened online follows the connection: the selected blocked result
+    // loses its hint, as Ctrl+Enter opens nothing, and the blocked links lose their
+    // href, so a middle click or "open in new tab" opens nothing.
     await setOffline(true);
     stepping.active = true;
     for (const { name } of commandsOf("Reporting")) {
         expect(paletteCommand(name)).toHaveAttribute("aria-disabled", "true");
         expect(`${paletteCommand(name)} > a`).toHaveClass("o_disabled_offline");
+        expect(`${paletteCommand(name)} > a`).not.toHaveAttribute("href");
     }
     expect(selectedHint).toHaveCount(0);
 
@@ -6679,6 +6686,7 @@ test("[Offline] command palette results of blocked CRM menus are dimmed and aria
         for (const { name } of commandsOf(section)) {
             expect(paletteCommand(name)).toHaveAttribute("aria-disabled", "true");
             expect(`${paletteCommand(name)} > a`).toHaveClass("o_disabled_offline");
+            expect(`${paletteCommand(name)} > a`).not.toHaveAttribute("href");
             await click(queryFirst(paletteCommand(name)));
             await animationFrame();
             expect(paletteCommand(name)).toHaveAttribute("aria-selected", "true");
@@ -6698,22 +6706,24 @@ test("[Offline] command palette results of blocked CRM menus are dimmed and aria
     expect(Object.keys(getService(OfflinePlugin)._ormToSync())).toEqual([]);
 
     // Other results keep the framework's markup: the visited pipeline and Stages are
-    // not dimmed, the never-opened Teams is dimmed by the framework, and none is
-    // aria-disabled.
+    // not dimmed, the never-opened Teams is dimmed by the framework, none is
+    // aria-disabled, and each keeps its href.
     await searchCommandPalette("/Sales");
     expect(paletteCommand("CRM / Sales")).toHaveCount(1);
     expect(paletteCommand("CRM / Sales")).not.toHaveAttribute("aria-disabled");
     expect(`${paletteCommand("CRM / Sales")} > a`).not.toHaveClass("o_disabled_offline");
+    expect(`${paletteCommand("CRM / Sales")} > a`).toHaveAttribute("href", /^\/odoo\/./);
     await searchCommandPalette("/Other app");
     for (const name of ["Other app / Stages", "Other app / Teams"]) {
         expect(paletteCommand(name)).toHaveCount(1);
         expect(paletteCommand(name)).not.toHaveAttribute("aria-disabled");
+        expect(`${paletteCommand(name)} > a`).toHaveAttribute("href", /^\/odoo\/./);
     }
     expect(`${paletteCommand("Other app / Stages")} > a`).not.toHaveClass("o_disabled_offline");
     expect(`${paletteCommand("Other app / Teams")} > a`).toHaveClass("o_disabled_offline");
 
-    // Back online, an open palette drops the dimming at once, and a blocked menu's
-    // result opens its view.
+    // Back online, an open palette drops the dimming at once and restores the hrefs,
+    // and a blocked menu's result opens its view.
     await searchCommandPalette("/Reporting");
     stepping.active = false;
     await setOffline(false);
@@ -6721,6 +6731,7 @@ test("[Offline] command palette results of blocked CRM menus are dimmed and aria
     for (const { name } of commandsOf("Reporting")) {
         expect(paletteCommand(name)).not.toHaveAttribute("aria-disabled");
         expect(`${paletteCommand(name)} > a`).not.toHaveClass("o_disabled_offline");
+        expect(`${paletteCommand(name)} > a`).toHaveAttribute("href", hrefs.get(name));
     }
     expect(selectedHint).toHaveCount(1);
     const [forecast] = blockedCommands;
@@ -6728,6 +6739,276 @@ test("[Offline] command palette results of blocked CRM menus are dimmed and aria
     await expectCurrentView(forecast.view);
     expect(".o_command_palette").toHaveCount(0);
     expect.verifySteps([]);
+});
+
+/**
+ * Captures each command palette as it is set up, and returns a getter of the last
+ * one.
+ *
+ * @returns {() => CommandPalette}
+ */
+function capturePalette() {
+    let palette;
+    patchWithCleanup(CommandPalette.prototype, {
+        setup() {
+            super.setup(...arguments);
+            palette = this;
+        },
+    });
+    return () => palette;
+}
+
+/** Selects the result named `name` of the open command palette and returns it. */
+function selectPaletteCommand(palette, name) {
+    const index = palette.state.commands.findIndex((command) => command.name === name);
+    expect(index).toBeGreaterThan(-1);
+    palette.selectCommand(index);
+    return palette.state.selectedCommand;
+}
+
+test.tags("desktop");
+test("[Offline] command palette Ctrl+Enter checks the command selected once the search settles", async () => {
+    defineMenus([...CRM_MENUS, OTHER_APP_MENU]);
+    const setOffline = mockOffline();
+    patchWithCleanup(window, {
+        open(url, target) {
+            const offline = getService(OfflinePlugin).isOffline();
+            expect.step(`window.open ${url} ${target} ${offline ? "offline" : "online"}`);
+        },
+    });
+    const palette = capturePalette();
+    await mountWithCleanup(WebClient);
+    await getService("menu").selectMenu(2);
+    await expectCurrentView(PIPELINE_VIEW);
+    // "/s" lists the blocked CRM results and the other app's results together.
+    await searchCommandPalette("/s");
+    const blocked = "CRM / Reporting / Forecast";
+
+    // Online, a disconnection that lands after the search settles comes after the
+    // check and the opening: the blocked result opens online, as the framework's
+    // Ctrl+Enter does, and never once offline.
+    const { href: blockedHref } = selectPaletteCommand(palette(), blocked);
+    let search = Promise.withResolvers();
+    palette().searchValuePromise = search.promise;
+    let execution = palette().executeSelectedCommand(true);
+    search.promise.then(() => setOffline(true));
+    search.resolve();
+    await execution;
+    await animationFrame();
+    expect(getService(OfflinePlugin).isOffline()).toBe(true);
+    expect.verifySteps([`window.open ${blockedHref} _blank online`]);
+
+    // A disconnection that lands while the search is pending is seen when it
+    // settles: the blocked result opens nothing.
+    await setOffline(false);
+    selectPaletteCommand(palette(), blocked);
+    search = Promise.withResolvers();
+    search.promise.then(() => setOffline(true));
+    palette().searchValuePromise = search.promise;
+    execution = palette().executeSelectedCommand(true);
+    search.resolve();
+    await execution;
+    await animationFrame();
+    expect(getService(OfflinePlugin).isOffline()).toBe(true);
+    expect.verifySteps([]);
+
+    // Offline, the command opened is the one checked: a blocked result selected after
+    // the check of another app's result is never opened.
+    const { href: allowedHref } = selectPaletteCommand(palette(), "Other app / Stages");
+    expect(allowedHref).not.toBe(blockedHref);
+    search = Promise.withResolvers();
+    palette().searchValuePromise = search.promise;
+    execution = palette().executeSelectedCommand(true);
+    search.promise.then(() => selectPaletteCommand(palette(), blocked));
+    search.resolve();
+    await execution;
+    await animationFrame();
+    expect(palette().state.selectedCommand.name).toBe(blocked);
+    expect.verifySteps([`window.open ${allowedHref} _blank offline`]);
+
+    // A blocked result still selected when the search settles opens nothing.
+    search = Promise.withResolvers();
+    palette().searchValuePromise = search.promise;
+    execution = palette().executeSelectedCommand(true);
+    search.resolve();
+    await execution;
+    await animationFrame();
+    expect.verifySteps([]);
+    expect(".o_command_palette").toHaveCount(1);
+    expect(Object.keys(getService(OfflinePlugin)._ormToSync())).toEqual([]);
+});
+
+test.tags("desktop");
+test("[Offline] command palette Enter and Ctrl+Enter wait once for the search", async () => {
+    defineMenus([...CRM_MENUS, OTHER_APP_MENU]);
+    const setOffline = mockOffline();
+    patchWithCleanup(window, {
+        open(url) {
+            expect.step(`window.open ${url}`);
+        },
+    });
+    const palette = capturePalette();
+    // A pending search the palette's methods wait for: each wait reads `then` once.
+    const settledSearch = () => ({
+        then(resolve) {
+            expect.step("search wait");
+            resolve();
+        },
+    });
+    /** Presses `keys` in the palette while its search is `settledSearch()`. */
+    const pressInPalette = async (keys) => {
+        palette().searchValuePromise = settledSearch();
+        await press(keys);
+        await animationFrame();
+    };
+    await mountWithCleanup(WebClient);
+    await getService("menu").selectMenu(2);
+    await expectCurrentView(PIPELINE_VIEW);
+
+    // A blocked CRM result: online Ctrl+Enter opens its new tab, offline neither key
+    // runs it, and online Enter opens its view, each after one wait.
+    await searchCommandPalette("/Reporting");
+    const { href: forecastHref } = selectPaletteCommand(palette(), "CRM / Reporting / Forecast");
+    await pressInPalette(["control", "Enter"]);
+    expect.verifySteps(["search wait", `window.open ${forecastHref}`]);
+    await setOffline(true);
+    await pressInPalette(["control", "Enter"]);
+    expect.verifySteps(["search wait"]);
+    await pressInPalette("Enter");
+    expect.verifySteps(["search wait"]);
+    expect(".o_command_palette").toHaveCount(1);
+    expect(currentView()).toBe(PIPELINE_VIEW);
+    await setOffline(false);
+    await pressInPalette("Enter");
+    expect.verifySteps(["search wait"]);
+    await expectCurrentView(DISABLED_MENUS[0].view);
+    expect(".o_command_palette").toHaveCount(0);
+
+    // Another app's result: Ctrl+Enter opens its new tab online and offline, and
+    // online Enter opens its view, each after one wait.
+    await searchCommandPalette("/Other app");
+    const { href: stagesHref } = selectPaletteCommand(palette(), "Other app / Stages");
+    await pressInPalette(["control", "Enter"]);
+    expect.verifySteps(["search wait", `window.open ${stagesHref}`]);
+    await setOffline(true);
+    await pressInPalette(["control", "Enter"]);
+    expect.verifySteps(["search wait", `window.open ${stagesHref}`]);
+    await setOffline(false);
+    await pressInPalette("Enter");
+    expect.verifySteps(["search wait"]);
+    await expectCurrentView(`${STAGE_ACTION.xml_id}/list`);
+    expect(".o_command_palette").toHaveCount(0);
+});
+
+/**
+ * Copies menu definitions, renaming `name` the menu of `xmlid`; the definitions
+ * given are left unchanged.
+ */
+function renameMenu(menus, xmlid, name) {
+    return menus.map((menu) => {
+        if (typeof menu !== "object") {
+            return menu;
+        }
+        const copy = menu.xmlid === xmlid ? { ...menu, name } : { ...menu };
+        if (menu.children) {
+            copy.children = renameMenu(menu.children, xmlid, name);
+        }
+        return copy;
+    });
+}
+
+test.tags("desktop");
+test("[Offline] command palette results of blocked CRM menus follow the menus reloaded", async () => {
+    defineMenus([...CRM_MENUS, OTHER_APP_MENU]);
+    const setOffline = mockOffline();
+    await mountWithCleanup(WebClient);
+    await getService("menu").selectMenu(2);
+    await expectCurrentView(PIPELINE_VIEW);
+    const forecast = "CRM / Reporting / Forecast";
+    const renamed = "CRM / Reporting / Sales Forecast";
+
+    await setOffline(true);
+    await searchCommandPalette("/Reporting");
+    expect(paletteCommand(forecast)).toHaveAttribute("aria-disabled", "true");
+    expect(`${paletteCommand(forecast)} > a`).toHaveClass("o_disabled_offline");
+    await press("Escape");
+    await animationFrame();
+    expect(".o_command_palette").toHaveCount(0);
+
+    // Reloaded menus replace the root menu: the renamed result is the one guarded.
+    await setOffline(false);
+    const root = getService("menu").getMenuAsTree("root");
+    MockServer.current.menus = renameMenu(
+        MockServer.current.menus,
+        "crm.crm_menu_forecast",
+        "Sales Forecast"
+    );
+    await getService("menu").reload();
+    await animationFrame();
+    expect(getService("menu").getMenuAsTree("root")).not.toBe(root);
+    await setOffline(true);
+    await searchCommandPalette("/Reporting");
+    expect(paletteCommand(forecast)).toHaveCount(0);
+    expect(paletteCommand(renamed)).toHaveCount(1);
+    expect(paletteCommand(renamed)).toHaveAttribute("aria-disabled", "true");
+    expect(`${paletteCommand(renamed)} > a`).toHaveClass("o_disabled_offline");
+    expect(`${paletteCommand(renamed)} > a`).not.toHaveAttribute("href");
+    await click(queryFirst(paletteCommand(renamed)));
+    await animationFrame();
+    expect(".o_command_palette").toHaveCount(1);
+    expect(currentView()).toBe(PIPELINE_VIEW);
+
+    // Online, the renamed result opens its view.
+    await setOffline(false);
+    expect(paletteCommand(renamed)).not.toHaveAttribute("aria-disabled");
+    expect(`${paletteCommand(renamed)} > a`).toHaveAttribute("href", /^\/odoo\/./);
+    await click(queryFirst(paletteCommand(renamed)));
+    await expectCurrentView(DISABLED_MENUS[0].view);
+});
+
+test.tags("desktop");
+test("[Offline] command palette listing no blocked CRM result does not render again on a connection change", async () => {
+    defineMenus([...CRM_MENUS, OTHER_APP_MENU]);
+    const setOffline = mockOffline();
+    // Each render of the results reads the class of each result's link.
+    let classReads = 0;
+    patchWithCleanup(CommandPalette.prototype, {
+        crmOfflineCommandClass() {
+            classReads++;
+            return super.crmOfflineCommandClass(...arguments);
+        },
+    });
+    await mountWithCleanup(WebClient);
+    await getService("menu").selectMenu(2);
+    await expectCurrentView(PIPELINE_VIEW);
+
+    // Only the other app's results: the connection changes render nothing again.
+    await searchCommandPalette("/Other app");
+    const names = queryAllTexts(".o_command_palette .o_command_name");
+    expect(names).toInclude("Other app / Stages");
+    expect(names.every((name) => name.startsWith("Other app"))).toBe(true);
+    const otherAppReads = classReads;
+    expect(otherAppReads).toBeGreaterThan(0);
+    await setOffline(true);
+    await animationFrame();
+    expect(classReads).toBe(otherAppReads);
+    expect(`${paletteCommand("Other app / Stages")} > a`).toHaveAttribute("href", /^\/odoo\/./);
+    await setOffline(false);
+    await animationFrame();
+    expect(classReads).toBe(otherAppReads);
+
+    // Blocked CRM results: each change renders them again, with the matching state.
+    await searchCommandPalette("/Reporting");
+    const forecast = "CRM / Reporting / Forecast";
+    expect(paletteCommand(forecast)).not.toHaveAttribute("aria-disabled");
+    const onlineReads = classReads;
+    await setOffline(true);
+    expect(classReads).toBeGreaterThan(onlineReads);
+    expect(paletteCommand(forecast)).toHaveAttribute("aria-disabled", "true");
+    const offlineReads = classReads;
+    await setOffline(false);
+    expect(classReads).toBeGreaterThan(offlineReads);
+    expect(paletteCommand(forecast)).not.toHaveAttribute("aria-disabled");
 });
 
 test.tags("mobile");
@@ -9225,6 +9506,201 @@ test("[Offline] avatars of other models keep opening their card", async () => {
     await setOffline(false);
     await animationFrame();
     await click(".o_field_widget[name=user_id] .o_m2o_avatar > img");
+    await expect.waitForSteps(["avatar_card"]);
+    await waitFor(".o_avatar_card");
+    expect(".o_avatar_card").toHaveCount(1);
+});
+
+/**
+ * The record models user avatar fields handed down to an avatar's env, nearest first:
+ * the values of the env's own symbol keys described `crmAvatarRecordModel`, through its
+ * prototype chain.
+ *
+ * @param {object} env
+ * @returns {Array<string|undefined>}
+ */
+function crmAvatarRecordModels(env) {
+    const recordModels = [];
+    for (let scope = env; scope; scope = Object.getPrototypeOf(scope)) {
+        for (const key of Object.getOwnPropertySymbols(scope)) {
+            if (key.description === "crmAvatarRecordModel") {
+                recordModels.push(scope[key]);
+            }
+        }
+    }
+    return recordModels;
+}
+
+/**
+ * Merge wizard arch (`merge_opportunity_form`) with its own "Reassign To" avatar field
+ * and its lead list.
+ */
+const MERGE_WIZARD_REASSIGN_AVATAR_ARCH = /* xml */ `
+    <form string="Merge Leads/Opportunities">
+        <group>
+            <field name="user_id" widget="many2one_avatar_user" string="Reassign To"/>
+        </group>
+        <field name="opportunity_ids" nolabel="1">
+            <list>
+                <field name="name" string="Title"/>
+                <field name="user_id" widget="many2one_avatar_user"/>
+            </list>
+        </field>
+    </form>`;
+
+test.tags("desktop");
+test("[Offline] a wizard's own avatar field adds no CRM scope, its lead avatar fields do", async () => {
+    const avatars = captureAvatars();
+    const setOffline = mockOffline();
+    stepAvatarCardReads();
+    const { env } = await makeMockServer();
+    const wizardId = env["crm.merge.opportunity"].create({
+        user_id: serverState.userId,
+        opportunity_ids: [1, 2],
+    });
+    await mountView({
+        type: "form",
+        resModel: "crm.merge.opportunity",
+        resId: wizardId,
+        arch: MERGE_WIZARD_REASSIGN_AVATAR_ARCH,
+    });
+    await flushStartupSync();
+    const wizardAvatarImg = ".o_inner_group .o_field_widget[name=user_id] .o_m2o_avatar > img";
+    expect(wizardAvatarImg).toHaveCount(1);
+    expect(".o_field_widget[name=opportunity_ids] .o_data_row .o_m2o_avatar > img").toHaveCount(2);
+    expect(avatars.size).toBe(3);
+
+    // Only the lead fields hand their model down; the wizard's field adds no env.
+    const recordModels = [...avatars].map((avatar) => crmAvatarRecordModels(avatar.env));
+    expect(recordModels.filter((found) => found.length === 0)).toHaveLength(1);
+    expect(recordModels.filter((found) => found.length > 0)).toEqual([["crm.lead"], ["crm.lead"]]);
+    const [wizardAvatar] = [...avatars].filter(
+        (avatar) => crmAvatarRecordModels(avatar.env).length === 0
+    );
+    const leadAvatars = [...avatars].filter((avatar) => avatar !== wizardAvatar);
+
+    await setOffline(true);
+    expect(wizardAvatar.crmOfflineAvatarGuarded).toBe(false);
+    expect(wizardAvatar.canOpenPopover).toBe(true);
+    for (const avatar of leadAvatars) {
+        expect(avatar.crmOfflineAvatarGuarded).toBe(true);
+        expect(avatar.canOpenPopover).toBe(false);
+    }
+    expect.verifySteps([]);
+
+    await setOffline(false);
+    await animationFrame();
+    for (const avatar of avatars) {
+        expect(avatar.canOpenPopover).toBe(true);
+    }
+    await click(wizardAvatarImg);
+    await expect.waitForSteps(["avatar_card"]);
+    await waitFor(".o_avatar_card");
+    expect(".o_avatar_card").toHaveCount(1);
+});
+
+test.tags("desktop");
+test("[Offline] avatar card fields of other apps leave their avatar's env untouched", async () => {
+    const avatars = captureAvatars();
+    const setOffline = mockOffline();
+    const { env } = await makeMockServer();
+    env["m2x.avatar.user"].create([
+        { user_id: serverState.userId },
+        { user_id: serverState.userId },
+    ]);
+    await mountView({
+        type: "kanban",
+        resModel: "m2x.avatar.user",
+        arch: /* xml */ `
+            <kanban>
+                <templates>
+                    <t t-name="card">
+                        <field name="user_id" widget="many2one_avatar_user"/>
+                    </t>
+                </templates>
+            </kanban>`,
+    });
+    await flushStartupSync();
+    expect(".o_kanban_record .o_m2o_avatar > img").toHaveCount(2);
+    expect(avatars.size).toBe(2);
+    for (const avatar of avatars) {
+        expect(crmAvatarRecordModels(avatar.env)).toEqual([]);
+    }
+
+    await setOffline(true);
+    for (const avatar of avatars) {
+        expect(avatar.crmOfflineAvatarGuarded).toBe(false);
+        expect(avatar.canOpenPopover).toBe(true);
+    }
+});
+
+/** Lead form arch with the salesperson and the lead's activities with their assignee. */
+const LEAD_ACTIVITY_AVATAR_FORM_ARCH = /* xml */ `
+    <form js_class="crm_form">
+        <sheet>
+            <field name="name"/>
+            <group>
+                <field name="user_id" widget="many2one_avatar_user"/>
+            </group>
+            <field name="activity_ids">
+                <list>
+                    <field name="summary"/>
+                    <field name="user_id" widget="many2one_avatar_user"/>
+                </list>
+            </field>
+        </sheet>
+    </form>`;
+
+test.tags("desktop");
+test("[Offline] activity avatars inside a lead form keep opening their card", async () => {
+    const avatars = captureAvatars();
+    const setOffline = mockOffline();
+    stepAvatarCardReads();
+    const { env } = await makeMockServer();
+    env["mail.activity"].create({
+        res_model: "crm.lead",
+        res_id: 1,
+        summary: "Call back",
+        user_id: serverState.userId,
+        date_deadline: "2999-01-01",
+    });
+    await mountView({
+        type: "form",
+        resModel: "crm.lead",
+        resId: 1,
+        arch: LEAD_ACTIVITY_AVATAR_FORM_ARCH,
+        config: { actionId: 1 },
+    });
+    await flushStartupSync();
+    const leadAvatarImg = ".o_inner_group .o_field_widget[name=user_id] .o_m2o_avatar > img";
+    const activityAvatarImg = ".o_field_widget[name=activity_ids] .o_data_row .o_m2o_avatar > img";
+    expect(leadAvatarImg).toHaveCount(1);
+    expect(activityAvatarImg).toHaveCount(1);
+    expect(avatars.size).toBe(2);
+
+    // The activity's field shadows the lead scope it is rendered in.
+    const avatarOf = (recordModel) =>
+        [...avatars].find((avatar) => crmAvatarRecordModels(avatar.env)[0] === recordModel);
+    const leadAvatar = avatarOf("crm.lead");
+    const activityAvatar = avatarOf("mail.activity");
+    expect(crmAvatarRecordModels(leadAvatar.env)).toEqual(["crm.lead"]);
+    expect(crmAvatarRecordModels(activityAvatar.env)).toEqual(["mail.activity"]);
+
+    await setOffline(true);
+    expect(leadAvatar.crmOfflineAvatarGuarded).toBe(true);
+    expect(leadAvatar.canOpenPopover).toBe(false);
+    expect(activityAvatar.crmOfflineAvatarGuarded).toBe(false);
+    expect(activityAvatar.canOpenPopover).toBe(true);
+    await click(leadAvatarImg);
+    await settle();
+    expect(".o_avatar_card").toHaveCount(0);
+    expect.verifySteps([]);
+
+    await setOffline(false);
+    await animationFrame();
+    expect(leadAvatar.canOpenPopover).toBe(true);
+    expect(activityAvatar.canOpenPopover).toBe(true);
+    await click(activityAvatarImg);
     await expect.waitForSteps(["avatar_card"]);
     await waitFor(".o_avatar_card");
     expect(".o_avatar_card").toHaveCount(1);
