@@ -749,6 +749,9 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         with self.assertRaises(AccessError) as refused:
             self._log_call(salesman, lead, lead_key)
         self.assertNotIsInstance(refused.exception, CrmOfflineOriginError)
+        self.assertEqual(
+            refused.exception.args[0], 'This activity was not created: its delivery key belongs to another kind of record.',
+        )
         self.assertEqual(self._lead_activities(lead), foreign)
         self.assertEqual(
             (self._quick_create_xmlids(lead_key).model, self._quick_create_xmlids(lead_key).res_id),
@@ -1586,6 +1589,149 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self.assertEqual(leads, lead)
         self.assertEqual(lead.expected_revenue, 40.0)
         self.assertEqual(self._quick_create_xmlids(key).res_id, lead.id)
+
+    def test_offline_create_key_of_another_model_refused(self):
+        """ A delivery key names one record of one model. Sent by the user who
+        registered it, the key of an activity delivered with a lead create (the
+        mobile quick create, a lead form's online save or its replayed later
+        save) and the key of a lead delivered with an activity create (online
+        or replayed) are refused with an ``AccessError`` naming that mismatch,
+        neither the refusal of another user's key nor of a call queued by
+        another user. Nothing is created, and each key stays registered with
+        its own record. """
+        salesman = self.user_sales_salesman
+        lead = self._create_salesman_opportunity('Cross Model Key Lead')
+        activity_key, lead_key = secrets.token_hex(16), secrets.token_hex(16)
+        activity = self._log_call(salesman, lead, activity_key)
+        [quick] = self._quick_create(salesman, {
+            'name': 'Cross Model Quick Lead',
+            'contact_name': '',
+            'phone': '',
+            'email_from': '',
+            'expected_revenue': 0.0,
+            'stage_id': self.stage_gen_1.id,
+        }, lead_key)
+        quick_lead = self.env['crm.lead'].browse(quick['id'])
+        registered = self.env['ir.model.data'].search([('module', '=', '__crm_offline__')])
+
+        # an activity's key delivered with a lead create
+        vals = {
+            'name': 'Cross Model Refused Lead',
+            'type': 'opportunity',
+            'user_id': salesman.id,
+            'stage_id': self.stage_gen_1.id,
+        }
+        deliveries = {
+            'quick create': lambda: self._quick_create(salesman, vals, activity_key),
+            'form online save': lambda: self._form_create(salesman, vals, activity_key),
+            'form replayed later save': lambda: self._form_create(
+                salesman, vals, activity_key, queued_by=salesman, later_save=True,
+            ),
+        }
+        for delivery, deliver in deliveries.items():
+            with self.subTest(delivery=delivery):
+                refused = self._refused_delivery(AccessError, deliver)
+                self.assertNotIsInstance(refused, CrmOfflineOriginError)
+                self.assertEqual(
+                    refused.args[0], 'This lead was not created: its delivery key belongs to another kind of record.',
+                )
+        self.assertFalse(
+            self.env['crm.lead'].with_context(active_test=False).search([('name', '=', 'Cross Model Refused Lead')]),
+        )
+
+        # a lead's key delivered with an activity create, online or replayed
+        for context in ({}, {'uid': salesman.id, 'crm_offline_uid': salesman.id}):
+            with self.subTest(context=context):
+                refused = self._refused_delivery(
+                    AccessError, self._log_call, salesman, lead, lead_key, summary='Cross Model Call', **context,
+                )
+                self.assertNotIsInstance(refused, CrmOfflineOriginError)
+                self.assertEqual(
+                    refused.args[0], 'This activity was not created: its delivery key belongs to another kind of record.',
+                )
+        self.assertEqual(self._lead_activities(lead), activity)
+        self.assertFalse(self._lead_activities(quick_lead))
+
+        # each key still registered with its own record, nothing else registered
+        self.assertEqual(self.env['ir.model.data'].search([('module', '=', '__crm_offline__')]), registered)
+        activity_xmlid, lead_xmlid = self._quick_create_xmlids(activity_key), self._quick_create_xmlids(lead_key)
+        self.assertEqual((activity_xmlid.model, activity_xmlid.res_id), ('mail.activity', activity.id))
+        self.assertEqual((lead_xmlid.model, lead_xmlid.res_id), ('crm.lead', quick_lead.id))
+
+    def test_offline_create_key_without_create_access(self):
+        """ A keyed create tells a caller who may not create the model's records
+        nothing about its key. A portal user, and an internal user without Sales
+        rights, get from a keyed lead create the access error a create gives
+        them, the same whether its key is fresh, registered by another user's
+        live lead or activity, or freed by the deletion of its lead; a portal
+        user gets from a keyed activity create the access error a create gives
+        them, the same whether its key is fresh or registered by another user's
+        live activity or lead. Never the refusal of another user's key or of
+        another model's; nothing is created or registered. """
+        salesman = self.user_sales_salesman
+        portal = mail_new_test_user(
+            self.env, login='user_portal_offline_key',
+            name='Paula Portal', email='portal_offline_key@test.example.com',
+            groups='base.group_portal',
+        )
+        employee = mail_new_test_user(
+            self.env, login='user_employee_offline_key',
+            name='Emile Employee', email='employee_offline_key@test.example.com',
+            groups='base.group_user',
+        )
+        lead = self._create_salesman_opportunity('No Create Access Lead')
+        quick_vals = {
+            'name': 'No Create Access Quick Lead',
+            'contact_name': '',
+            'phone': '',
+            'email_from': '',
+            'expected_revenue': 0.0,
+            'stage_id': self.stage_gen_1.id,
+        }
+        live_key, freed_key, activity_key = secrets.token_hex(16), secrets.token_hex(16), secrets.token_hex(16)
+        self._quick_create(salesman, quick_vals, live_key)
+        [freed] = self._quick_create(salesman, dict(quick_vals, name='No Create Access Freed Lead'), freed_key)
+        self.env['crm.lead'].browse(freed['id']).unlink()
+        self.assertFalse(self._quick_create_xmlids(freed_key), 'The deleted lead took its key with it')
+        activity = self._log_call(salesman, lead, activity_key)
+        registered = self.env['ir.model.data'].search([('module', '=', '__crm_offline__')])
+        refused_vals = {'name': 'No Create Access Refused Lead', 'type': 'opportunity', 'stage_id': self.stage_gen_1.id}
+
+        def lead_refusals(user, key):
+            # the quick create, and the replayed later save of a lead form
+            return [
+                self._refused_delivery(AccessError, self._quick_create, user, refused_vals, key),
+                self._refused_delivery(
+                    AccessError, self._form_create, user, refused_vals, key, queued_by=user, later_save=True,
+                ),
+            ]
+
+        for user in (portal, employee):
+            with self.subTest(user=user.login):
+                fresh = lead_refusals(user, secrets.token_hex(16))[0]
+                self.assertTrue(
+                    fresh.args[0].startswith("You are not allowed to create 'Lead' (crm.lead) records."), fresh.args[0],
+                )
+                for key in (secrets.token_hex(16), live_key, freed_key, activity_key):
+                    for refused in lead_refusals(user, key):
+                        self.assertNotIsInstance(refused, CrmOfflineOriginError)
+                        self.assertEqual(refused.args[0], fresh.args[0])
+        self.assertFalse(
+            self.env['crm.lead'].with_context(active_test=False).search([('name', '=', 'No Create Access Refused Lead')]),
+        )
+
+        # an activity create of a portal user (internal users may create activities)
+        fresh = self._refused_delivery(AccessError, self._log_call, portal, lead, secrets.token_hex(16))
+        self.assertTrue(
+            fresh.args[0].startswith("You are not allowed to create 'Activity' (mail.activity) records."), fresh.args[0],
+        )
+        for key in (activity_key, live_key):
+            with self.subTest(key=key):
+                refused = self._refused_delivery(AccessError, self._log_call, portal, lead, key)
+                self.assertNotIsInstance(refused, CrmOfflineOriginError)
+                self.assertEqual(refused.args[0], fresh.args[0])
+        self.assertEqual(self._lead_activities(lead), activity)
+        self.assertEqual(self.env['ir.model.data'].search([('module', '=', '__crm_offline__')]), registered)
 
     # ------------------------------------------------------------
     # Queue identity

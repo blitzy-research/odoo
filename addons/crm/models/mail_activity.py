@@ -39,11 +39,12 @@ class MailActivity(models.Model):
         first delivery of a key creates the activity and registers the key as its external
         identifier ``__crm_offline__.<key>``: an ``ir.model.data`` row, so the activity model gains
         no field. A later delivery of that key by the activity's creator creates nothing and
-        answers with that activity, done (archived) or not; a key registered by another user, or
-        for another model, is refused. Of two concurrent deliveries of one key, only the first
-        registers it: the later one's registration fails with a serialization failure, so the RPC
-        layer rolls that delivery back with the activity it created and retries it, and the retry
-        answers with the activity the first one created.
+        answers with that activity, done (archived) or not; a key registered by another user is
+        refused, and so is a key registered for another model (a lead's), with a refusal of its
+        own; neither creates or registers anything. Of two concurrent deliveries of one key, only
+        the first registers it: the later one's registration fails with a serialization failure,
+        so the RPC layer rolls that delivery back with the activity it created and retries it, and
+        the retry answers with the activity the first one created.
 
         A key names one activity: a create whose context key holds anything but 32 lowercase
         hexadecimal digits, or a keyed create of no or several values, is refused (``UserError``)
@@ -58,10 +59,12 @@ class MailActivity(models.Model):
         refused (``AccessError``) otherwise. Privileged access is limited to the ``ir.model.data``
         lookup and registration of the key, on that fixed module with a validated key, to the
         existence and creator check of the activity the key names, and to the cached
-        ``ir.model._get`` lookup; a matching creator elevates nothing. Deleting an activity deletes
-        its external identifiers (base ``unlink``), so a delivery after the deletion creates it
-        again. Creates without a key (none in the context, or one left unset: ``None`` or
-        ``False``) keep the base behaviour. """
+        ``ir.model._get`` lookup; a matching creator elevates nothing. The caller's right to create
+        activities is checked before the key's lookup, so a caller who may not create activities
+        gets the access error a create gives them whatever key they send, and learns nothing of
+        the record a key names. Deleting an activity deletes its external identifiers (base
+        ``unlink``), so a delivery after the deletion creates it again. Creates without a key (none
+        in the context, or one left unset: ``None`` or ``False``) keep the base behaviour. """
         self.env['crm.lead']._check_offline_queue_origin()
         key = self.env.context.get(CRM_OFFLINE_CREATE_KEY)
         # a context value left unset (missing, null or false) sends no key
@@ -78,12 +81,17 @@ class MailActivity(models.Model):
                 raise CrmOfflineOriginError(self.env._("This offline change was sent in another user's session and was not applied."))
             # the key only selects the delivery: the create itself sees the caller's context
             activities = self.with_context({k: v for k, v in self.env.context.items() if k != CRM_OFFLINE_CREATE_KEY})
+            # the error the create raises for a caller who may not create activities,
+            # raised before the key is looked up, so that it is the same for every key
+            self.browse().check_access('create')
             data = self.env['ir.model.data'].sudo().search(
                 [('module', '=', CRM_OFFLINE_CREATE_MODULE), ('name', '=', key)], limit=1,
             )
             if data:
-                delivered = self.sudo().browse(data.res_id).exists() if data.model == self._name else None
-                if delivered is None or (delivered and delivered.create_uid.id != self.env.uid):
+                if data.model != self._name:
+                    raise AccessError(self.env._("This activity was not created: its delivery key belongs to another kind of record."))
+                delivered = self.sudo().browse(data.res_id).exists()
+                if delivered and delivered.create_uid.id != self.env.uid:
                     raise AccessError(self.env._("This activity was already created by another user."))
                 if delivered:
                     # answered as its create would be: only while the caller may

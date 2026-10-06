@@ -1080,8 +1080,10 @@ class CrmLead(models.Model):
         answer was lost) writes nothing, so a save the creator made since, by
         the lead's id, keeps its values, and it answers with a read of that
         lead (of ``next_id`` when given).
-        A key registered by another user is refused. Of two concurrent
-        deliveries of one key, only the first registers it: the unique
+        A key registered by another user is refused, and so is a key registered
+        for another model (an activity's), with a refusal of its own; neither
+        creates or registers anything. Of two concurrent deliveries of one
+        key, only the first registers it: the unique
         ``(module, name)`` index fails the later one's registration with a
         serialization failure, so the RPC layer rolls that delivery back with
         the lead it created and retries it, and the retry answers with the
@@ -1099,8 +1101,12 @@ class CrmLead(models.Model):
 
         Everything runs under the caller's rights except the ``ir.model.data``
         lookup and registration, made as superuser on that fixed module with a
-        validated key. Deleting a lead deletes its external identifiers (base
-        ``unlink``), so a delivery after the deletion creates the lead again.
+        validated key. The caller's right to create leads is checked before
+        that lookup, so a caller who may not create leads gets the access error
+        a create gives them whatever key they send, and learns nothing of the
+        record a key names. Deleting a lead deletes its external identifiers
+        (base ``unlink``), so a delivery after the deletion creates the lead
+        again.
         Writes, and creates without a valid key (desktop, new leads saved while
         the client reports the connection up, any other caller), keep the base
         behaviour.
@@ -1123,11 +1129,16 @@ class CrmLead(models.Model):
         leads = self.with_context({
             k: v for k, v in self.env.context.items() if k not in (CRM_OFFLINE_CREATE_KEY, CRM_OFFLINE_CREATE_WRITE)
         })
+        # the error the create raises for a caller who may not create leads,
+        # raised before the key is looked up, so that it is the same for every key
+        self.browse().check_access('create')
         IrModelData = self.env['ir.model.data'].sudo()
         data = IrModelData.search([('module', '=', CRM_OFFLINE_CREATE_MODULE), ('name', '=', key)], limit=1)
         if data:
-            delivered = self.sudo().browse(data.res_id).exists() if data.model == self._name else None
-            if delivered is None or (delivered and delivered.create_uid.id != self.env.uid):
+            if data.model != self._name:
+                raise AccessError(_("This lead was not created: its delivery key belongs to another kind of record."))
+            delivered = self.sudo().browse(data.res_id).exists()
+            if delivered and delivered.create_uid.id != self.env.uid:
                 raise AccessError(_("This lead was already created by another user."))
             if delivered and later_save:
                 # a later save of the delivered lead: written under the caller's
