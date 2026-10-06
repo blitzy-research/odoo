@@ -355,9 +355,8 @@ registry.category("web_tour.tours").add("crm_mobile_offline", {
             run: "click",
         },
         {
-            // Refine D3.2a (P2): an addon adding a header button before "Won"
-            // (sale_crm's "New Quotation") puts "Won" under the phone header's
-            // "More" toggle, which stays available offline while it holds "Won".
+            // A header button before Won (such as sale_crm's New Quotation) moves Won
+            // into More; its toggle stays available offline while holding Won.
             content:
                 "Reach Won offline, under the header's More toggle when another button comes first",
             trigger: `.o_form_view button[name=action_set_won_rainbowman]:enabled, ${HEADER_MORE}`,
@@ -417,9 +416,9 @@ registry.category("web_tour.tours").add("crm_mobile_offline", {
         },
         {
             // A pending opportunity: its form shows the Won button, or, when another
-            // addon's header button comes first (Refine D3.2a (P2)), the "More"
-            // toggle holding it, the one that carries the offline attribute. The
-            // lead form renders its name with the text widget, hence a textarea.
+            // addon's header button comes first, the "More" toggle holding it, the
+            // one that carries the offline attribute. The lead form renders its name
+            // with the text widget, hence a textarea.
             content: "The server record of the created lead opens in its form",
             trigger: [
                 `.o_form_view:has(button[name=action_set_won_rainbowman]) ${OFFLINE_LEAD_SAVED_NAME}`,

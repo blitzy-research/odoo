@@ -4427,10 +4427,10 @@ test("[Offline] non-secure origin disables the card menu toggle and colours, whi
     expectAvailableOffline(colours);
 });
 
-// Refine D2.7 (U7): on a non-secure origin, the Delete of a lead card menu opened
-// online is disabled and inert offline, instead of opening a confirmation whose
-// delete only ends in the framework's non-secure-context notification. On a secure
-// origin it still confirms and queues `unlink`.
+// On a non-secure origin, the Delete of a lead card menu opened online is disabled
+// and inert offline, instead of opening a confirmation whose delete only ends in the
+// framework's non-secure-context notification. On a secure origin it still confirms
+// and queues `unlink`.
 
 /** Delete of the open card menu. */
 const CARD_MENU_DELETE = ".o-dropdown--menu .dropdown-item:contains(Delete)";
@@ -5149,8 +5149,9 @@ function expectGuarded(selector, count) {
         expect(el).toHaveAttribute("disabled");
         expect(tabbable).not.toInclude(el);
         if (el.tagName === "A") {
-            // Guarded links are out of hit-testing: `pe-none` wins over the framework's
-            // `.o_disabled_offline { pointer-events: auto !important }`.
+            // The CRM guard-marker rule (`a.o_crm_offline_guarded.o_disabled_offline` in
+            // crm_mobile_pipeline.scss) keeps links out of hit-testing despite the
+            // framework's offline pointer-events rule.
             expect(el).toHaveClass("o_crm_offline_guarded");
             expect(el).toHaveStyle({ "pointer-events": "none" });
         }
@@ -5379,9 +5380,9 @@ test("[Offline] lead form DISABLE buttons unreachable and re-enabled online", as
     expect(queued("crm.lead")).toEqual([]);
 });
 
-// Refine D2.6 (U6): guarded CRM view-button links keep no pointer events offline,
-// although the framework's `.o_disabled_offline { pointer-events: auto !important }`
-// applies to the whole page.
+// Guarded CRM view-button links keep no pointer events offline, although the
+// framework's `.o_disabled_offline { pointer-events: auto !important }` applies to
+// the whole page.
 
 /** Pointer events a hover and a click dispatch to their target. */
 const POINTER_EVENT_TYPES = ["pointerover", "pointerenter", "pointerdown", "pointerup", "click"];
@@ -6479,7 +6480,7 @@ test("[Offline] forecast, reports and analysis views unreachable after an online
     expect.verifyErrors([LEAD_LIST_LOAD]);
 });
 
-// Refine D2.4/D2.5 (U4, U5)
+// Desktop navbar and command-palette offline menu states.
 
 /**
  * Another app, beside `CRM_MENUS`: its Stages entry opens a visited action, its
@@ -7393,9 +7394,9 @@ function isMeetingWriteRoute(route) {
  * Those tests cannot settle with `runAllTimers`: a displayed calendar (FullCalendar)
  * keeps a "today" timer that waits until the next day, up to 24 h, so `runAllTimers`
  * would advance a whole day of virtual time and run every short framework interval,
- * such as the bus election worker's 3 s check, tens of thousands of times. Under 3×
- * CPU throttling on the mobile preset, that made the lead meeting views test last
- * 6.7 s, above Hoot's 5 s default timeout; settled this way it lasts 3.2 s.
+ * such as the bus election worker's 3 s check, tens of thousands of times. Limiting
+ * virtual-time settling avoids processing thousands of unrelated framework intervals
+ * while still draining the meeting tests' short timers.
  */
 const CALENDAR_SETTLE_MS = 60_000;
 
@@ -8985,7 +8986,7 @@ test("[Offline] sales team dashboard controls are unreachable", async () => {
     expect(".o_avatar_card").toHaveCount(1);
 });
 
-// Refine D2.3 (U3): the avatar-card read of lead avatars (SKIP).
+// The avatar-card read of lead avatars (SKIP).
 
 /** Pipeline kanban arch (`crm_case_kanban_view_leads`) with the card's salesperson avatar. */
 const LEAD_AVATAR_KANBAN_ARCH = /* xml */ `
@@ -11316,7 +11317,7 @@ test("[Offline] lead form chatter is read-only without error", async () => {
     expect(".modal .o_form_view").toHaveCount(1);
 });
 
-// Refine D2.1 (U1): a lead chatter first opened offline loads once on reconnection.
+// A lead chatter first opened offline loads once on reconnection.
 
 /**
  * A connection lost without the browser announcing it: while `lost` is set, every
@@ -12709,9 +12710,9 @@ test("[Offline] online save during the replay of the lead's queued save is sent 
     expect.verifySteps([]);
 });
 
-// Refine D1.1 (R1): once the connection is back, the framework reports it lost until
-// a request reaches the server. A lead save made meanwhile must not reach the server
-// ahead of the lead's older queued writes, whose replay would then overwrite it.
+// Once the connection is back, the framework reports it lost until a request reaches
+// the server. A lead save made meanwhile must not reach the server ahead of the
+// lead's older queued writes, whose replay would then overwrite it.
 
 /**
  * A connection that comes back before the framework notices it: while `down`, every
@@ -12943,8 +12944,7 @@ test("[Offline] save held during a replay stays held when a lost connection is r
     expect.verifySteps([]);
 });
 
-// Refine D1.1 (R1): the two save paths of the replay hold that no test exercised, a
-// page-close save during a replay and a held save whose connection drops.
+// Urgent saves bypass the replay hold; a connection loss queues held saves.
 
 test("[Offline] page-close save during a replay is sent at once by beacon, not held", async () => {
     // The beacon reaches the server as it is sent (the page may be gone afterwards).
@@ -13150,9 +13150,9 @@ test("[Offline] lead form saved again after a card move replays last, its last w
     expect.verifyErrors([LEAD_GROUPS_LOAD, LEAD_RECORD_LOAD]);
 });
 
-// Refine D1.3 (R3): an online write from a lead's pipeline card made while the
-// replay has still to send a queued write of that lead (the lead's form save) is
-// sent after it, so the card's value, written last, is the one the server keeps.
+// An online write from a lead's pipeline card made while the replay has still to
+// send a queued write of that lead (the lead's form save) is sent after it, so the
+// card's value, written last, is the one the server keeps.
 
 /**
  * Steps each `crm.lead` `web_save` reaching the mock server (as `stepLeadWrites`),
@@ -13518,10 +13518,10 @@ test("[Online] card stage move waiting for the replay is sent once the lead's qu
     expect.verifySteps([]);
 });
 
-// Pipeline card writes and the connection state the framework reports (R1 on cards):
-// a card write is neither released ahead of the lead's queued writes by a reported
-// lost connection, nor sent ahead of them while the connection is reported lost
-// although it is back.
+// Pipeline card writes and the connection state the framework reports: a card write
+// is neither released ahead of the lead's queued writes by a reported lost
+// connection, nor sent ahead of them while the connection is reported lost although
+// it is back.
 
 test("[Online] card stage move held during a replay stays held when a lost connection is reported", async () => {
     // Offline root load served from the cache: the pipeline groups (back from the form).
@@ -14521,8 +14521,8 @@ test("[Offline] queued lead create whose replay answer is lost is sent again wit
     expect.verifySteps([]);
 });
 
-// Refine D1.2 (R2): a lead created in the form offline, then saved online while its own
-// create replays, is created once and keeps the values of that save.
+// A lead created in the form offline, then saved online while its own create replays,
+// is created once and keeps the values of that save.
 
 /**
  * Emulates the server's keyed lead create (the `crm.lead` `web_save` override) for the
@@ -16289,11 +16289,11 @@ test("[Offline] parked lead save retried from the systray after a server change 
     expect(queued("crm.lead")).toEqual([]);
 });
 
-// Refine D3.2a (P2): an addon adding a header button before "Won", as sale_crm adds
-// "New Quotation", moves "Won" under the phone header's "More" toggle, which the
-// framework disables offline. While that toggle holds a lead-form button tagged
-// available offline ("Won"), it stays available offline, so the offline mark-won is
-// still reached on a phone; every other "More" toggle keeps the framework's state.
+// An addon adding a header button before "Won", as sale_crm adds "New Quotation",
+// moves "Won" under the phone header's "More" toggle, which the framework disables
+// offline. While that toggle holds a lead-form button tagged available offline
+// ("Won"), it stays available offline, so the offline mark-won is still reached on a
+// phone; every other "More" toggle keeps the framework's state.
 
 /** Lead form header as `sale_crm` extends it: "New Quotation" before "Won", then "Lost". */
 const QUOTATION_FIRST_HEADER = /* xml */ `

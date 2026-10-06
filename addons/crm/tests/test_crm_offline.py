@@ -1251,8 +1251,9 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self.assertEqual(self._quick_create_xmlids(key).res_id, taken_over['id'])
         self.assertEqual(self._quick_create(salesman, vals, key), [taken_over])
 
-    # Refine D1.2 (R2): a lead created in the form offline, saved online while its
-    # own create replays, is created once and keeps the later values.
+    # An offline-created lead keeps one delivery key across replay and online saves:
+    # saved online while its own create replays, it is created once and keeps the
+    # later values.
 
     def _form_create(self, user, vals, key, specification=None, queued_by=None):
         """ Deliver the create a lead form sends for its new lead, as ``user``:

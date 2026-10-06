@@ -4577,9 +4577,9 @@ test("mobile pipeline hides the empty-data helper while a parked create whose st
 });
 
 // -----------------------------------------------------------------------------
-// Refine D2.2 (U2)
-// A stage deleted on the server leaves every stage list at the root reload that
-// follows a discard in the offline systray.
+// Deleted stages leave every stage list after an online discard reload: the root
+// reload that follows a discard in the offline systray lists no stage deleted on
+// the server.
 // -----------------------------------------------------------------------------
 
 /**
@@ -11148,13 +11148,13 @@ test("mobile activities: one remaining activity reads in the singular, online an
     expect(".o_crm_mobile_activities_more").toHaveAttribute("role", "status");
 });
 
-// Refine D3.1 (P1): the activity sheet on iOS Safari. Chrome and current WebKit
-// keep an expanded sheet's rail at its end when the sheet grows, by re-snapping
-// the rail to the sheet (its mandatory scroll snapping). A rail that is not
-// re-snapped (Safari without re-snapping, or any browser before the sheet's
-// slide-in has enabled snapping) stays where it was, below the sheet's new end.
-// Safari does not focus a tapped button either, so no focus move reveals a row:
-// the sheet expands itself after the patch that grew it. On a mobile OS the
+// Keep an expanded activity sheet visible when its rail does not re-snap. Chrome
+// and current WebKit keep an expanded sheet's rail at its end when the sheet
+// grows, by re-snapping the rail to the sheet (its mandatory scroll snapping). A
+// rail that is not re-snapped (Safari without re-snapping, or any browser before
+// the sheet's slide-in has enabled snapping) stays where it was, below the sheet's
+// new end. Safari does not focus a tapped button either, so no focus move reveals
+// a row: the sheet expands itself after the patch that grew it. On a mobile OS the
 // bottom sheet also takes the browser's Back (iOS edge swipe, Android back).
 test.tags("mobile");
 test("mobile activities: Show more keeps the sheet expanded on an iPhone rail that is not re-snapped", async () => {
@@ -12056,8 +12056,8 @@ test("mobile activities: the schedule form opens in view and focused, styled lik
 });
 
 // -----------------------------------------------------------------------------
-// Refine D1.4 (R4): an activity create whose answer is lost is created once, by
-// the delivery key (`CRM_OFFLINE_CREATE_KEY`) it carries online and queued alike
+// Lost activity-create replies are deduplicated by their delivery key
+// (`CRM_OFFLINE_CREATE_KEY`), which the create carries online and queued alike
 // -----------------------------------------------------------------------------
 
 /**
@@ -13152,9 +13152,10 @@ test("[Offline] card stage choices after a move back to the server stage replay 
     expect.verifyErrors(["/web/dataset/call_kw/crm.lead/web_read_group"]);
 });
 
-// Refine D1.3 (R3): a stage chosen online on a lead card while the replay has still
-// to send the lead's queued form save is sent after it, so the card's choice, made
-// last, is the stage the server keeps.
+// Online card stage writes follow the lead's pending form replay: a stage chosen
+// online on a lead card while the replay has still to send the lead's queued form
+// save is sent after it, so the card's choice, made last, is the stage the server
+// keeps.
 
 /**
  * Opens the pipeline in the web client and the form of "Office Design" (1) from its
