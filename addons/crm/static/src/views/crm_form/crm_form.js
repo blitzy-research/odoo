@@ -47,11 +47,14 @@ import {
     CRM_MOBILE_ACTIVITY_LIMIT,
     CRM_OFFLINE_CREATE_KEY,
     CRM_OFFLINE_CREATE_WRITE,
+    crmContextWithOrigin,
     crmDeliveredArgs,
+    crmIsReplayRunning,
     crmPendingLeadWrites,
     crmReplayQueued,
     crmReportError,
     crmReturnFocusFromSheet,
+    crmWriteOrigin,
     getCrmActivitySubfields,
     isCrmOfflineCreateKey,
     isCrmOfflineQueueBlocked,
@@ -490,6 +493,14 @@ class CrmFormRecord extends formView.Model.Record {
      * and "partner_email_update", which are computed fields that hold a value
      * whenever we need to synch.
      *
+     * A save held for the replay of the lead's queued writes is sent with the user
+     * and database of the session it was made in (`_crmAwaitLeadReplay`). Its edits
+     * keep that origin until they are delivered: every later save of the record that
+     * is sent (the form's save once the replay ends, the user's own save, the
+     * page-close beacon) carries it too, until a save of the record succeeds, sent or
+     * queued, or its changes are dropped (`_crmUndeliveredOrigin`). Any other save is
+     * sent as before, with no origin.
+     *
      * @override
      */
     async _save() {
@@ -504,17 +515,23 @@ class CrmFormRecord extends formView.Model.Record {
         // still-new lead, any other save waits for it (`_crmAwaitLeadReplay`). A wait
         // ended by a connection reported lost, or by the end of the form, with that
         // write still pending, ends "queue only": the save is then queued after it,
-        // never sent. As the replay may have failed to send, or parked, the queued
-        // save the lists name meanwhile, the routing is decided again once the wait
-        // ends. While the connection is reported lost, a save of a lead with such a
-        // write is queued after it as well (`_crmQueuesSave`). Any other save starts
-        // at once.
+        // never sent. A held save that is sent carries the user who made it and the
+        // database of their session, read when the wait started (`origin`); so does
+        // every later save of the record that is sent until a save of it succeeds or
+        // its changes are dropped, as it still holds the edits of that held save
+        // (`_crmUndeliveredOrigin`, `_crmSendWithOrigin`). As the replay may have
+        // failed to send, or parked, the queued save the lists name meanwhile, the
+        // routing is decided again once the wait ends. While the connection is
+        // reported lost, a save of a lead with such a write is queued after it as well
+        // (`_crmQueuesSave`). Any other save starts at once.
+        const record = toRaw(this);
         let routes = untrack(() => this._crmRoutesSave());
         let queueOnly = false;
+        let origin;
         if (!routes) {
             const leadReplay = this._crmAwaitLeadReplay();
             if (leadReplay) {
-                queueOnly = await leadReplay;
+                ({ queueOnly, origin } = await leadReplay);
                 routes = untrack(() => this._crmRoutesSave());
             }
         }
@@ -532,6 +549,9 @@ class CrmFormRecord extends formView.Model.Record {
             const result = this._offlineSave();
             if (asksReplay) {
                 crmReplayQueued(this.model.offlinePlugin);
+            }
+            if (result) {
+                record._crmUndeliveredOrigin = undefined;
             }
             return result;
         }
@@ -572,11 +592,21 @@ class CrmFormRecord extends formView.Model.Record {
         // most one of the two paths changes the save. A save that is sent (its
         // request, or its page-close beacon) leaves out the x2many commands a queued
         // save of the lead does, sent or delivered by a replay
-        // (`_crmSaveLeavingQueuedCommands`).
+        // (`_crmSaveLeavingQueuedCommands`); held by the replay hold, or holding the
+        // undelivered edits of a held save, its request (or beacon) carries the hold's
+        // `origin` (`_crmSendWithOrigin`). Once a save of the record succeeds, sent or
+        // queued, its edits are no longer the record's to send.
         const queues = routes || untrack(() => this._crmQueuesSave(queueOnly));
+        const send = () => super._save(...arguments);
+        const sendOrigin = queues ? undefined : origin || record._crmUndeliveredOrigin;
         const res = queues
-            ? await this._crmQueueSave(() => super._save(...arguments))
-            : await this._crmSaveLeavingQueuedCommands(() => super._save(...arguments));
+            ? await this._crmQueueSave(send)
+            : await this._crmSaveLeavingQueuedCommands(
+                  sendOrigin ? () => this._crmSendWithOrigin(sendOrigin, send) : send
+              );
+        if (res) {
+            record._crmUndeliveredOrigin = undefined;
+        }
         // The rainbowman lookup is decorative: offline it is neither issued nor queued.
         // The signal is read after the save, because a connection lost during the save
         // turns the plugin offline before the queued (offline) save resolves. A save
@@ -598,8 +628,12 @@ class CrmFormRecord extends formView.Model.Record {
      *
      * The save is released, to be sent, once no pending (not parked) queued
      * `crm.lead` call writing a field of the lead remains (`_crmHasPendingLeadWrite`),
-     * or once the replay ends; when the replay stopped on a lost call, the save is
-     * then queued after that call instead of being sent (`_crmQueuesSave`).
+     * or once no replay is in progress any more (`crmIsReplayRunning`); when the
+     * replay stopped on a lost call, the save is then queued after that call instead
+     * of being sent (`_crmQueuesSave`). A write of the lead queued during the replay,
+     * which that replay did not read (such as a save of the lead released "queue
+     * only"), is sent by the replay that follows it: the save stays held across the
+     * end of the first replay until that one sends it.
      *
      * It is also released, "queue only", as soon as the plugin reports the
      * connection lost or the form owning the record is destroyed (`crmDestroyed` of
@@ -624,30 +658,47 @@ class CrmFormRecord extends formView.Model.Record {
      * the replay keeps if it is sending that create meanwhile (`crmReplayCall`).
      *
      * Nothing is held for an urgent save (the page is being left, and its beacon
-     * cannot wait), when no replay runs, or for a save without an edit of the user
-     * (`_crmHasOwnEdits`); a record without an id is held only for its own pending
-     * queued create. While the connection is reported lost and no replay runs, a save
-     * of a lead with an id and a pending queued write is queued after that write
-     * instead (`_crmQueuesSave`). `_save` does not ask for the hold of a save naming
-     * records or commands of a queued save that no replay sent: that save is queued
-     * at once (`_crmRoutesSave`).
+     * cannot wait), when no replay is in progress, or for a save without an edit of
+     * the user (`_crmHasOwnEdits`); a record without an id is held only for its own
+     * pending queued create. While the connection is reported lost and no replay
+     * runs, a save of a lead with an id and a pending queued write is queued after
+     * that write instead (`_crmQueuesSave`). `_save` does not ask for the hold of a
+     * save naming records or commands of a queued save that no replay sent: that
+     * save is queued at once (`_crmRoutesSave`).
      *
-     * @returns {Promise<boolean>|undefined} resolved once the save may proceed:
-     *   `true` when it is to be queued only, `false` when it may be sent; `undefined`
-     *   when it may be sent at once
+     * Sent once released, the save reaches the server in whatever session the
+     * browser then holds, which another user, or the same user id on another
+     * database served on this origin, may have opened meanwhile (in another tab). So
+     * the hold's outcome carries the user who made the save and the database of the
+     * session they made it in, read when the hold starts (`crmWriteOrigin`), which the
+     * save's request then sends in its context (`_crmSendWithOrigin`): the server
+     * refuses it in another user's session, as it refuses a queued call replayed
+     * there, and in a session of another database, and nothing is applied. Refused,
+     * its edits stay in the form, still bound to that origin: every later send of
+     * them (the form's save once the replay ends, the user's own save, the page-close
+     * beacon), held or not, carries it as well, until a save of the record succeeds
+     * or its changes are dropped (`_crmUndeliveredOrigin`). A save queued instead
+     * carries the identity every queued CRM call carries.
+     *
+     * @returns {Promise<import("@crm/mobile/crm_offline_hooks").CrmWriteTurn>|undefined}
+     *   resolved once the save may proceed, with `queueOnly` set when it is to be
+     *   queued only, and `origin`, which its request sends when it is sent;
+     *   `undefined` when it may be sent at once, as before, without any origin
      */
     _crmAwaitLeadReplay() {
         if (!untrack(() => this._crmIsLeadReplayPending() && this._crmHasOwnEdits())) {
             return undefined;
         }
+        const origin = crmWriteOrigin();
         const plugin = this.model.offlinePlugin;
         const destroyed = this.model.crmDestroyed;
         let stop;
         const released = new Promise((resolve) => {
             // Created outside any computation, so that only `stop` disposes of it. Its
             // first run is synchronous; it runs again on every change of the signals
-            // it reads: the sync and queue signals (`_crmIsLeadReplayPending`), then,
-            // while the save is still held, the connection and the model's lifetime.
+            // it reads: the sync, replay and queue signals (`_crmIsLeadReplayPending`),
+            // then, while the save is still held, the connection and the model's
+            // lifetime.
             stop = untrack(() =>
                 effect(() => {
                     if (!this._crmIsLeadReplayPending()) {
@@ -660,8 +711,103 @@ class CrmFormRecord extends formView.Model.Record {
         });
         return released.then((queueOnly) => {
             stop();
-            return queueOnly;
+            return { queueOnly, origin };
         });
+    }
+
+    /**
+     * Runs `send`, the parent save of this lead released by the replay hold
+     * (`_crmAwaitLeadReplay`), or a later save of the record still holding the edits
+     * of such a save (`_crmUndeliveredOrigin`), with the model's ORM sending the
+     * lead's own `web_save` (by the lead's id, or without ids for the create of a
+     * still-new lead, which its delivery key and later-save flag go with:
+     * `_crmSaveSendingCreateKey`) with `origin`, the user who made the held save and
+     * the database of their session, in its context (`crmContextWithOrigin`): sent in
+     * another user's session or in a session of another database, it is refused by
+     * the server, and the framework handles its error as for any refused save. An
+     * urgent save sends its page-close beacon instead, which the parent builds from the
+     * record's context while `send` starts (`context`, `_crmSendsOrigin`): it carries
+     * `origin` as well. `send` starts at once, so the parent reads the changes it sends
+     * while the caller says so (`_crmSaveLeavingQueuedCommands`). Every other call of
+     * the model's ORM, and every later read of the record's context (such as the
+     * queued save of a request lost meanwhile, which the framework queues as before),
+     * is unchanged. The model's ORM is put back when the save settles, unless another
+     * wrapper replaced it since.
+     *
+     * The record's edits stay bound to `origin` (`_crmUndeliveredOrigin`) from now on:
+     * a save that is refused, or that does not happen, leaves them in the form, and
+     * every later send of them carries `origin` too (`_save`), until a save of the
+     * record succeeds (answered, or queued by the framework after a lost request) or
+     * its changes are dropped (`_discard`, a load that resets them: `_setData`).
+     *
+     * @param {import("@crm/mobile/crm_offline_hooks").CrmWriteOrigin} origin
+     * @param {() => Promise<boolean>} send
+     * @returns {Promise<boolean>} the result of `send`
+     */
+    async _crmSendWithOrigin(origin, send) {
+        const record = toRaw(this);
+        const model = toRaw(this.model);
+        const orm = model.orm;
+        const resModel = this.resModel;
+        const resId = this.resId;
+        record._crmUndeliveredOrigin = origin;
+        const originOrm = Object.assign(Object.create(orm), {
+            call(callModel, callMethod, args, kwargs) {
+                const ids = args?.[0];
+                if (
+                    callModel === resModel &&
+                    callMethod === "web_save" &&
+                    Array.isArray(ids) &&
+                    (resId ? ids.length === 1 && ids[0] === resId : ids.length === 0)
+                ) {
+                    kwargs = { ...kwargs, context: crmContextWithOrigin(kwargs?.context, origin) };
+                }
+                return orm.call.call(this, callModel, callMethod, args, kwargs);
+            },
+        });
+        model.orm = originOrm;
+        const sendsOrigin = record._crmSendsOrigin;
+        record._crmSendsOrigin = origin;
+        try {
+            let promise;
+            try {
+                promise = send();
+            } finally {
+                record._crmSendsOrigin = sendsOrigin;
+            }
+            return await promise;
+        } finally {
+            if (model.orm === originOrm) {
+                model.orm = orm;
+            }
+        }
+    }
+
+    /**
+     * @override
+     * While an urgent save sending the edits of a held save builds its page-close
+     * beacon (`_crmSendWithOrigin`: `_crmSendsOrigin`), the context carries the origin
+     * of that held save (`crmContextWithOrigin`). Every other read is the parent's
+     * context, unchanged.
+     */
+    get context() {
+        const context = super.context;
+        const origin = toRaw(this)._crmSendsOrigin;
+        if (!origin || !this.model._urgentSave) {
+            return context;
+        }
+        return crmContextWithOrigin(context, origin);
+    }
+
+    /**
+     * @override
+     * The record's changes are dropped, those of a held save it could not deliver
+     * included: later edits are saved as any edit is, with no origin
+     * (`_crmUndeliveredOrigin`).
+     */
+    _discard() {
+        super._discard(...arguments);
+        toRaw(this)._crmUndeliveredOrigin = undefined;
     }
 
     /**
@@ -723,18 +869,23 @@ class CrmFormRecord extends formView.Model.Record {
     }
 
     /**
-     * Whether the running replay has still to send a queued write the save of the
+     * Whether a replay in progress has still to send a queued write the save of the
      * lead must follow (`_crmAwaitLeadReplay`): a pending queued write of a field of
      * the lead (`_crmHasPendingLeadWrite`), or the pending queued create of the
-     * still-new lead. The connection state the plugin reports plays no part here; it
-     * only decides how the save proceeds once released. It reads the plugin's sync
-     * and queue signals, so that an effect calling it follows them.
+     * still-new lead. A replay is in progress from the start of its call, while it
+     * waits for the replay lock, until the replay that follows it to send the calls
+     * queued meanwhile has ended (`crmIsReplayRunning`): a write of the lead queued
+     * during a replay, which that replay did not read, is sent by the next one, and
+     * the save waits for it across the end of the first. The connection state the
+     * plugin reports plays no part here; it only decides how the save proceeds once
+     * released. It reads the plugin's sync, replay and queue signals, so that an
+     * effect calling it follows them.
      *
      * @returns {boolean}
      */
     _crmIsLeadReplayPending() {
         const plugin = this.model.offlinePlugin;
-        if (this.model._urgentSave || !plugin.syncingORM()) {
+        if (this.model._urgentSave || !crmIsReplayRunning(plugin)) {
             return false;
         }
         if (!this.resId) {
@@ -2097,8 +2248,9 @@ class CrmFormRecord extends formView.Model.Record {
      * Either way, the lead's email and phone are remembered as loaded, before any
      * queued value is applied over them (`_crmRememberLoadedContacts`).
      * A parent call that resets the changes also ends the state of a partner change
-     * whose onchange was lost (`_getOnchangeValues`): the changes it concerned are
-     * gone. A call that keeps them, like a `crmRefresh` load, keeps that state.
+     * whose onchange was lost (`_getOnchangeValues`), and the binding of the edits of
+     * a held save to its origin (`_crmUndeliveredOrigin`): the changes they concerned
+     * are gone. A call that keeps them, like a `crmRefresh` load, keeps both.
      */
     _setData(data, options = {}) {
         const refresh = this._crmRefreshState;
@@ -2110,6 +2262,7 @@ class CrmFormRecord extends formView.Model.Record {
             if (!options.keepChanges) {
                 this._crmPartnerOnchangeLost = false;
                 this._crmRevertedContacts = undefined;
+                toRaw(this)._crmUndeliveredOrigin = undefined;
             }
             if (keepsRestoredEdits && Object.keys(this._changes).length) {
                 this.dirty = true;
@@ -2167,6 +2320,10 @@ class CrmFormRecord extends formView.Model.Record {
      * leaves out what the replayed save did (`_crmSaveLeavingQueuedCommands`): when
      * nothing else is left, it sends nothing and the form shows the refreshed values.
      * A save that does not happen (invalid record) leaves the changes in the form.
+     * Changes that still hold the edits of a held save the server refused are sent
+     * with that save's origin, as every later save of them is (`_save`,
+     * `_crmUndeliveredOrigin`): in the session of another user or database, the server
+     * refuses them again, and they stay in the form.
      *
      * @param {{dropFields: string[], saving: boolean}} refresh
      * @returns {Promise<void>}

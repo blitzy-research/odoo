@@ -15033,6 +15033,160 @@ test("[Online] lead dialog save held during a replay is queued after the lead's 
     expect.verifySteps([]);
 });
 
+// A lead write queued during a replay (a write released "queue only") is not sent by
+// that replay, which read the queue when it started: the replay that follows it sends
+// that write. A write of the lead held during the first replay stays held until then,
+// across the end of the first replay, so that the user's later write reaches the
+// server last.
+
+/**
+ * Opens lead 1 in a form dialog over the current view, chooses stage B (Qualified) and
+ * saves: the save waits for the replay, as the lead has queued writes still to be sent.
+ * The dialog is then closed (Escape): with its form gone, the save stops waiting
+ * without being sent, and is queued after the lead's writes, unread by the running
+ * replay.
+ *
+ * @param {string[]} keysBefore the queued `crm.lead` keys before the save
+ * @returns {Promise<Object>} the queue entry of the dialog's save
+ */
+async function queueLeadDialogStageDuringReplay(keysBefore) {
+    getService("dialog").add(FormViewDialog, {
+        resModel: "crm.lead",
+        resId: 1,
+        context: callContext(PIPELINE_ACTION.context),
+    });
+    await contains(`.modal .o_statusbar_status button[data-value='${STAGE_QUALIFIED}']`).click();
+    await contains(".modal .o_form_button_save").click();
+    await animationFrame();
+    expect.verifySteps([]);
+    await press("Escape");
+    await animationFrame();
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+    const dialogSave = queued("crm.lead").find(({ key }) => !keysBefore.includes(key));
+    expect(dialogSave.value.args).toEqual([[1], { stage_id: STAGE_QUALIFIED }]);
+    expect(queued("crm.lead").map(({ key }) => key)).toEqual([...keysBefore, dialogSave.key]);
+    return dialogSave;
+}
+
+test.tags("desktop");
+test("[Online] card stage move held during a replay is sent after a lead save queued during that replay, once the replay that follows sends it", async () => {
+    const lead2Write = stepLeadWritesHoldingLead2();
+    mockDate("2026-10-02 09:00:00");
+    const setOffline = mockOffline();
+    await openPipeline();
+    await flushStartupSync();
+    const plugin = getService(OfflinePlugin);
+    const lead1 = ".o_kanban_record:contains(Lead 1)";
+
+    // Offline: a write of another lead is queued, then, a minute later, the card menu
+    // of the lead queues colour 3.
+    await setOffline(true);
+    const renameKey = queueLead2RenameFirst(plugin);
+    await contains(`${lead1} .o_dropdown_kanban .dropdown-toggle`, { visible: false }).click();
+    await contains(".o-dropdown--menu .o_colorlist_item_color_3").click();
+    const colourKey = queued("crm.lead").find(({ key }) => key !== renameKey).key;
+
+    // Reconnected: the replay reads the queue, sends the other lead's write first, and
+    // is held there.
+    await setOffline(false);
+    await expect.waitForSteps([LEAD_2_RENAME_STEP]);
+    expect(plugin.syncingORM()).toBe(true);
+
+    // A save of the lead's stage B is queued meanwhile, after the lead's writes: the
+    // running replay does not send it.
+    const dialogSave = await queueLeadDialogStageDuringReplay([renameKey, colourKey]);
+
+    // The card then moves the lead to C (Won): its save waits for the lead's queued
+    // writes, the dialog's save included.
+    await moveLeadCard("Lead 1", STAGE_WON, 2);
+    await animationFrame();
+    expect.verifySteps([]);
+
+    // The replay sends the lead's colour and ends; the replay that follows sends the
+    // dialog's save, and only then is the card's save sent: the stage the user chose
+    // last is the one the server keeps.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await waitUntil(() => !(dialogSave.key in plugin._ormToSync()));
+    await runAllTimers();
+    await animationFrame();
+    expect.verifySteps([
+        `web_save [1] ${JSON.stringify({ color: 3 })}`,
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_WON })}`,
+    ]);
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0]).toMatchObject({
+        color: 3,
+        stage_id: STAGE_WON,
+    });
+    expect(MockServer.env["crm.lead"].browse(2)[0].name).toBe("Lead 2 renamed");
+    expect(`.o_kanban_group:eq(2) ${lead1}`).toHaveCount(1);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] lead form save held during a replay is sent after a lead save queued during that replay, once the replay that follows sends it", async () => {
+    const lead2Write = stepLeadWritesHoldingLead2();
+    mockDate("2026-10-02 09:00:00");
+    const setOffline = mockOffline();
+    await openPipeline();
+    await flushStartupSync();
+    await openLead(1);
+    const plugin = getService(OfflinePlugin);
+
+    // Offline: a write of another lead is queued, then, a minute later, the lead form
+    // saves a revenue of 1800, queued.
+    await setOffline(true);
+    const renameKey = queueLead2RenameFirst(plugin);
+    await contains(".o_field_widget[name=expected_revenue] input").edit("1800");
+    await contains(".o_form_button_save").click();
+    const formSave = queued("crm.lead").find(({ key }) => key !== renameKey);
+    expect(formSave.value.args).toEqual([[1], { expected_revenue: 1800 }]);
+
+    // Reconnected: the replay reads the queue, sends the other lead's write first, and
+    // is held there.
+    await setOffline(false);
+    await expect.waitForSteps([LEAD_2_RENAME_STEP]);
+    expect(plugin.syncingORM()).toBe(true);
+
+    // A save of the lead's stage B is queued meanwhile, after the lead's writes: the
+    // running replay does not send it.
+    const dialogSave = await queueLeadDialogStageDuringReplay([renameKey, formSave.key]);
+
+    // The form then saves stage C (Won): the save waits for the lead's queued writes,
+    // the dialog's save included.
+    await selectStage(STAGE_WON, "Won");
+    await contains(".o_form_button_save").click();
+    await animationFrame();
+    expect.verifySteps([]);
+
+    // The replay sends the lead's revenue and ends; the replay that follows sends the
+    // dialog's save, and only then is the form's save sent: the stage the user chose
+    // last is the one the server keeps, and the form shows it.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await waitUntil(() => !(dialogSave.key in plugin._ormToSync()));
+    await runAllTimers();
+    await animationFrame();
+    expect.verifySteps([
+        lead1RevenueStep(1800),
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_WON })}`,
+    ]);
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0]).toMatchObject({
+        expected_revenue: 1800,
+        stage_id: STAGE_WON,
+    });
+    expect(MockServer.env["crm.lead"].browse(2)[0].name).toBe("Lead 2 renamed");
+    expect(currentStageSelector()).toHaveText("Won");
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
 /**
  * Steps each `crm.lead` `web_save` reaching the mock server as `web_save <ids> <values>`
  * (`action_set_won` is stepped with its payload for every test).
@@ -17473,6 +17627,408 @@ test("[Online] forecast list edit during the replay of the lead's queued save is
     expect.verifySteps([]);
 });
 
+// Shared browser: a lead form save held for the replay of the lead's queued writes is
+// sent, at its turn, with the user who made it and the database of their session, as
+// a held card write is, so that the server refuses it once the browser's session
+// belongs to another user or to another database served on this origin.
+
+/** Step of a `web_save` of lead 1 writing `revenue` (`stepLeadWritesHoldingLead2`). */
+function lead1RevenueStep(revenue) {
+    return `web_save [1] ${JSON.stringify({ expected_revenue: revenue })}`;
+}
+
+/**
+ * Opens lead 1 of "My Pipeline" in its form and lets the start-up sync run. Offline, a
+ * rename of lead 2 is queued (`queueLead2RenameFirst`), then, a minute later, the form
+ * saves a revenue of 1800, queued. Reconnected, the replay sends the rename first and
+ * is held there (`stepLeadWritesHoldingLead2`), with the form's queued save still to
+ * be sent. The form then saves a revenue of 1801 online: the save waits for its turn.
+ *
+ * @returns {Promise<{plugin: OfflinePlugin, lead2Write: PromiseWithResolvers<void>,
+ *  renameKey: string, formSave: Object, revenue: number}>} `revenue`: the server's
+ *  revenue of lead 1 before the replay sends anything of it
+ */
+async function holdLead1FormSaveDuringReplay() {
+    const lead2Write = stepLeadWritesHoldingLead2();
+    // The clock is set before the views and the cache are created (see above).
+    mockDate("2026-10-02 09:00:00");
+    const setOffline = mockOffline();
+    await openPipeline();
+    await flushStartupSync();
+    await openLead(1);
+    const plugin = getService(OfflinePlugin);
+    const revenue = MockServer.env["crm.lead"].browse(1)[0].expected_revenue;
+
+    await setOffline(true);
+    const renameKey = queueLead2RenameFirst(plugin);
+    await contains(".o_field_widget[name=expected_revenue] input").edit("1800");
+    await contains(".o_form_button_save").click();
+    const formSave = queued("crm.lead").find(({ key }) => key !== renameKey);
+    expect(formSave.value.args).toEqual([[1], { expected_revenue: 1800 }]);
+    expect.verifySteps([]);
+
+    await setOffline(false);
+    await expect.waitForSteps([LEAD_2_RENAME_STEP]);
+    expect(plugin.syncingORM()).toBe(true);
+    await contains(".o_field_widget[name=expected_revenue] input").edit("1801");
+    await contains(".o_form_button_save").click();
+    await animationFrame();
+    expect.verifySteps([]);
+    expect(".o_form_button_save").not.toBeEnabled();
+    return { plugin, lead2Write, renameKey, formSave, revenue };
+}
+
+test("[Online] lead form save held during a replay is sent with the user and database that made it", async () => {
+    const sent = recordCallContexts("crm.lead", "web_save");
+    const { plugin, lead2Write, renameKey } = await holdLead1FormSaveDuringReplay();
+
+    // Sent at its turn, after the lead's queued save, the held save names the user who
+    // made it and the database of their session, in the context the queued save of the
+    // same form was sent in.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([lead1RevenueStep(1800), lead1RevenueStep(1801)]);
+    const [replayedSave, heldSave] = sent.filter(({ ids }) => ids[0] === 1);
+    expect(heldSave.context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    expect(heldSave.context[CRM_OFFLINE_DB_KEY]).toBe(session.db);
+    expect(heldSave.context).toEqual({
+        ...replayedSave.context,
+        [CRM_OFFLINE_DB_KEY]: session.db,
+    });
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(1801);
+
+    // With no replay running, a save is sent at once, as before, with no user id nor
+    // database.
+    await contains(".o_field_widget[name=expected_revenue] input").edit("1802");
+    await contains(".o_form_button_save").click();
+    await expect.waitForSteps([lead1RevenueStep(1802)]);
+    expect(sent.at(-1).ids).toEqual([1]);
+    expect(sent.at(-1).context).not.toInclude(CRM_OFFLINE_UID_KEY);
+    expect(sent.at(-1).context).not.toInclude(CRM_OFFLINE_DB_KEY);
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(1802);
+    expect(".o_field_widget[name=expected_revenue] input").toHaveValue("1,802.00");
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test("[Online] lead form save held during a replay is refused, and changes nothing, once the browser's session belongs to another user", async () => {
+    // The framework's error dialog of the refused save.
+    expect.errors(1);
+    const browserSession = mockBrowserSession();
+    // Registered after the refusal, so that it runs first: the refused calls too.
+    const sent = recordCallContexts("crm.lead", "web_save");
+    const { plugin, lead2Write, renameKey, formSave, revenue } =
+        await holdLead1FormSaveDuringReplay();
+
+    // Another user signs in on this browser (another tab) before the save's turn: the
+    // server session the replay and the save then reach is theirs. This user's queued
+    // saves are refused and parked; the held save, released by them, is sent with the
+    // id of the user who made it and refused as well. The framework shows its error.
+    browserSession.uid = serverState.userId + 100;
+    await releaseLead2RenameRefused(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([lead1RevenueStep(1800), lead1RevenueStep(1801)]);
+    await waitFor(".o_error_dialog");
+    expect(queryFirst(".o_error_dialog").textContent).toInclude(ORIGIN_ERROR_MESSAGE);
+    expect(sent.at(-1).ids).toEqual([1]);
+    expect(sent.at(-1).context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    expect(sent.at(-1).context[CRM_OFFLINE_DB_KEY]).toBe(session.db);
+    expect.verifyErrors([ORIGIN_ERROR_MESSAGE]);
+
+    // Nothing was applied: the server keeps the leads as they were, and both queued
+    // saves stay parked with the server's error, for their user.
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(revenue);
+    expect(MockServer.env["crm.lead"].browse(2)[0].name).toBe("Lead 2");
+    expect(queued("crm.lead").map(({ key, value }) => [key, value.extras.error])).toEqual([
+        [renameKey, originParkedError()],
+        [formSave.key, originParkedError()],
+    ]);
+    expect.verifySteps([]);
+});
+
+test("[Online] lead form save held during a replay is refused, and changes nothing, once the browser's session belongs to another database", async () => {
+    // The framework's error dialog of the refused save.
+    expect.errors(1);
+    const otherDb = `${serverState.db}_other`;
+    const missing = {
+        errorName: "odoo.exceptions.MissingError",
+        message: "Record does not exist or has been deleted.",
+    };
+    /** @type {{uid: number|false, db: string}} */
+    let browserSession;
+    // Registered first, so that it runs last, once the call passed the session check:
+    // the same user id signs in on another database served on this origin (another
+    // tab) as the replay sends the form's queued save, which reaches that database,
+    // where the lead does not exist. The save is refused there and parked. The session
+    // the held save, sent after it, reaches is then the other database's, where this
+    // user id names another user.
+    onRpc("crm.lead", "web_save", ({ args }) => {
+        if (args[0][0] === 1 && args[1].expected_revenue === 1800) {
+            browserSession.db = otherDb;
+            throw makeServerError(missing);
+        }
+    });
+    browserSession = mockBrowserSession();
+    // Registered after the refusal, so that it runs first: the refused calls too.
+    const sent = recordCallContexts("crm.lead", "web_save");
+    const { plugin, lead2Write, renameKey, formSave, revenue } =
+        await holdLead1FormSaveDuringReplay();
+
+    // Released once the queued save is parked, the held save names the user who made
+    // it, whose id the other database's session has too, and the database of their
+    // session: it is refused. The framework shows its error.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([lead1RevenueStep(1800), lead1RevenueStep(1801)]);
+    await waitFor(".o_error_dialog");
+    expect(queryFirst(".o_error_dialog").textContent).toInclude(ORIGIN_ERROR_MESSAGE);
+    expect(browserSession).toEqual({ uid: user.userId, db: otherDb });
+    expect(sent.at(-1).ids).toEqual([1]);
+    expect(sent.at(-1).context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    expect(sent.at(-1).context[CRM_OFFLINE_DB_KEY]).toBe(session.db);
+    expect.verifyErrors([ORIGIN_ERROR_MESSAGE]);
+
+    // Nothing of the held save was applied, and it is not queued: the server keeps the
+    // lead's revenue, and only the lead's own queued save stays parked.
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(revenue);
+    expect(MockServer.env["crm.lead"].browse(2)[0].name).toBe("Lead 2 renamed");
+    expect(queued("crm.lead").map(({ key, value }) => [key, value.extras.error])).toEqual([
+        [formSave.key, `${missing.errorName} - ${missing.message}`],
+    ]);
+    expect.verifySteps([]);
+});
+
+// Shared browser: the edits of a held lead form save the server refused stay bound to
+// the user and database of the hold until they are delivered. Every later send of them
+// (the save the form makes once the replay ends, the user's own save, the page-close
+// beacon) names them, so that it is refused again in the other session and nothing of
+// them is applied there. Once they are discarded, new edits are saved as before.
+
+/**
+ * Holds a lead form save of a revenue of 1801 for the replay of the form's queued save
+ * of 1800 (`holdLead1FormSaveDuringReplay`). The replay delivers that queued save in
+ * this session, then `switchSession` gives the browser's session
+ * (`mockBrowserSession`) to another user or database (another tab signs in) before
+ * the held save is sent. Released, the held save is refused there, and so is the save
+ * of its edits the form makes once the replay ends (`crmReconcile`): both are sent
+ * with the user and database of the hold. The framework shows both errors.
+ *
+ * @param {(browserSession: {uid: number|false, db: string}) => void} switchSession
+ * @returns {Promise<{plugin: OfflinePlugin, browserSession: {uid: number|false, db:
+ *  string}, sent: {ids: number[], context: Object}[]}>} `sent`: the `crm.lead`
+ *  `web_save` calls reaching the server, refused ones included
+ */
+async function refuseHeldLead1FormSaveInSwitchedSession(switchSession) {
+    /** @type {{uid: number|false, db: string}} */
+    let browserSession;
+    // Registered first, so that it runs last, once the call passed the session check:
+    // the form's queued save is applied in this session, then the session switches.
+    onRpc("crm.lead", "web_save", async ({ args, parent }) => {
+        if (args[0][0] === 1 && args[1].expected_revenue === 1800) {
+            const answer = await parent();
+            switchSession(browserSession);
+            return answer;
+        }
+    });
+    browserSession = mockBrowserSession();
+    // Registered after the refusal, so that it runs first: the refused calls too.
+    const sent = recordCallContexts("crm.lead", "web_save");
+    const { plugin, lead2Write, renameKey } = await holdLead1FormSaveDuringReplay();
+
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        lead1RevenueStep(1800),
+        lead1RevenueStep(1801),
+        lead1RevenueStep(1801),
+    ]);
+    await expect.waitForErrors([ORIGIN_ERROR_MESSAGE, ORIGIN_ERROR_MESSAGE]);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(".o_error_dialog").toHaveCount(2);
+
+    // The queued save is sent as every queued CRM call is, naming the user who queued
+    // it. The held save and the form's save of its edits after the replay both name
+    // the user and the database of the hold, in the context of the form.
+    const [replayedSave, heldSave, refreshSave] = sent.filter(({ ids }) => ids[0] === 1);
+    expect(replayedSave.context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    expect(replayedSave.context).not.toInclude(CRM_OFFLINE_DB_KEY);
+    const boundContext = { ...replayedSave.context, [CRM_OFFLINE_DB_KEY]: session.db };
+    expect(heldSave.context).toEqual(boundContext);
+    expect(refreshSave.context).toEqual(boundContext);
+
+    // Nothing of the edits was applied, nor queued: the server keeps the revenue of the
+    // lead's queued save, and the form still holds them, unsaved.
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(1800);
+    expect(MockServer.env["crm.lead"].browse(2)[0].name).toBe("Lead 2 renamed");
+    expect(queued("crm.lead")).toEqual([]);
+    expect(".o_field_widget[name=expected_revenue] input").toHaveValue("1,801.00");
+    expect(".o_form_button_save").toBeEnabled();
+    return { plugin, browserSession, sent };
+}
+
+/** Closes every error dialog the framework shows, one after the other. */
+async function closeErrorDialogs() {
+    while (queryAll(".o_error_dialog").length) {
+        await contains(".o_error_dialog .modal-footer .btn-primary").click();
+    }
+}
+
+/**
+ * Saves the lead form with its unsaved edits, as the user does once the server
+ * refused them (`refuseHeldLead1FormSaveInSwitchedSession`): the save is sent with the
+ * user and database of the hold again, and refused again; the framework shows its
+ * error, and the server keeps the lead's revenue.
+ *
+ * @param {{ids: number[], context: Object}[]} sent
+ */
+async function saveRefusedLead1EditsAgain(sent) {
+    await closeErrorDialogs();
+    await contains(".o_form_button_save").click();
+    await expect.waitForSteps([lead1RevenueStep(1801)]);
+    await waitFor(".o_error_dialog");
+    expect(queryFirst(".o_error_dialog").textContent).toInclude(ORIGIN_ERROR_MESSAGE);
+    expect(sent.at(-1).ids).toEqual([1]);
+    expect(sent.at(-1).context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    expect(sent.at(-1).context[CRM_OFFLINE_DB_KEY]).toBe(session.db);
+    expect.verifyErrors([ORIGIN_ERROR_MESSAGE]);
+    await animationFrame();
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(1800);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(".o_field_widget[name=expected_revenue] input").toHaveValue("1,801.00");
+}
+
+test("[Online] lead form edits of a held save refused in another database are sent again with their user and database, and refused", async () => {
+    // The framework's error dialogs: the held save, the form's save of its edits once
+    // the replay ends, and the user's own save of them.
+    expect.errors(3);
+    const otherDb = `${serverState.db}_other`;
+    const { browserSession, sent } = await refuseHeldLead1FormSaveInSwitchedSession(
+        (browserSession) => {
+            browserSession.db = otherDb;
+        }
+    );
+    expect(browserSession).toEqual({ uid: user.userId, db: otherDb });
+
+    // Saved again by the user, the edits still name the user and database of the hold:
+    // the other database refuses them.
+    await saveRefusedLead1EditsAgain(sent);
+    expect.verifySteps([]);
+});
+
+test("[Online] lead form edits of a held save refused in another user's session are sent again with their user and database, and refused", async () => {
+    // The framework's error dialogs: the held save, the form's save of its edits once
+    // the replay ends, and the user's own save of them.
+    expect.errors(3);
+    const otherUid = serverState.userId + 100;
+    const { browserSession, sent } = await refuseHeldLead1FormSaveInSwitchedSession(
+        (browserSession) => {
+            browserSession.uid = otherUid;
+        }
+    );
+    expect(browserSession).toEqual({ uid: otherUid, db: serverState.db });
+
+    // Saved again by the user, the edits still name the user and database of the hold:
+    // the other user's session refuses them.
+    await saveRefusedLead1EditsAgain(sent);
+    expect.verifySteps([]);
+});
+
+test("[Online] page-close save of the edits of a refused held lead form save sends its beacon with their user and database", async () => {
+    // The framework's error dialogs: the held save, and the form's save of its edits
+    // once the replay ends.
+    expect.errors(2);
+    const otherDb = `${serverState.db}_other`;
+    const { browserSession } = await refuseHeldLead1FormSaveInSwitchedSession(
+        (browserSession) => {
+            browserSession.db = otherDb;
+        }
+    );
+    // The beacon reaches the server as it is sent, which answers it in the browser's
+    // session as it answers a lead save (`mockBrowserSession`): a beacon naming another
+    // user or database is refused, and writes nothing.
+    const beacons = [];
+    mockSendBeacon((route, blob) => {
+        expect.step(`sendBeacon ${route}`);
+        beacons.push(
+            blob.text().then((text) => {
+                const { params } = JSON.parse(text);
+                const { context } = params.kwargs;
+                const queuedBy = context[CRM_OFFLINE_UID_KEY];
+                const madeIn = context[CRM_OFFLINE_DB_KEY];
+                const refused =
+                    (Number.isInteger(queuedBy) && queuedBy !== browserSession.uid) ||
+                    (typeof madeIn === "string" && madeIn !== browserSession.db);
+                if (!refused) {
+                    MockServer.env[params.model].write(params.args[0], params.args[1]);
+                }
+                return params;
+            })
+        );
+        return true;
+    });
+
+    // The page is closed with the refused edits still unsaved: the urgent save is not
+    // held, and its beacon names the user and database of the hold, so the other
+    // database refuses it as well.
+    const [event] = await unload();
+    expect.verifySteps(["sendBeacon /web/dataset/call_kw/crm.lead/web_save"]);
+    const [params] = await Promise.all(beacons);
+    expect(params).toMatchObject({
+        model: "crm.lead",
+        method: "web_save",
+        args: [[1], { expected_revenue: 1801 }],
+        kwargs: { specification: {} },
+    });
+    expect(params.kwargs.context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    expect(params.kwargs.context[CRM_OFFLINE_DB_KEY]).toBe(session.db);
+    expect(event.defaultPrevented).toBe(false);
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(1800);
+    expect(queued("crm.lead")).toEqual([]);
+    expect.verifySteps([]);
+});
+
+test("[Online] lead form edits made once the edits of a refused held save are discarded are saved with no user nor database", async () => {
+    // The framework's error dialogs: the held save, and the form's save of its edits
+    // once the replay ends.
+    expect.errors(2);
+    const otherDb = `${serverState.db}_other`;
+    const { browserSession, sent } = await refuseHeldLead1FormSaveInSwitchedSession(
+        (browserSession) => {
+            browserSession.db = otherDb;
+        }
+    );
+
+    // The user discards the refused edits: the form shows the server's revenue.
+    await closeErrorDialogs();
+    await contains(".o_form_button_cancel").click();
+    expect(".o_field_widget[name=expected_revenue] input").toHaveValue("1,800.00");
+    expect.verifySteps([]);
+
+    // Back in this session (the other tab signed out), a new edit is a save as any
+    // other: sent at once, as before, with no user id nor database, and applied.
+    browserSession.db = serverState.db;
+    await contains(".o_field_widget[name=expected_revenue] input").edit("1900");
+    await contains(".o_form_button_save").click();
+    await expect.waitForSteps([lead1RevenueStep(1900)]);
+    expect(sent.at(-1).ids).toEqual([1]);
+    expect(sent.at(-1).context).not.toInclude(CRM_OFFLINE_UID_KEY);
+    expect(sent.at(-1).context).not.toInclude(CRM_OFFLINE_DB_KEY);
+    await animationFrame();
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(1900);
+    expect(".o_field_widget[name=expected_revenue] input").toHaveValue("1,900.00");
+    expect(".o_error_dialog").toHaveCount(0);
+    expect(queued("crm.lead")).toEqual([]);
+    expect.verifySteps([]);
+});
+
 test("[Offline] lead form opened after a card move shows its queued stage, not as an edit", async () => {
     // Offline root loads served from the cache: the lead form, the pipeline groups back
     // from it, and the lead form again.
@@ -18286,7 +18842,9 @@ test("[Offline] queued lead create whose replay answer is lost is sent again wit
  * answers as a save of that lead, and writes its values on it only when flagged as a
  * later save of it (`CRM_OFFLINE_CREATE_WRITE`). Each create is stepped as
  * `replayed create <name>` (a queued call: its context names the user who queued it,
- * `CRM_OFFLINE_UID_KEY`) or `online create <name>`, with ` (delivered)` appended when
+ * `CRM_OFFLINE_UID_KEY`, and no database, `CRM_OFFLINE_DB_KEY`, which only an online
+ * save held for the replay sends with that user) or `online create <name>` (an online
+ * save, held for the replay or not), with ` (delivered)` appended when
  * its key answered it and its values were written, ` (delivered, nothing written)`
  * when its key answered it without the flag, and ` (answer lost)` when the answer of
  * an online create is lost (a 502): `onlineLosses` counts the next online creates
@@ -18319,7 +18877,7 @@ function mockFormLeadCreatesByKey() {
         state.received.push(callPayload(params));
         const context = kwargs.context || {};
         const key = context[CRM_OFFLINE_CREATE_KEY];
-        const replayed = CRM_OFFLINE_UID_KEY in context;
+        const replayed = CRM_OFFLINE_UID_KEY in context && !(CRM_OFFLINE_DB_KEY in context);
         let step = `${replayed ? "replayed" : "online"} create ${args[1].name}`;
         const leads = MockServer.env["crm.lead"];
         let result;
@@ -18430,8 +18988,9 @@ test("[Offline] lead created in the form offline and saved online during its rep
     expect.verifySteps([]);
 
     // Once the create is replayed, the save is sent, with the create's delivery key
-    // flagged as a later save of the lead: it writes its values on the lead the replay
-    // created. One lead, holding them, is the form's record.
+    // flagged as a later save of the lead, and with the user who made it and the
+    // database of their session, as a save held for the replay is: it writes its values
+    // on the lead the replay created. One lead, holding them, is the form's record.
     server.replayAnswer.resolve();
     await runAllTimers();
     await animationFrame();
@@ -18446,7 +19005,8 @@ test("[Offline] lead created in the form offline and saved online during its rep
     expect(server.received[1].args[0]).toEqual([]);
     expect(server.received[1].kwargs.context[CRM_OFFLINE_CREATE_KEY]).toBe(deliveryKey);
     expect(server.received[1].kwargs.context[CRM_OFFLINE_CREATE_WRITE]).toBe(true);
-    expect(server.received[1].kwargs.context).not.toInclude(CRM_OFFLINE_UID_KEY);
+    expect(server.received[1].kwargs.context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    expect(server.received[1].kwargs.context[CRM_OFFLINE_DB_KEY]).toBe(session.db);
     expect(controllers.at(-1).model.root.resId).toBe(leadId);
     expect(".o_form_view .o_field_widget[name=name] input").toHaveValue("R2 Online Lead");
     expect(".o_list_view").toHaveCount(0);
@@ -18561,6 +19121,68 @@ test("[Offline] lead form save held during its create's replay is queued into th
     expect.verifySteps([]);
 });
 
+test("[Offline] lead form save held during its create's replay is refused, and creates or writes nothing, once the browser's session belongs to another database", async () => {
+    // The framework's error dialog of the refused save.
+    expect.errors(1);
+    const server = mockFormLeadCreatesByKey();
+    // Registered after the lead creates, so that it refuses first.
+    const browserSession = mockBrowserSession();
+    // Registered after the refusal, so that it runs first: the refused calls too.
+    const sent = recordCallContexts("crm.lead", "web_save");
+    const { setOffline, deliveryKey } = await queueFormLeadCreate("R2 Origin Lead");
+    const plugin = getService(OfflinePlugin);
+    const leadNames = () =>
+        MockServer.env["crm.lead"].search_read(
+            [["name", "in", ["R2 Origin Lead", "R2 Origin Lead edited"]]],
+            ["name"]
+        );
+
+    // Back online, the replay sends the queued create: the server creates the lead, and
+    // its answer is still on its way. The user saves the still-new lead with another
+    // name meanwhile: the save waits for the replay of its create.
+    await setOffline(false);
+    await runAllTimers();
+    await expect.waitForSteps(["replayed create R2 Origin Lead"]);
+    expect(plugin.syncingORM()).toBe(true);
+    await contains(".o_field_widget[name=name] input").edit("R2 Origin Lead edited");
+    await contains(".o_form_button_save").click();
+    await runAllTimers();
+    await animationFrame();
+    expect.verifySteps([]);
+    expect(sent).toHaveLength(1);
+
+    // The same user id signs in on another database served on this origin (another
+    // tab) before the save's turn. Released once the create is replayed, the save, a
+    // keyed create flagged as a later save of the lead, names the user who made it and
+    // the database of their session: it is refused, and the framework shows its error.
+    browserSession.db = `${serverState.db}_other`;
+    server.replayAnswer.resolve();
+    await runAllTimers();
+    await animationFrame();
+    await waitFor(".o_error_dialog");
+    expect(queryFirst(".o_error_dialog").textContent).toInclude(ORIGIN_ERROR_MESSAGE);
+    expect(sent).toHaveLength(2);
+    const [, heldSave] = sent;
+    expect(heldSave.ids).toEqual([]);
+    expect(heldSave.context[CRM_OFFLINE_CREATE_KEY]).toBe(deliveryKey);
+    expect(heldSave.context[CRM_OFFLINE_CREATE_WRITE]).toBe(true);
+    expect(heldSave.context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    expect(heldSave.context[CRM_OFFLINE_DB_KEY]).toBe(session.db);
+    expect.verifyErrors([ORIGIN_ERROR_MESSAGE]);
+
+    // Nothing of the save was applied: one lead, the replayed create's, with its values,
+    // and nothing left queued.
+    await runAllTimers();
+    await animationFrame();
+    expect(leadNames()).toEqual([
+        { id: server.leadIdsByKey.get(deliveryKey), name: "R2 Origin Lead" },
+    ]);
+    expect(server.received).toHaveLength(1);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(plugin.syncingORM()).toBe(false);
+    expect.verifySteps([]);
+});
+
 // Refine D1.2 (R2): a lead create sent while the connection is reported lost carries its
 // delivery key from its first request, whatever record sends it (lead form, kanban quick
 // create), and only a later save of the lead writes its values on the lead the key
@@ -18632,8 +19254,9 @@ test("[Offline] lead form create sent while reported offline carries its deliver
     // Back online, the replay delivers it: its values are written on that lead, and its
     // answer is still on its way. Meanwhile the user saves the still-new lead again:
     // once the create is replayed, that save is sent with the same key flagged as a
-    // later save. One lead, with the values of the user's last save, is the form's
-    // record.
+    // later save, and with the user who made it and the database of their session, as
+    // a save held for the replay is. One lead, with the values of the user's last save,
+    // is the form's record.
     await setOffline(false);
     await runAllTimers();
     await expect.waitForSteps(["replayed create F03 Lead edited (delivered)"]);
@@ -18659,6 +19282,8 @@ test("[Offline] lead form create sent while reported offline carries its deliver
         ...callContext(),
         [CRM_OFFLINE_CREATE_KEY]: deliveryKey,
         [CRM_OFFLINE_CREATE_WRITE]: true,
+        [CRM_OFFLINE_UID_KEY]: user.userId,
+        [CRM_OFFLINE_DB_KEY]: session.db,
     });
     expect(controllers.at(-1).model.root.resId).toBe(leadId);
     expect(queued("crm.lead")).toEqual([]);
@@ -18815,7 +19440,8 @@ test("[Offline] lead kanban quick create restored in the lead form and saved dur
 
     // The user saves the still-new lead with another name: the save waits for the
     // replay of its create, then is sent with the create's delivery key flagged as a
-    // later save of the lead, which writes its values on the lead the replay created.
+    // later save of the lead, and with the user who made it and the database of their
+    // session, which writes its values on the lead the replay created.
     await contains(".o_field_widget[name=name] input").edit("F01 Restored Lead edited");
     await contains(".o_form_button_save").click();
     await runAllTimers();
@@ -18837,7 +19463,8 @@ test("[Offline] lead kanban quick create restored in the lead form and saved dur
     expect(twin.args[0]).toEqual([]);
     expect(twin.kwargs.context[CRM_OFFLINE_CREATE_KEY]).toBe(deliveryKey);
     expect(twin.kwargs.context[CRM_OFFLINE_CREATE_WRITE]).toBe(true);
-    expect(twin.kwargs.context).not.toInclude(CRM_OFFLINE_UID_KEY);
+    expect(twin.kwargs.context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    expect(twin.kwargs.context[CRM_OFFLINE_DB_KEY]).toBe(session.db);
     expect(controllers.at(-1).model.root.resId).toBe(leadId);
     expect(queued("crm.lead")).toEqual([]);
     expect(plugin.syncingORM()).toBe(false);

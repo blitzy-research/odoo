@@ -1798,6 +1798,73 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         )
         self.assertEqual([revenue for revenue, _uid, _messages in leads_audit()], [120, 220])
 
+    def test_offline_held_lead_create_from_another_database(self):
+        """ The save of a new lead the lead form held until the replay of the lead's
+        queued create is sent as a keyed create (the create's delivery key, flagged
+        as a later save of the lead) with the user who made it and the database of
+        the session they made it in. Reaching a session of another database as the
+        same user id, it is refused before its key is looked up or registered: it
+        creates no lead, registers no external identifier and writes nothing on the
+        lead the key already names. Reaching the database it was made in, it creates
+        the lead once, and a later save writes its values on that lead. """
+        salesman = self.user_sales_salesman
+        dbname = self.env.cr.dbname
+        other_db = f'not_{dbname}'
+        key = secrets.token_hex(16)
+        vals = {
+            'name': 'Held Create Lead',
+            'type': 'opportunity',
+            'user_id': salesman.id,
+            'stage_id': self.stage_gen_1.id,
+            'expected_revenue': 60.0,
+        }
+        edited_vals = dict(vals, name='Held Create Lead edited', expected_revenue=90.0)
+
+        def held_create(db, values, later_save=False):
+            # as the held save reaches a session of ``db`` as the salesman's user id
+            context = dict(
+                self.pipeline_context, uid=salesman.id, crm_offline_create_key=key,
+                crm_offline_uid=salesman.id, crm_offline_db=db,
+            )
+            if later_save:
+                context['crm_offline_create_write'] = True
+            return self.env['crm.lead'].with_user(salesman).with_context(context).browse().web_save(
+                values, specification={},
+            )
+
+        def held_leads():
+            return self.env['crm.lead'].with_context(active_test=False).search(
+                [('name', 'in', (vals['name'], edited_vals['name']))],
+            )
+
+        # first delivery from another database, flagged or not: nothing created
+        for later_save in (False, True):
+            with self.subTest(later_save=later_save), self._assert_queued_by_another_user():
+                held_create(other_db, vals, later_save=later_save)
+            self.assertFalse(held_leads())
+            self.assertFalse(self._quick_create_xmlids(key))
+
+        # from the database it was made in: the lead is created once, under its key
+        [created] = held_create(dbname, vals)
+        lead = held_leads()
+        self.assertEqual(lead.ids, [created['id']])
+        self.assertEqual(lead.create_uid, salesman)
+        self.assertEqual(self._quick_create_xmlids(key).res_id, lead.id)
+
+        # a later save of the lead from another database: refused, nothing written
+        with self._assert_queued_by_another_user():
+            held_create(other_db, edited_vals, later_save=True)
+        lead.invalidate_recordset()
+        self.assertEqual(held_leads(), lead)
+        self.assertEqual((lead.name, lead.expected_revenue), ('Held Create Lead', 60.0))
+
+        # from the database it was made in: written on the lead its key created
+        self.assertEqual(held_create(dbname, edited_vals, later_save=True), [{'id': lead.id}])
+        lead.invalidate_recordset()
+        self.assertEqual(held_leads(), lead)
+        self.assertEqual((lead.name, lead.expected_revenue), ('Held Create Lead edited', 90.0))
+        self.assertEqual(len(self._quick_create_xmlids(key)), 1)
+
     def test_offline_replay_queued_by_another_user_activity_calls(self):
         """ The activity calls the CRM queue replays ("Log a call", "Schedule
         follow-up", "Mark done") are refused when queued by another user than
