@@ -39,7 +39,7 @@ import { useActiveElement } from "@web/core/ui/ui_service";
 import { user } from "@web/core/user";
 import { mergeClasses } from "@web/core/utils/classname";
 import { useService } from "@web/core/utils/hooks";
-import { omit } from "@web/core/utils/objects";
+import { omit, pick } from "@web/core/utils/objects";
 import { patch } from "@web/core/utils/patch";
 import { getTabableElements } from "@web/core/utils/ui";
 import { Record } from "@web/model/relational_model/record";
@@ -816,7 +816,10 @@ function hasLeadWriteAhead(plugin, record, fieldNames) {
  * (`crmReplayQueued`, and the replay's own end, `OfflinePlugin._syncORM`). The queue
  * is neither read for conflicts nor changed: nothing is dropped, merged or
  * reordered, and no request is added while the write waits. The effect following
- * the replay is stopped at every outcome.
+ * the replay is stopped at every outcome. An outcome reached while the connection is
+ * reported lost leaves the buttons the write's caller disabled meanwhile to the
+ * framework's offline UI, which they get when the caller re-enables them
+ * (`crmKeepOfflineUI`).
  *
  * Sent at its turn, the write reaches the server in whatever session the browser
  * then holds, which another user, or the same user id on another database served on
@@ -862,8 +865,110 @@ export function crmLeadWriteTurn(plugin, records, fieldNames = null, isDestroyed
     });
     return turn.then((queueOnly) => {
         stop();
+        crmKeepOfflineUI(plugin);
         return { queueOnly, origin };
     });
+}
+
+/**
+ * Buttons the framework's offline UI disables while the connection is reported lost
+ * (`OfflinePlugin.SELECTORS_TO_DISABLE`: no `data-available-offline`) that it skipped,
+ * as they were disabled already, without its offline styling (`o_disabled_offline`).
+ */
+const OFFLINE_UI_SKIPPED_BUTTONS =
+    "button:not([data-available-offline])[disabled]:not(.o_disabled_offline)";
+
+/**
+ * Watch of the buttons the offline UI skipped (`crmKeepOfflineUI`), one per plugin.
+ *
+ * @type {WeakMap<OfflinePlugin, {watched: Set<HTMLButtonElement>, observer: MutationObserver}>}
+ */
+const offlineUIWatches = new WeakMap();
+
+/**
+ * Keeps the framework's offline UI on the buttons that the caller of a lead write
+ * held for its turn in the replay (`crmLeadWriteTurn`, the lead form's replay hold,
+ * `CrmFormRecord._crmAwaitLeadReplay`) disabled while it waits, called once the hold
+ * ends or the held write settles. A write started from a button (the form's Save, a
+ * view button, the list's Save: `executeButtonCallback`) disables the enabled
+ * buttons of its view, or of the page, and removes their `disabled` attribute once it
+ * settles. When the connection is reported lost meanwhile, the offline UI
+ * (`OfflinePlugin._offlineUI`) skips those buttons, disabled already, and the
+ * plugin's observer of the page sees inserted nodes only: re-enabled, they would stay
+ * enabled offline, without the offline styling, until the next insertion.
+ *
+ * So, while the plugin reports the connection lost, the `disabled` attribute of the
+ * buttons it skipped (`OFFLINE_UI_SKIPPED_BUTTONS`) is watched, and the offline UI is
+ * applied again as soon as one of them is re-enabled with the connection still
+ * reported lost: right after the caller's re-enable, before any event reaches them.
+ * The watch ends once each of them is disabled by the offline UI, available offline
+ * or out of the page, or once the connection is reported back (the framework's online
+ * UI then re-enables the page). Online, nothing is watched or changed.
+ *
+ * @param {OfflinePlugin} plugin
+ */
+export function crmKeepOfflineUI(plugin) {
+    if (!untrack(() => plugin.isOffline())) {
+        return;
+    }
+    const buttons = document.querySelectorAll(OFFLINE_UI_SKIPPED_BUTTONS);
+    if (!buttons.length) {
+        return;
+    }
+    let watch = offlineUIWatches.get(plugin);
+    if (!watch) {
+        const watched = new Set();
+        let stop;
+        let ended = false;
+        const end = () => {
+            if (ended) {
+                return;
+            }
+            ended = true;
+            observer.disconnect();
+            watched.clear();
+            offlineUIWatches.delete(plugin);
+            // Disposed of outside the run of its effect, which may be the caller.
+            Promise.resolve().then(() => stop?.());
+        };
+        const observer = new MutationObserver((mutations) => {
+            if (!untrack(() => plugin.isOffline())) {
+                end();
+                return;
+            }
+            if (mutations.some(({ target }) => !target.hasAttribute("disabled"))) {
+                plugin._offlineUI();
+            }
+            for (const button of watched) {
+                if (
+                    !button.isConnected ||
+                    button.hasAttribute("data-available-offline") ||
+                    button.classList.contains("o_disabled_offline")
+                ) {
+                    watched.delete(button);
+                }
+            }
+            if (!watched.size) {
+                end();
+            }
+        });
+        // Created outside any computation, so that only `end` disposes of it.
+        stop = untrack(() =>
+            effect(() => {
+                if (!plugin.isOffline()) {
+                    end();
+                }
+            })
+        );
+        watch = { watched, observer };
+        offlineUIWatches.set(plugin, watch);
+    }
+    for (const button of buttons) {
+        if (!watch.watched.has(button)) {
+            watch.watched.add(button);
+            watch.observer.observe(button, { attributes: true, attributeFilter: ["disabled"] });
+        }
+    }
 }
 
 /**
@@ -1639,7 +1744,11 @@ function rewrittenReplayEntry(plugin, model, method, args) {
  * with the arguments and keyword arguments its entry holds now, and is then handled
  * as a call found by its arguments: delivered, it leaves the offline store; refused,
  * it is parked with them (`scheduleORM`); with the connection lost, its entry stays
- * as it is.
+ * as it is. A lead save that an urgent save of its lead superseded while it was being
+ * sent (`crmInFlightSupersessions`) is the one call whose entry changes then: still
+ * holding what was sent, it takes that urgent save's values
+ * (`applyInFlightSupersessions`), so the next replay does not send the older ones; at
+ * any other outcome, the record of that urgent save is dropped.
  *
  * Every other outcome is the framework's: the call is sent unchanged, a lost
  * connection stops the replay and keeps the entry, and any other error parks it.
@@ -1712,11 +1821,15 @@ async function crmReplayCall(plugin, silentOrm, model, method, args, kwargs) {
         result = await silentOrm.call(model, method, args, kwargs);
     } catch (error) {
         sent.delete(toRaw(args));
-        if (!(error instanceof ConnectionLostError) && isRewritten()) {
+        const supersessions = takeInFlightSupersessions(plugin, entry.key, args);
+        if (error instanceof ConnectionLostError) {
+            applyInFlightSupersessions(plugin, entry.key, supersessions);
+        } else if (isRewritten()) {
             keepRewrittenCreate(plugin, entry.key, "refused");
         }
         throw error;
     }
+    takeInFlightSupersessions(plugin, entry.key, args);
     recordDeliveredArgs(plugin, entry.key, model, method, args);
     if (isRewritten()) {
         keepRewrittenCreate(plugin, entry.key, "delivered");
@@ -1899,6 +2012,288 @@ function isForeignCrmEntry(value) {
         return !uid || contextUid !== uid;
     }
     return false;
+}
+
+// -----------------------------------------------------------------------------
+// Queued lead saves superseded by a page-close save
+// -----------------------------------------------------------------------------
+
+/**
+ * The arguments and extras of the queued lead save `value` with the values `values`
+ * of the fields it names, and their display values `changes` in its display values
+ * (`extras.changes`, when it holds them). Its other values, its target, its time
+ * stamp and its other extras (an error included) stay as they are.
+ *
+ * @param {{args: any[], extras?: Object}} value
+ * @param {Object} values
+ * @param {Object} changes
+ * @returns {{args: any[], extras: Object}}
+ */
+function supersededSaveValue(value, values, changes) {
+    const extras = { ...value.extras };
+    if (isFieldMapping(extras.changes)) {
+        extras.changes = { ...extras.changes, ...changes };
+    }
+    return { args: [value.args[0], { ...value.args[1], ...values }], extras };
+}
+
+/**
+ * The state of the queued call `key` of `plugin`, as the offline store holds it (its
+ * value in JSON): a rewrite, a merged save or a parking of the call changes it, a
+ * reload of the queue from the store does not; `undefined` once it left the queue.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {string} key
+ * @returns {string|undefined}
+ */
+function queuedCallState(plugin, key) {
+    const entry = untrack(() => plugin._ormToSync()[key]);
+    return entry ? JSON.stringify(toRaw(entry.value)) : undefined;
+}
+
+/**
+ * The arguments and extras of the queued lead save `value` once the urgent saves
+ * `supersessions` superseded it, in their order (`supersededSaveValue`); its own
+ * when there is none.
+ *
+ * @param {{args: any[], extras?: Object}} value
+ * @param {CrmInFlightSupersession[]} supersessions
+ * @returns {{args: any[], extras: Object}}
+ */
+function supersededInFlightValue(value, supersessions) {
+    let superseded = { args: value.args, extras: value.extras };
+    for (const { values, changes } of supersessions) {
+        superseded = supersededSaveValue(superseded, values, changes);
+    }
+    return superseded;
+}
+
+/**
+ * An urgent save of a lead that superseded a queued save of that lead while the
+ * replay was sending it (`isCrmReplaySent`).
+ *
+ * @typedef {Object} CrmInFlightSupersession
+ * @property {any[]} args the arguments that delivery sent (raw), which hold the older
+ *  values
+ * @property {Object} values the server values the urgent save sent for the fields
+ *  those arguments name
+ * @property {Object} changes their display values (`extras.changes`)
+ * @property {{stale: Object, state: string, supersessions: CrmInFlightSupersession[]}} [applied]
+ *  set once the connection lost that delivery and the entry took the values
+ *  (`applyInFlightSupersessions`): the value it held before (raw), the state it holds
+ *  since (`queuedCallState`), and the supersessions it took
+ */
+
+/**
+ * Per offline plugin, the urgent saves that superseded a queued lead save while the
+ * replay was sending it (`CrmInFlightSupersession`), by queue key, in their order.
+ * Such a call is not rewritten (what the server receives is what was sent), and its
+ * delivery settles them (`crmReplayCall`): lost with the connection, its entry stays
+ * queued and, while it still holds the arguments that delivery sent, takes their
+ * values (`applyInFlightSupersessions`), which the next replay sends; delivered or
+ * refused, they are dropped. Held in memory only, for the lifetime of the page:
+ * nothing of it is stored.
+ *
+ * @type {WeakMap<OfflinePlugin, Map<string, CrmInFlightSupersession[]>>}
+ */
+const crmInFlightSupersessions = new WeakMap();
+
+/**
+ * Records that an urgent save of its lead superseded the queued lead save `entry`,
+ * which the replay of `plugin` is sending, with the server values `values` and the
+ * display values `changes` of the fields it names (`crmInFlightSupersessions`).
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {{key: string, value: Object}} entry
+ * @param {Object} values
+ * @param {Object} changes
+ * @returns {() => void} undoes it, as an urgent save the server refused: while the
+ *  delivery is unsettled, its record is dropped; once the entry took its values, the
+ *  entry, when it still holds them and the replay is not sending it, takes back what
+ *  it held before, with the values of the other urgent saves it took
+ */
+function supersedeInFlightSave(plugin, entry, values, changes) {
+    let byKey = crmInFlightSupersessions.get(toRaw(plugin));
+    if (!byKey) {
+        byKey = new Map();
+        crmInFlightSupersessions.set(toRaw(plugin), byKey);
+    }
+    const { key } = entry;
+    /** @type {CrmInFlightSupersession} */
+    const supersession = { args: toRaw(entry.value.args), values, changes };
+    byKey.set(key, [...(byKey.get(key) || []), supersession]);
+    return () => {
+        const recorded = byKey.get(key) || [];
+        if (recorded.includes(supersession)) {
+            const kept = recorded.filter((item) => item !== supersession);
+            if (kept.length) {
+                byKey.set(key, kept);
+            } else {
+                byKey.delete(key);
+            }
+            return;
+        }
+        const { applied } = supersession;
+        if (!applied) {
+            return;
+        }
+        applied.supersessions = applied.supersessions.filter((item) => item !== supersession);
+        if (queuedCallState(plugin, key) !== applied.state) {
+            return;
+        }
+        const { args, extras } = supersededInFlightValue(applied.stale, applied.supersessions);
+        if (rewriteCrmQueuedCall(plugin, key, args, extras)) {
+            applied.state = queuedCallState(plugin, key);
+        }
+    };
+}
+
+/**
+ * Takes out of `crmInFlightSupersessions` the urgent saves that superseded the queued
+ * call `key` of `plugin` whose delivery with the arguments `args` settled.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {string} key
+ * @param {any[]} args
+ * @returns {CrmInFlightSupersession[]} empty when there is none
+ */
+function takeInFlightSupersessions(plugin, key, args) {
+    const byKey = crmInFlightSupersessions.get(toRaw(plugin));
+    const recorded = byKey?.get(key);
+    if (!recorded) {
+        return [];
+    }
+    const taken = recorded.filter((supersession) => supersession.args === toRaw(args));
+    const kept = recorded.filter((supersession) => supersession.args !== toRaw(args));
+    if (kept.length) {
+        byKey.set(key, kept);
+    } else {
+        byKey.delete(key);
+    }
+    return taken;
+}
+
+/**
+ * Rewrites the queued lead save `key` of `plugin`, whose delivery the connection lost
+ * after the urgent saves `supersessions` of its lead superseded it, with their values
+ * and display values (`rewriteCrmQueuedCall`), so that the next replay sends them,
+ * when its entry is still queued with the arguments that delivery sent. An entry
+ * changed since (merged, rewritten) or gone (discarded) is left as it is.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {string} key
+ * @param {CrmInFlightSupersession[]} supersessions
+ */
+function applyInFlightSupersessions(plugin, key, supersessions) {
+    const entry = untrack(() => plugin._ormToSync()[key]);
+    if (!supersessions.length || !entry || toRaw(entry.value.args) !== supersessions[0].args) {
+        return;
+    }
+    const stale = toRaw(entry.value);
+    const { args, extras } = supersededInFlightValue(stale, supersessions);
+    if (!rewriteCrmQueuedCall(plugin, key, args, extras)) {
+        return;
+    }
+    const applied = {
+        stale,
+        state: queuedCallState(plugin, key),
+        supersessions: [...supersessions],
+    };
+    for (const supersession of supersessions) {
+        supersession.applied = applied;
+    }
+}
+
+/**
+ * Makes the pending queued saves of the lead `resId` stop overriding an urgent save
+ * of that lead (the save of a page being closed: its beacon, or its request) that
+ * sent `values`, the server values of fields other than x2many lists, with the
+ * display values `changes`. The urgent save is never held: it reaches the server at
+ * once, while every pending (not parked) queued `crm.lead` `web_save` of that lead
+ * alone naming one of those fields still holds an older value of it, which the
+ * running replay, or the replay of the page that follows, would send after it. So
+ * each one is rewritten with those values and display values for the fields it names
+ * (`rewriteCrmQueuedCall`, which a running replay follows), keeping its other values,
+ * its key, its time stamp and its other extras: the replay still sends it at its
+ * place, and the server keeps the user's later values. The rewrite goes through the
+ * framework queue (`scheduleORM`), which writes it to its offline store, the queue
+ * the page that follows loads and replays.
+ *
+ * A call the replay is sending (`isCrmReplaySent`) is not rewritten: what the server
+ * receives is what was sent. Its supersession is kept in memory until that delivery
+ * settles (`crmInFlightSupersessions`): when the connection loses it, the call stays
+ * queued with its older values, and its entry then takes the urgent save's values
+ * (`crmReplayCall`), which the next replay sends; delivered or refused, nothing more
+ * is done.
+ *
+ * The urgent save is rewritten into those calls as it is sent, before any answer
+ * (the page may be gone by then). An urgent save sent by request that the server
+ * refuses is undone by the returned function: each call rewritten takes back the
+ * arguments and extras it held before (`rewriteCrmQueuedCall`, which a running
+ * replay follows), when it still holds the rewritten ones (`queuedCallState`) and the
+ * replay is not sending it, and the supersession of a call in flight is dropped, or
+ * undone in the entry that took it (`supersedeInFlightSave`).
+ *
+ * x2many commands are not values that a later save replaces, and are left to the
+ * calls holding them; calls of other methods (won, archive, delete) are left as they
+ * are. With no such call queued, nothing is rewritten or kept.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {number} resId
+ * @param {Object} values
+ * @param {Object} changes
+ * @returns {(() => void)|null} undoes the supersession; `null` when it changed nothing
+ */
+export function crmSupersedeQueuedLeadSaves(plugin, resId, values, changes) {
+    const fieldNames = Object.keys(values);
+    if (!resId || !fieldNames.length) {
+        return null;
+    }
+    const undos = [];
+    for (const entry of Object.values(untrack(() => plugin._ormToSync()))) {
+        const { value } = entry;
+        const ids = value?.args?.[0];
+        if (
+            value?.model !== "crm.lead" ||
+            value.method !== "web_save" ||
+            isParked(entry) ||
+            !Array.isArray(ids) ||
+            ids.length !== 1 ||
+            ids[0] !== resId ||
+            !isFieldMapping(value.args[1])
+        ) {
+            continue;
+        }
+        const named = fieldNames.filter((fieldName) => fieldName in value.args[1]);
+        if (!named.length) {
+            continue;
+        }
+        const namedValues = pick(values, ...named);
+        const namedChanges = pick(changes, ...named);
+        if (isCrmReplaySent(plugin, entry)) {
+            undos.push(supersedeInFlightSave(plugin, entry, namedValues, namedChanges));
+            continue;
+        }
+        const { key } = entry;
+        const previous = toRaw(value);
+        const { args, extras } = supersededSaveValue(value, namedValues, namedChanges);
+        if (rewriteCrmQueuedCall(plugin, key, args, extras)) {
+            const state = queuedCallState(plugin, key);
+            undos.push(() => {
+                if (queuedCallState(plugin, key) === state) {
+                    rewriteCrmQueuedCall(plugin, key, previous.args, previous.extras);
+                }
+            });
+        }
+    }
+    if (!undos.length) {
+        return null;
+    }
+    return () => {
+        for (const undo of undos) {
+            undo();
+        }
+    };
 }
 
 patch(OfflinePlugin.prototype, {

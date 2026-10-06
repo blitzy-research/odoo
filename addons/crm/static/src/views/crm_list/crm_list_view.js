@@ -1,6 +1,7 @@
 import { onWillDestroy, signal, toRaw, untrack } from "@odoo/owl";
 import {
     crmContextWithOrigin,
+    crmKeepOfflineUI,
     crmLeadWriteTurn,
     crmPendingLeadWrites,
     crmReplayQueued,
@@ -76,7 +77,9 @@ function keepCommittedText(record) {
  *   for its turn (`crmLeadWriteTurn`), holding the model mutex as any save does. At
  *   its turn, it is sent with the user who made it and the database of their session
  *   in its context (`crmContextWithOrigin`), which the server checks against the
- *   session the request reaches.
+ *   session the request reaches. Once the wait ends, or the held save settles, while
+ *   the connection is reported lost, the buttons the list's Save disabled get the
+ *   framework's offline UI when it re-enables them (`crmKeepOfflineUI`).
  * - While the connection is reported lost and one of those leads has a pending
  *   queued write (`crmPendingLeadWrites`), and when the turn ended "queue only" (the
  *   connection reported lost, or the view destroyed, during the wait) with such a
@@ -109,6 +112,8 @@ async function multiSaveInTurn(list, multiSave) {
     // later call is forwarded unchanged.
     let settled = false;
     let queued = false;
+    // Set once the multi-save's own call waits for its turn.
+    let held = false;
 
     /**
      * @param {"webSave"|"webSaveMulti"} method
@@ -152,6 +157,7 @@ async function multiSaveInTurn(list, multiSave) {
         if (!turn) {
             return untrack(() => plugin.isOffline()) && queues() ? queue() : orm[method](...args);
         }
+        held = true;
         return turn.then(({ queueOnly, origin }) => {
             if ((queueOnly || untrack(() => plugin.isOffline())) && queues()) {
                 return queue();
@@ -184,6 +190,12 @@ async function multiSaveInTurn(list, multiSave) {
         }
         if (queued) {
             crmReplayQueued(plugin);
+        }
+        // A held save that settles while the connection is reported lost (its request
+        // lost) leaves the buttons its caller (the list's Save) disabled to the offline
+        // UI.
+        if (held) {
+            crmKeepOfflineUI(plugin);
         }
     }
 }

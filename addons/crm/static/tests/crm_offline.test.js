@@ -22,7 +22,7 @@
  * "desktop".
  */
 
-import { Component, effect, onWillDestroy, untrack, xml } from "@odoo/owl";
+import { Component, effect, onWillDestroy, toRaw, untrack, xml } from "@odoo/owl";
 import {
     advanceTime,
     after,
@@ -14719,6 +14719,351 @@ test("[Offline] page-close save during a replay is sent at once by beacon, not h
     expect.verifySteps([]);
 });
 
+/**
+ * Mocks `navigator.sendBeacon`: each beacon is stepped as `sendBeacon <route>`, reaches
+ * the mock server as it is sent (the page may be gone afterwards), which writes its
+ * values, and is accepted.
+ *
+ * @returns {Promise<Object>[]} the params of each beacon, once the server wrote them
+ */
+function mockBeaconWrites() {
+    const beacons = [];
+    mockSendBeacon((route, blob) => {
+        expect.step(`sendBeacon ${route}`);
+        beacons.push(
+            blob.text().then((text) => {
+                const { params } = JSON.parse(text);
+                MockServer.env[params.model].write(params.args[0], params.args[1]);
+                return params;
+            })
+        );
+        return true;
+    });
+    return beacons;
+}
+
+/**
+ * Keys of local storage the CRM offline flow would own (`crm_offline` prefix): it keeps
+ * nothing there, its queued calls living in the framework's offline store only.
+ *
+ * @returns {string[]}
+ */
+function crmOfflineLocalStorageKeys() {
+    const keys = [];
+    for (let index = 0; index < browser.localStorage.length; index++) {
+        const key = browser.localStorage.key(index);
+        if (key.startsWith("crm_offline")) {
+            keys.push(key);
+        }
+    }
+    return keys;
+}
+
+test("[Offline] page-close save during a replay supersedes the lead's queued save of the same field", async () => {
+    const beacons = mockBeaconWrites();
+    const { plugin, release, otherKey, formSave } = await holdReplayBeforeLeadSave();
+
+    // During the replay, with the lead's queued save (1800) still to be sent, the user
+    // sets the revenue again and closes the page. The urgent save is not held: its
+    // beacon is sent at once with the user's value, and the page may be left.
+    await contains(".o_field_widget[name=expected_revenue] input").edit("1801");
+    const [event] = await unload();
+    expect.verifySteps(["sendBeacon /web/dataset/call_kw/crm.lead/web_save"]);
+    const [params] = await Promise.all(beacons);
+    expect(params.args).toEqual([[1], { expected_revenue: 1801 }]);
+    expect(event.defaultPrevented).toBe(false);
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(1801);
+
+    // The lead's queued save no longer holds the older value: it takes the user's, at
+    // its key, its time and its place in the running replay, in the queue and in the
+    // framework's offline store, which a reloaded page replays. Nothing is kept
+    // anywhere else.
+    expect(plugin.syncingORM()).toBe(true);
+    const [leadSave] = queued("crm.lead").filter(({ key }) => key !== otherKey);
+    expect(leadSave.key).toBe(formSave.key);
+    expect(leadSave.value.args).toEqual([[1], { expected_revenue: 1801 }]);
+    expect(leadSave.value.extras).toMatchObject({
+        timeStamp: formSave.value.extras.timeStamp,
+        changes: { expected_revenue: 1801 },
+    });
+    expect((await storedQueueValue(plugin, formSave.key)).args).toEqual([
+        [1],
+        { expected_revenue: 1801 },
+    ]);
+    expect(crmOfflineLocalStorageKeys()).toEqual([]);
+    await animationFrame();
+    expect(".o_notification").toHaveCount(0);
+
+    // The page stays: the replay goes on and sends the lead's queued save with the
+    // user's value, once. The server keeps it, and nothing is left queued.
+    release();
+    await waitUntil(() => !(otherKey in plugin._ormToSync()));
+    await runAllTimers();
+    await expect.waitForSteps([`web_save [1] ${JSON.stringify({ expected_revenue: 1801 })}`]);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(await storedQueueKeys(plugin)).toEqual([]);
+    expect(crmOfflineLocalStorageKeys()).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(1801);
+    expect(MockServer.env["crm.lead"].browse(2)[0].name).toBe("Lead 2 renamed");
+    expect(".o_offline_systray").toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test("[Offline] page-close save during a replay supersedes the lead's queued save the next page loads from the store", async () => {
+    const beacons = mockBeaconWrites();
+    const { plugin, network, release, otherKey, formSave } = await holdReplayBeforeLeadSave();
+
+    // During the replay, the user sets the revenue again and closes the page: the
+    // beacon is sent at once, and the server writes the user's value. The lead's queued
+    // save takes it in the framework's offline store, which the next page loads.
+    await contains(".o_field_widget[name=expected_revenue] input").edit("1801");
+    await unload();
+    expect.verifySteps(["sendBeacon /web/dataset/call_kw/crm.lead/web_save"]);
+    await Promise.all(beacons);
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(1801);
+    expect((await storedQueueValue(plugin, formSave.key)).args).toEqual([
+        [1],
+        { expected_revenue: 1801 },
+    ]);
+    expect(crmOfflineLocalStorageKeys()).toEqual([]);
+
+    // The page is gone before its replay sends the lead's queued save: here, the
+    // connection drops, and the replay stops on that save, which it keeps.
+    network.down = true;
+    release();
+    await waitUntil(() => !(otherKey in plugin._ormToSync()));
+    await runAllTimers();
+    await waitUntil(() => !plugin.syncingORM());
+    expect(plugin.isOffline()).toBe(true);
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(1801);
+
+    // The next page loads the queue from the offline store, as a reloaded page does:
+    // the lead's queued save holds the user's value, at its key and its time.
+    await plugin._updateScheduledORMList();
+    const [leadSave, ...otherSaves] = queued("crm.lead");
+    expect(otherSaves).toEqual([]);
+    expect(leadSave.key).toBe(formSave.key);
+    expect(leadSave.value.args).toEqual([[1], { expected_revenue: 1801 }]);
+    expect(leadSave.value.extras).toMatchObject({
+        timeStamp: formSave.value.extras.timeStamp,
+        changes: { expected_revenue: 1801 },
+    });
+
+    // Its replay sends the user's value, once: the server keeps it.
+    network.down = false;
+    plugin.setOffline(false);
+    await expect.waitForSteps([`web_save [1] ${JSON.stringify({ expected_revenue: 1801 })}`]);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(await storedQueueKeys(plugin)).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(1801);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test("[Online] page-close save of a lead without a queued save of its fields changes no queued call", async () => {
+    const beacons = mockBeaconWrites();
+    const { plugin, release, otherKey, formSave } = await holdReplayBeforeLeadSave();
+    const queuedSave = toRaw(plugin._ormToSync()[formSave.key]);
+    const storedSave = await storedQueueValue(plugin, formSave.key);
+
+    // During the replay, the lead's queued save writes the revenue only: a page-close
+    // save renaming the lead leaves it exactly as it is, and keeps nothing.
+    await contains(".o_field_widget[name=name] input").edit("Lead 1 renamed");
+    await unload();
+    expect.verifySteps(["sendBeacon /web/dataset/call_kw/crm.lead/web_save"]);
+    await Promise.all(beacons);
+    expect(toRaw(plugin._ormToSync()[formSave.key])).toBe(queuedSave);
+    expect(await storedQueueValue(plugin, formSave.key)).toEqual(storedSave);
+    expect(crmOfflineLocalStorageKeys()).toEqual([]);
+
+    // Once the replay sent it, the lead has no queued save: a page-close save of the
+    // revenue finds nothing to rewrite, and keeps nothing.
+    release();
+    await waitUntil(() => !(otherKey in plugin._ormToSync()));
+    await runAllTimers();
+    await expect.waitForSteps([`web_save [1] ${JSON.stringify({ expected_revenue: 1800 })}`]);
+    await runAllTimers();
+    await animationFrame();
+    expect(queued("crm.lead")).toEqual([]);
+    await contains(".o_field_widget[name=expected_revenue] input").edit("1802");
+    await unload();
+    expect.verifySteps(["sendBeacon /web/dataset/call_kw/crm.lead/web_save"]);
+    await Promise.all(beacons);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(crmOfflineLocalStorageKeys()).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0]).toMatchObject({
+        name: "Lead 1 renamed",
+        expected_revenue: 1802,
+    });
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test("[Offline] page-close save sent by request during a replay and refused leaves the lead's queued save as it was", async () => {
+    // The framework's error dialog of the refused page-close save.
+    expect.errors(1);
+    const forms = captureLeadForms();
+    const { plugin, release, otherKey, formSave } = await holdReplayBeforeLeadSave();
+    // The server refuses the next save of the lead once `refuse` is resolved (registered
+    // last, this handler runs first).
+    const refuse = Promise.withResolvers();
+    let refusesLeadSave = false;
+    onRpc("crm.lead", "web_save", async ({ args }) => {
+        if (refusesLeadSave && args[0][0] === 1) {
+            refusesLeadSave = false;
+            expect.step(`refused web_save ${JSON.stringify(args[0])} ${JSON.stringify(args[1])}`);
+            await refuse.promise;
+            throw makeServerError({ message: "Revenue refused" });
+        }
+    });
+    const serverRevenue = MockServer.env["crm.lead"].browse(1)[0].expected_revenue;
+    const [form] = forms;
+    const record = toRaw(form.model.root);
+    // The form's page-close save is sent by request, as in a dialog, rather than by
+    // beacon.
+    toRaw(form.model).useSendBeaconToSaveUrgently = false;
+    const queuedValue = JSON.parse(JSON.stringify(plugin._ormToSync()[formSave.key].value));
+    const storedValue = await storedQueueValue(plugin, formSave.key);
+    expect(storedValue).toEqual(queuedValue);
+    expect(record._offlineChanges).toEqual({ expected_revenue: 1800 });
+
+    // During the replay, with the lead's queued save (1800) still to be sent, the user
+    // sets the revenue again and closes the page. The urgent save is not held: its
+    // request is sent at once, and, as it is sent, the lead's queued save and the
+    // record's queued changes take the user's value.
+    await contains(".o_field_widget[name=expected_revenue] input").edit("1801");
+    refusesLeadSave = true;
+    await unload();
+    await expect.waitForSteps([
+        `refused web_save [1] ${JSON.stringify({ expected_revenue: 1801 })}`,
+    ]);
+    expect(plugin._ormToSync()[formSave.key].value.args).toEqual([[1], { expected_revenue: 1801 }]);
+    expect(record._offlineChanges).toEqual({ expected_revenue: 1801 });
+
+    // The server refuses it: before the framework shows its error, the lead's queued
+    // save takes back what it held, in the queue and in the offline store, and so do
+    // the record's queued changes.
+    refuse.resolve();
+    await waitFor(".o_error_dialog");
+    const [leadSave, ...otherSaves] = queued("crm.lead").filter(({ key }) => key !== otherKey);
+    expect(otherSaves).toEqual([]);
+    expect(leadSave.key).toBe(formSave.key);
+    expect(JSON.parse(JSON.stringify(leadSave.value))).toEqual(queuedValue);
+    expect(await storedQueueValue(plugin, formSave.key)).toEqual(storedValue);
+    expect(record._offlineChanges).toEqual({ expected_revenue: 1800 });
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(serverRevenue);
+    await closeErrorDialogs();
+
+    // The replay goes on and sends the lead's queued save with the value it held, once.
+    // The form still holds the refused edit, unsaved: once the lead's calls are
+    // replayed, it saves that edit itself (a save of the form, not a queued call), which
+    // the server accepts this time. Nothing is left queued.
+    release();
+    await waitUntil(() => !(otherKey in plugin._ormToSync()));
+    await runAllTimers();
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ expected_revenue: 1800 })}`,
+        `web_save [1] ${JSON.stringify({ expected_revenue: 1801 })}`,
+    ]);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(await storedQueueKeys(plugin)).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(1801);
+    expect(crmOfflineLocalStorageKeys()).toEqual([]);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+    expect.verifyErrors(["Revenue refused"]);
+});
+
+test("[Offline] page-close save while the replay sends the lead's queued save of the same field supersedes it once that delivery is lost", async () => {
+    const beacons = mockBeaconWrites();
+    const { plugin, network, release, otherKey, formSave } = await holdReplayBeforeLeadSave();
+    // The replay's delivery of the lead's queued save reaches the server, which writes
+    // its value, and its answer is lost with the connection once `loseAnswer` is
+    // resolved (registered last, this handler runs first).
+    const loseAnswer = Promise.withResolvers();
+    let holdsLeadSave = true;
+    onRpc("/web/dataset/call_kw/crm.lead/web_save", async (request) => {
+        const { params } = await request.clone().json();
+        if (holdsLeadSave && params.args[0][0] === 1) {
+            holdsLeadSave = false;
+            expect.step(`web_save [1] ${JSON.stringify(params.args[1])} sent`);
+            await loseAnswer.promise;
+            MockServer.env["crm.lead"].write(params.args[0], params.args[1]);
+            return new Response("", { status: 502 });
+        }
+    });
+
+    // The replay sends the other lead's write, then the lead's queued save (1800),
+    // whose answer does not come.
+    release();
+    await waitUntil(() => !(otherKey in plugin._ormToSync()));
+    await runAllTimers();
+    await expect.waitForSteps([`web_save [1] ${JSON.stringify({ expected_revenue: 1800 })} sent`]);
+    expect(plugin.syncingORM()).toBe(true);
+
+    // Meanwhile, the user sets the revenue again and closes the page: the beacon is sent
+    // at once, and the server writes the user's value. The queued save the replay is
+    // sending is left as it was sent, in the queue and in the offline store.
+    await contains(".o_field_widget[name=expected_revenue] input").edit("1801");
+    await unload();
+    expect.verifySteps(["sendBeacon /web/dataset/call_kw/crm.lead/web_save"]);
+    await Promise.all(beacons);
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(1801);
+    expect(queued("crm.lead").map(({ key, value }) => [key, value.args])).toEqual([
+        [formSave.key, [[1], { expected_revenue: 1800 }]],
+    ]);
+    expect((await storedQueueValue(plugin, formSave.key)).args).toEqual([
+        [1],
+        { expected_revenue: 1800 },
+    ]);
+    expect(crmOfflineLocalStorageKeys()).toEqual([]);
+
+    // That delivery's answer is lost (the server wrote the older value after the
+    // beacon): the replay stops and keeps the lead's queued save, which takes the user's
+    // value, at its key and its time, in the queue and in the offline store.
+    network.down = true;
+    loseAnswer.resolve();
+    await waitUntil(() => !plugin.syncingORM());
+    expect(plugin.isOffline()).toBe(true);
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(1800);
+    const [leadSave, ...otherSaves] = queued("crm.lead");
+    expect(otherSaves).toEqual([]);
+    expect(leadSave.key).toBe(formSave.key);
+    expect(leadSave.value.args).toEqual([[1], { expected_revenue: 1801 }]);
+    expect(leadSave.value.extras).toMatchObject({
+        timeStamp: formSave.value.extras.timeStamp,
+        changes: { expected_revenue: 1801 },
+    });
+    expect((await storedQueueValue(plugin, formSave.key)).args).toEqual([
+        [1],
+        { expected_revenue: 1801 },
+    ]);
+    expect(crmOfflineLocalStorageKeys()).toEqual([]);
+
+    // Back online, the next replay sends the user's value, once: the server keeps it.
+    network.down = false;
+    plugin.setOffline(false);
+    await expect.waitForSteps([`web_save [1] ${JSON.stringify({ expected_revenue: 1801 })}`]);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(await storedQueueKeys(plugin)).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(1801);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
 test("[Offline] save held during a replay whose connection drops is queued after the lead's save", async () => {
     stepLeadWrites();
     const network = mockNetwork();
@@ -14791,6 +15136,94 @@ test("[Offline] save held during a replay whose connection drops is queued after
     });
     expect(MockServer.env["crm.lead"].browse(2)[0].name).toBe("Lead 2 renamed");
     expect(".o_field_widget[name=expected_revenue] input").toHaveValue("1,801.00");
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+/** Buttons the framework's offline UI disables while the connection is reported lost. */
+const OFFLINE_DISABLED_BUTTONS = "button:not([data-available-offline])";
+
+/**
+ * Records, from now on, each of `buttons` seen enabled while the plugin reports the
+ * connection lost, read when their `disabled` attribute changes, once every observer
+ * of it created before this one has run (such as the CRM's watch of the offline UI,
+ * `crmKeepOfflineUI`): a re-enable is seen before a render inserts nodes, which the
+ * framework's observer of the page answers by applying its offline UI again.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {HTMLElement[]} buttons
+ * @returns {Set<HTMLElement>}
+ */
+function recordButtonsEnabledOffline(plugin, buttons) {
+    const enabled = new Set();
+    const observer = new MutationObserver(() => {
+        for (const button of buttons) {
+            if (plugin.isOffline() && button.isConnected && !button.hasAttribute("disabled")) {
+                enabled.add(button);
+            }
+        }
+    });
+    for (const button of buttons) {
+        observer.observe(button, { attributes: true, attributeFilter: ["disabled"] });
+    }
+    after(() => observer.disconnect());
+    return enabled;
+}
+
+test("[Offline] save held during a replay whose connection drops leaves the buttons it disabled to the offline UI", async () => {
+    const { plugin, network, release, otherKey } = await holdReplayBeforeLeadSave();
+
+    // The user's later write, saved during the replay, waits for the lead's queued save:
+    // meanwhile its Save keeps every button of the page it disabled disabled.
+    await contains(".o_field_widget[name=expected_revenue] input").edit("1801");
+    const enabled = queryAll(`${OFFLINE_DISABLED_BUTTONS}:not([disabled])`);
+    expect(enabled.length).toBeGreaterThan(0);
+    await contains(".o_form_button_save").click();
+    await animationFrame();
+    expect.verifySteps([]);
+    for (const button of enabled) {
+        expect(button).not.toBeEnabled();
+        expect(button).not.toHaveClass("o_disabled_offline");
+    }
+
+    // The connection drops before the replay sends the lead's save: the held save is
+    // queued after it, and its Save re-enables the buttons it disabled. Offline, each
+    // of them is disabled again by the framework's offline UI, with its styling, as
+    // every button that is not available offline.
+    await loseConnection(network);
+    await animationFrame();
+    const [, followUp] = queued("crm.lead").filter(({ key }) => key !== otherKey);
+    expect(followUp.value.args).toEqual([[1], { expected_revenue: 1801 }]);
+    expect(followUp.value.extras.crmFollowUp).toBe(true);
+    expect(`${OFFLINE_DISABLED_BUTTONS}:not([disabled])`).toHaveCount(0);
+    const shown = enabled.filter((button) => button.isConnected);
+    expect(shown.length).toBeGreaterThan(0);
+    for (const button of shown) {
+        expect(button).not.toBeEnabled();
+        expect(button).toHaveClass("o_disabled_offline");
+    }
+    expect.verifySteps([]);
+
+    // Reconnected, the replay sends the lead's save, then the user's: it wins, and the
+    // framework's online UI enables the buttons again.
+    network.down = false;
+    release();
+    await waitUntil(() => !(otherKey in plugin._ormToSync()));
+    await runAllTimers();
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ expected_revenue: 1800 })}`,
+        `web_save [1] ${JSON.stringify({ expected_revenue: 1801 })}`,
+    ]);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.isOffline()).toBe(false);
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].expected_revenue).toBe(1801);
+    for (const button of shown.filter((button) => button.isConnected)) {
+        expect(button).toBeEnabled();
+        expect(button).not.toHaveClass("o_disabled_offline");
+    }
     expect(".modal").toHaveCount(0);
     expect.verifySteps([]);
 });
@@ -17420,6 +17853,91 @@ test("[Online] lead list edit waiting for the replay is queued after the lead's 
     expect(queued("crm.lead")).toEqual([]);
     expect(MockServer.env["crm.lead"].browse(1)[0].name).toBe("Lead 1 listed");
     expect(".o_data_row:contains(Lead 1) .o_data_cell[name=name]").toHaveText("Lead 1 listed");
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] lead list Save waiting for the replay leaves the buttons it disabled to the offline UI as soon as the connection drops", async () => {
+    const lead2Write = stepLeadWritesHoldingLead2();
+    mockDate("2026-10-02 09:00:00");
+    const setOffline = mockOffline();
+    await openLeadList();
+    const plugin = getService(OfflinePlugin);
+
+    // Offline: a write of another lead, then a rename of the lead.
+    await setOffline(true);
+    const renameKey = queueLead2RenameFirst(plugin);
+    const formKey = queueLeadRename(plugin, 1, "Lead 1 renamed");
+    const isListSaveQueued = () =>
+        queued("crm.lead").some(({ key }) => key !== renameKey && key !== formKey);
+
+    // Reconnected, the replay is held on the other lead's write. The list renames the
+    // lead, and its Save commits the name: the save waits for the lead's queued rename,
+    // and the Save keeps the list's buttons it disabled disabled meanwhile.
+    await setOffline(false);
+    await expect.waitForSteps([LEAD_2_RENAME_STEP]);
+    await toggleLeadRow("Lead 1");
+    await contains(".o_data_row:contains(Lead 1) .o_data_cell[name=name]").click();
+    await contains(".o_selected_row .o_field_widget[name=name] input").edit("Lead 1 listed", {
+        confirm: false,
+    });
+    const enabled = queryAll(`${OFFLINE_DISABLED_BUTTONS}:not([disabled])`);
+    await contains(".o_list_button_save").click();
+    await animationFrame();
+    expect.verifySteps([]);
+    expect(isListSaveQueued()).toBe(false);
+    expect(".o_list_button_save").not.toBeEnabled();
+    const disabledBySave = enabled.filter((button) => button.hasAttribute("disabled"));
+    expect(disabledBySave.length).toBeGreaterThan(1);
+
+    // The connection drops while it waits: the save stops waiting without being sent,
+    // and is queued after the lead's rename. The Save then re-enables the buttons it
+    // disabled: offline, each of them is disabled again at once by the framework's
+    // offline UI, with its styling, before any render.
+    const dropped = setOffline(true);
+    for (let turn = 0; turn < 100 && !isListSaveQueued(); turn++) {
+        await microTick();
+    }
+    expect(isListSaveQueued()).toBe(true);
+    const enabledOffline = recordButtonsEnabledOffline(plugin, disabledBySave);
+    await dropped;
+    await animationFrame();
+    expect(".o_selected_row").toHaveCount(0);
+    expect([...enabledOffline]).toEqual([]);
+    expect(`${OFFLINE_DISABLED_BUTTONS}:not([disabled])`).toHaveCount(0);
+    const shown = disabledBySave.filter((button) => button.isConnected);
+    expect(shown.length).toBeGreaterThan(0);
+    for (const button of shown) {
+        expect(button).toHaveClass("o_disabled_offline");
+    }
+    const listSave = queued("crm.lead").find(({ key }) => key !== renameKey && key !== formKey);
+    expect(listSave.value.args).toEqual([[1], { name: "Lead 1 listed" }]);
+    expect(queued("crm.lead").map(({ key }) => key)).toEqual([renameKey, formKey, listSave.key]);
+    expect.verifySteps([]);
+
+    // The other lead's write is answered; the replay stops at the lead's queued rename.
+    // Reconnected, the replay sends the rename, then the list's name, which the server
+    // keeps, and the framework's online UI enables the buttons again.
+    lead2Write.resolve();
+    await waitUntil(() => !(renameKey in plugin._ormToSync()));
+    await runAllTimers();
+    await animationFrame();
+    await setOffline(false);
+    await runAllTimers();
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ name: "Lead 1 renamed" })}`,
+        `web_save [1] ${JSON.stringify({ name: "Lead 1 listed" })}`,
+    ]);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].name).toBe("Lead 1 listed");
+    for (const button of shown.filter((button) => button.isConnected)) {
+        expect(button).toBeEnabled();
+        expect(button).not.toHaveClass("o_disabled_offline");
+    }
     expect(".modal").toHaveCount(0);
     expect.verifySteps([]);
 });

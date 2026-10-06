@@ -50,10 +50,12 @@ import {
     crmContextWithOrigin,
     crmDeliveredArgs,
     crmIsReplayRunning,
+    crmKeepOfflineUI,
     crmPendingLeadWrites,
     crmReplayQueued,
     crmReportError,
     crmReturnFocusFromSheet,
+    crmSupersedeQueuedLeadSaves,
     crmWriteOrigin,
     getCrmActivitySubfields,
     isCrmOfflineCreateKey,
@@ -300,6 +302,11 @@ function crmLeadCreateContext(record, context) {
  * origin, which queues nothing, with their requests answered) sends no key and no
  * flag. Every other record, and a lead with an id, is saved and queued as the
  * framework does.
+ *
+ * The urgent save (page close) of a `crm.lead` with an id, from its form or its list
+ * row, is sent at once as the framework sends it, and the lead's pending queued saves
+ * then stop overriding the values it sent, unless the server refuses its request
+ * (`_crmSaveSupersedingQueued`).
  */
 patch(Record.prototype, {
     /**
@@ -320,14 +327,194 @@ patch(Record.prototype, {
 
     /**
      * @override
-     * A save of a still-new lead runs through `_crmSaveSendingCreateKey`; every other
-     * save is the parent's.
+     * A save of a still-new lead runs through `_crmSaveSendingCreateKey`, and the
+     * urgent save of a lead with an id through `_crmSaveSupersedingQueued`; every
+     * other save is the parent's.
      */
     _save() {
+        if (this.resModel === "crm.lead" && this.resId && this.model._urgentSave) {
+            return this._crmSaveSupersedingQueued(() => super._save(...arguments));
+        }
         if (this.resModel !== "crm.lead" || this.resId) {
             return super._save(...arguments);
         }
         return this._crmSaveSendingCreateKey(() => super._save(...arguments));
+    },
+
+    /**
+     * @override
+     * While the urgent save of a lead reads the changes it sends
+     * (`_crmSaveSupersedingQueued`: `_crmUrgentChanges`), the changes read from the
+     * record's own ones are kept there, as the save then sends them (the lead form
+     * leaves out of them, in place, the x2many commands of the lead's queued saves).
+     * The changes read are the parent's, unchanged.
+     *
+     * @param {Object} [changes]
+     * @param {{withReadonly?: boolean}} [options]
+     */
+    _getChanges(changes = this._changes, options = {}) {
+        const result = super._getChanges(...arguments);
+        const capture = toRaw(this)._crmUrgentChanges;
+        if (capture && toRaw(changes) === toRaw(this._changes) && !options?.withReadonly) {
+            capture.sent = result;
+        }
+        return result;
+    },
+
+    /**
+     * Runs `save`, the parent's urgent save of this lead (the page is being closed:
+     * `urgentSave`), so that the lead's pending queued saves stop overriding the values
+     * it sends. The save is neither held nor changed: the framework sends its beacon
+     * at once, or, in a dialog, its request. Its replay would then send an older queued
+     * save of the lead after it, here or on the page that follows, and overwrite the
+     * values the user saved last. So, as soon as the save is sent (its beacon accepted,
+     * which the framework tells by clearing the record's changes before `save`
+     * returns; its request made, through the model's ORM), and before any answer (the
+     * page may be gone by then), those queued saves take its values
+     * (`_crmSupersedeQueuedSaves`). Nothing more happens when it sends nothing (no
+     * change, an invalid record, a beacon the browser does not take, a connection
+     * reported lost), and every other call of the model's ORM is unchanged. The
+     * model's ORM is put back when the save settles, unless another wrapper replaced
+     * it since.
+     *
+     * A request the server refuses (any error but a lost connection) undoes that
+     * before its error reaches the framework, which then handles it as before: the
+     * lead's queued saves and the record's queued changes take back the values they
+     * held, which their replay sends. A request whose connection is lost keeps it: the
+     * framework queues that save into the record's own queued save (`_offlineSave`).
+     * A beacon's answer is never read, so a beacon the server refuses leaves its values
+     * in the queued saves it rewrote: their replay sends them, and the server's refusal
+     * then parks them in the offline systray with its error.
+     *
+     * @param {() => Promise<boolean>} save
+     * @returns {Promise<boolean>} the result of `save`
+     */
+    async _crmSaveSupersedingQueued(save) {
+        const record = toRaw(this);
+        const model = toRaw(this.model);
+        const resId = this.resId;
+        const changes = record._changes;
+        // Record values of the changes the save sends (the forced contacts included):
+        // the beacon clears the record's changes.
+        const pending = { ...changes };
+        let superseded = false;
+        /**
+         * @param {Object} sent
+         * @returns {(() => void)|null} undoes the supersession (`_crmSupersedeQueuedSaves`)
+         */
+        const supersede = (sent) => {
+            if (superseded) {
+                return null;
+            }
+            superseded = true;
+            // The save is sent: nothing here may fail it, or keep the page open.
+            try {
+                return record._crmSupersedeQueuedSaves(sent, pending);
+            } catch (error) {
+                crmReportError(error);
+                return null;
+            }
+        };
+        const orm = model.orm;
+        const urgentOrm = Object.assign(Object.create(orm), {
+            async webSave(saveModel, resIds, values) {
+                if (saveModel !== "crm.lead" || resIds?.length !== 1 || resIds[0] !== resId) {
+                    return orm.webSave.call(this, ...arguments);
+                }
+                const undo = supersede(values);
+                try {
+                    return await orm.webSave.call(this, ...arguments);
+                } catch (error) {
+                    if (undo && !(error instanceof ConnectionLostError)) {
+                        // The error is the framework's to handle, whatever happens here.
+                        try {
+                            undo();
+                        } catch (undoError) {
+                            crmReportError(undoError);
+                        }
+                    }
+                    throw error;
+                }
+            },
+        });
+        model.orm = urgentOrm;
+        try {
+            const capture = {};
+            const previousCapture = record._crmUrgentChanges;
+            record._crmUrgentChanges = capture;
+            let promise;
+            try {
+                promise = save();
+            } finally {
+                record._crmUrgentChanges = previousCapture;
+            }
+            if (capture.sent && record._changes !== changes && !record.dirty) {
+                supersede(capture.sent);
+            }
+            return await promise;
+        } finally {
+            if (model.orm === urgentOrm) {
+                model.orm = orm;
+            }
+        }
+    },
+
+    /**
+     * Makes the lead's pending queued saves stop overriding `sent`, the server values
+     * an urgent save of this lead sent, whose record values are `pending`: for each
+     * field other than an x2many list (a list's commands are not values a later save
+     * replaces), the queued saves naming it take its value and display value
+     * (`crmSupersedeQueuedLeadSaves`), and so do the record's own queued changes
+     * (`_offlineChanges`), from which the framework queues the record's next offline
+     * save again.
+     *
+     * @param {Object} sent
+     * @param {Object} pending
+     * @returns {(() => void)|null} undoes it, for an urgent save the server refused:
+     *  the record's queued changes it replaced take back their values, unless they no
+     *  longer hold those it set, and so do the queued saves it rewrote
+     *  (`crmSupersedeQueuedLeadSaves`); `null` when it changed nothing
+     */
+    _crmSupersedeQueuedSaves(sent, pending) {
+        const fieldNames = Object.keys(sent).filter(
+            (fieldName) =>
+                fieldName !== "id" &&
+                fieldName in pending &&
+                fieldName in this.fields &&
+                !X2MANY_TYPES.includes(this.fields[fieldName].type)
+        );
+        if (!fieldNames.length) {
+            return null;
+        }
+        const offlineChanges = toRaw(this)._offlineChanges;
+        const replaced = {};
+        if (offlineChanges) {
+            for (const fieldName of fieldNames) {
+                if (fieldName in offlineChanges) {
+                    replaced[fieldName] = offlineChanges[fieldName];
+                    offlineChanges[fieldName] = pending[fieldName];
+                }
+            }
+        }
+        const undoQueued = crmSupersedeQueuedLeadSaves(
+            this.model.offlinePlugin,
+            this.resId,
+            pick(sent, ...fieldNames),
+            this._formatOfflineValues(pick(pending, ...fieldNames))
+        );
+        if (!undoQueued && !Object.keys(replaced).length) {
+            return null;
+        }
+        return () => {
+            if (toRaw(this)._offlineChanges === offlineChanges) {
+                for (const fieldName in replaced) {
+                    if (offlineChanges[fieldName] === pending[fieldName]) {
+                        offlineChanges[fieldName] = replaced[fieldName];
+                    }
+                }
+            }
+            undoQueued?.();
+        };
     },
 
     /**
@@ -532,9 +719,11 @@ class CrmFormRecord extends formView.Model.Record {
         let routes = untrack(() => this._crmRoutesSave());
         let queueOnly = false;
         let origin;
+        let held = false;
         if (!routes) {
             const leadReplay = this._crmAwaitLeadReplay();
             if (leadReplay) {
+                held = true;
                 ({ queueOnly, origin } = await leadReplay);
                 routes = untrack(() => this._crmRoutesSave());
             }
@@ -611,6 +800,11 @@ class CrmFormRecord extends formView.Model.Record {
         if (res) {
             record._crmUndeliveredOrigin = undefined;
         }
+        // A held save that settles while the connection is reported lost (its request
+        // lost) leaves the buttons its caller disabled to the offline UI.
+        if (held) {
+            crmKeepOfflineUI(this.model.offlinePlugin);
+        }
         // The rainbowman lookup is decorative: offline it is neither issued nor queued.
         // The signal is read after the save, because a connection lost during the save
         // turns the plugin offline before the queued (offline) save resolves. A save
@@ -650,7 +844,9 @@ class CrmFormRecord extends formView.Model.Record {
      * as it is (`_offlineSave`): the replay that follows sends the user's values last.
      * While it waits, the save holds the model mutex, as any save does: edits made
      * meanwhile apply after it, and the form's buttons stay disabled. The queue is left
-     * as it is.
+     * as it is. Once the hold ends, or the held save settles, while the connection is
+     * reported lost, the buttons the save's caller disabled get the framework's offline
+     * UI when the caller re-enables them (`crmKeepOfflineUI`).
      *
      * A new lead (no id, so no queued write targets it) is held the same way while
      * its own queued create (`offlineId`) is pending: saving it before that create's
@@ -715,6 +911,7 @@ class CrmFormRecord extends formView.Model.Record {
         });
         return released.then((queueOnly) => {
             stop();
+            crmKeepOfflineUI(plugin);
             return { queueOnly, origin };
         });
     }
