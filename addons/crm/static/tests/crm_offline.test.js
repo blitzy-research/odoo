@@ -91,6 +91,7 @@ import {
     CRM_MOBILE_ACTIVITY_LIMIT,
     CRM_OFFLINE_CREATE_KEY,
     CRM_OFFLINE_CREATE_WRITE,
+    CRM_OFFLINE_DB_KEY,
     CRM_OFFLINE_DISABLED_ACTIONS,
     CRM_OFFLINE_UID_KEY,
     CRM_OFFLINE_DISABLED_MENUS,
@@ -14182,6 +14183,196 @@ test("[Offline] card moved again before the connection is seen back replays afte
 
 
 
+/**
+ * Sets up a replay held on the rename of lead 2 (`stepLeadWritesHoldingLead2`) with
+ * the queued form save of lead 1 (stage B, Qualified) still to be sent, then reopens
+ * the pipeline online: its groups are served from the RPC cache at once, while the
+ * server's answer to its root load, read when the request arrives and changed since
+ * the cached one by another user's rename of Lead 3, is held until `rootAnswer` is
+ * resolved. Each root load reaching the server is stepped as `web_read_group`, each
+ * rainbowman lookup as `stepRainbowman` steps it. One error is raised meanwhile,
+ * which the test declares: the pipeline's root load served from the cache offline
+ * (`LEAD_GROUPS_LOAD`).
+ *
+ * @returns {Promise<{plugin: OfflinePlugin, lead2Write: PromiseWithResolvers<void>, renameKey: string, rootAnswer: PromiseWithResolvers<void>}>}
+ */
+async function reopenPipelineDuringReplay() {
+    const lead2Write = stepLeadWritesHoldingLead2();
+    stepRainbowman();
+    let rootAnswer = null;
+    onRpc("crm.lead", "web_read_group", async ({ parent }) => {
+        expect.step("web_read_group");
+        const answer = await parent();
+        await rootAnswer?.promise;
+        return answer;
+    });
+    // The clock is set before the views and the cache are created (see the tests above).
+    mockDate("2026-10-02 09:00:00");
+    const setOffline = mockOffline();
+    await openPipeline();
+    await flushStartupSync();
+    await openLead(1);
+    const plugin = getService(OfflinePlugin);
+    expect.verifySteps(["web_read_group"]);
+
+    // Offline: a write of another lead is queued, then, a minute later, the lead form
+    // saves stage B (Qualified).
+    await setOffline(true);
+    const renameKey = queueLead2RenameFirst(plugin);
+    await selectStage(STAGE_QUALIFIED, "Qualified");
+    await contains(".o_form_button_save").click();
+    await goBack();
+    expect.verifyErrors([LEAD_GROUPS_LOAD]);
+    const formSave = queued("crm.lead").find(({ key }) => key !== renameKey);
+    expect(formSave.value.args).toEqual([[1], { stage_id: STAGE_QUALIFIED }]);
+
+    // Reconnected: the replay sends the other lead's write first, and is held there.
+    await setOffline(false);
+    await expect.waitForSteps([LEAD_2_RENAME_STEP]);
+    expect(plugin.syncingORM()).toBe(true);
+
+    // Online meanwhile, the pipeline is opened again, its server answer held.
+    MockServer.env["crm.lead"].write([3], { name: "Lead 3 renamed" });
+    rootAnswer = Promise.withResolvers();
+    await getService("action").doAction(PIPELINE_ACTION.id);
+    await animationFrame();
+    expect.verifySteps(["web_read_group"]);
+    expect(".o_kanban_group:eq(0) .o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(".o_kanban_record:contains(Lead 3 renamed)").toHaveCount(0);
+    return { plugin, lead2Write, renameKey, rootAnswer };
+}
+
+/**
+ * Asserts that the pipeline shows what the server holds once the replay and the
+ * card's move are done: lead 1 in C (Won), the card's stage, chosen last, and the
+ * other user's rename of Lead 3, with nothing left queued.
+ *
+ * @param {OfflinePlugin} plugin
+ */
+async function expectPipelineReloadedAfterMove(plugin) {
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(STAGE_WON);
+    expect(".o_kanban_group:eq(2) .o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(".o_kanban_group:eq(0) .o_kanban_record:contains(Lead 3 renamed)").toHaveCount(1);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+}
+
+test.tags("desktop");
+test("[Online] card stage move held during a replay is not undone by the server answer of a pipeline reopened from the cache", async () => {
+    // Offline root load served from the cache: the pipeline groups (back from the form).
+    expect.errors(1);
+    const { plugin, lead2Write, renameKey, rootAnswer } = await reopenPipelineDuringReplay();
+
+    // The card moves the lead to C (Won): its save waits for the lead's queued form
+    // save, and the card shows the move.
+    await moveLeadCard("Lead 1", STAGE_WON, 2);
+    expect.verifySteps([]);
+    expect(".o_kanban_group:eq(2) .o_kanban_record:contains(Lead 1)").toHaveCount(1);
+
+    // The server's answer arrives while the move waits. Read before the move was
+    // saved, it is not set over it: the card stays in Won.
+    rootAnswer.resolve();
+    await animationFrame();
+    await animationFrame();
+    expect(".o_kanban_group:eq(2) .o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect.verifySteps([]);
+
+    // The queued form save replays one second later, then the card's save is sent,
+    // followed by the online rainbowman lookup of the move; the pipeline is then
+    // loaded again, once.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_WON })}`,
+        "web_read_group",
+        "get_rainbowman_message",
+    ]);
+    await expectPipelineReloadedAfterMove(plugin);
+});
+
+test.tags("desktop");
+test("[Online] card stage move saved during a replay is not undone by a later server answer of a pipeline reopened from the cache", async () => {
+    // Offline root load served from the cache: the pipeline groups (back from the form).
+    expect.errors(1);
+    const { plugin, lead2Write, renameKey, rootAnswer } = await reopenPipelineDuringReplay();
+
+    // The card moves the lead to C (Won); its save waits for the lead's queued form
+    // save, which replays one second later, then the card's save is sent, followed
+    // by the online rainbowman lookup of the move.
+    await moveLeadCard("Lead 1", STAGE_WON, 2);
+    expect.verifySteps([]);
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_WON })}`,
+        "get_rainbowman_message",
+    ]);
+    await runAllTimers();
+    await animationFrame();
+    expect(".o_kanban_group:eq(2) .o_kanban_record:contains(Lead 1)").toHaveCount(1);
+
+    // The server's answer to the reopened pipeline arrives only then. Read before the
+    // move was saved, it is not set over it: the pipeline is loaded again instead.
+    rootAnswer.resolve();
+    await expect.waitForSteps(["web_read_group"]);
+    await expectPipelineReloadedAfterMove(plugin);
+});
+
+test.tags("desktop");
+test("[Online] card stage move answered after the server answer of a pipeline reopened from the cache issues its rainbowman lookup", async () => {
+    stepRainbowman();
+    // The server answers the card's save only once `cardSave` is resolved.
+    const cardSave = Promise.withResolvers();
+    onRpc("crm.lead", "web_save", async ({ args }) => {
+        expect.step(`web_save ${JSON.stringify(args[0])} ${JSON.stringify(args[1])}`);
+        await cardSave.promise;
+    });
+    // Steps each root load; while `rootAnswer` is set, the server's answer, read when
+    // the request arrives, is held until it is resolved.
+    let rootAnswer = null;
+    onRpc("crm.lead", "web_read_group", async ({ parent }) => {
+        expect.step("web_read_group");
+        const answer = await parent();
+        await rootAnswer?.promise;
+        return answer;
+    });
+    await openPipeline();
+    await flushStartupSync();
+    expect(getService(OfflinePlugin).syncingORM()).toBe(false);
+    expect.verifySteps(["web_read_group"]);
+
+    // The pipeline is opened again: its groups are served from the RPC cache at once,
+    // while the server's answer, changed since by another user's rename of Lead 3, is
+    // held.
+    MockServer.env["crm.lead"].write([3], { name: "Lead 3 renamed" });
+    rootAnswer = Promise.withResolvers();
+    await getService("action").doAction(PIPELINE_ACTION.id);
+    await animationFrame();
+    expect.verifySteps(["web_read_group"]);
+
+    // With no replay running, the card's move to C (Won) is sent at once.
+    await moveLeadCard("Lead 1", STAGE_WON, 2);
+    expect.verifySteps([`web_save [1] ${JSON.stringify({ stage_id: STAGE_WON })}`]);
+
+    // The pipeline's server answer arrives before the save's: the framework sets it on
+    // the pipeline, replacing its groups and records. Once the save is answered, the
+    // rainbowman lookup of the move is still made, for the lead the user moved.
+    rootAnswer.resolve();
+    await animationFrame();
+    expect(".o_kanban_record:contains(Lead 3 renamed)").toHaveCount(1);
+    cardSave.resolve();
+    await expect.waitForSteps(["get_rainbowman_message"]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(STAGE_WON);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
 test.tags("desktop");
 test("[Online] card writes with no replay running are sent at once", async () => {
     stepLeadWrites();
@@ -14216,6 +14407,330 @@ test("[Online] card writes with no replay running are sent at once", async () =>
     expect(".modal").toHaveCount(0);
     expect(queued("crm.lead")).toEqual([]);
 });
+
+// Shared browser: a card write held for its turn in the replay is sent with the id of
+// the user who made it (`CRM_OFFLINE_UID_KEY`), as every queued CRM call is, and with
+// the database of their session (`CRM_OFFLINE_DB_KEY`), so that the server refuses it
+// once the browser's session belongs to another user (another tab signed in), as it
+// refuses a queued call replayed there, or to another database served on this origin,
+// where the same user id names another user.
+
+/**
+ * Records `{ids, context}` (copies) of each `model`/`method` call reaching the mock
+ * server, in arrival order. Its handler returns nothing, so the other handlers of the
+ * call still answer it: registered after a refusal, it records the refused calls too.
+ *
+ * @param {string} model
+ * @param {string} method
+ * @returns {{ids: number[], context: Object}[]}
+ */
+function recordCallContexts(model, method) {
+    const calls = [];
+    onRpc(model, method, ({ args, kwargs }) => {
+        calls.push(JSON.parse(JSON.stringify({ ids: args[0], context: kwargs.context })));
+    });
+    return calls;
+}
+
+/**
+ * Opens "My Pipeline" and lets its start-up sync run, then, offline, queues a rename of
+ * lead 2 (`queueLead2RenameFirst`) and, a minute later, moves the card of lead 1 to B
+ * (Qualified), queued. Reconnected, the replay sends the rename first and is held
+ * there (`stepLeadWritesHoldingLead2`): the card's queued move is still to be sent.
+ *
+ * @returns {Promise<{plugin: OfflinePlugin, lead2Write: PromiseWithResolvers<void>,
+ *  renameKey: string, cardMove: Object}>}
+ */
+async function holdReplayBeforeLead1CardMove() {
+    const lead2Write = stepLeadWritesHoldingLead2();
+    mockDate("2026-10-02 09:00:00");
+    const setOffline = mockOffline();
+    await openPipeline();
+    await flushStartupSync();
+    const plugin = getService(OfflinePlugin);
+    await setOffline(true);
+    const renameKey = queueLead2RenameFirst(plugin);
+    await moveLeadCard("Lead 1", STAGE_QUALIFIED, 1);
+    const cardMove = queued("crm.lead").find(({ key }) => key !== renameKey);
+    expect(cardMove.value.args).toEqual([[1], { stage_id: STAGE_QUALIFIED }]);
+    expect.verifySteps([]);
+    await setOffline(false);
+    await expect.waitForSteps([LEAD_2_RENAME_STEP]);
+    expect(plugin.syncingORM()).toBe(true);
+    return { plugin, lead2Write, renameKey, cardMove };
+}
+
+/**
+ * Lets the replay held on the rename of lead 2 go on once the browser's session
+ * belongs to another user (`mockBrowserSession`): the rename, queued by this user, is
+ * refused and parked, and the replay sends the next queued call one second later.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {PromiseWithResolvers<void>} lead2Write
+ * @param {string} renameKey
+ */
+async function releaseLead2RenameRefused(plugin, lead2Write, renameKey) {
+    lead2Write.resolve();
+    await waitUntil(() => plugin._ormToSync()[renameKey]?.value.extras.error);
+    await runAllTimers();
+}
+
+/** Error of a call the server refused with its `CrmOfflineOriginError`, once parked. */
+function originParkedError() {
+    return `${ORIGIN_ERROR_NAME} - ${ORIGIN_ERROR_MESSAGE}`;
+}
+
+test.tags("desktop");
+test("[Online] card save held during a replay is sent with the user and database that made it", async () => {
+    const sent = recordCallContexts("crm.lead", "web_save");
+    stepRainbowman();
+    const { plugin, lead2Write, renameKey } = await holdReplayBeforeLead1CardMove();
+
+    // A card write the replay has nothing to send before is sent at once, as before,
+    // with no user id nor database: the colour of a lead without queued writes.
+    await contains(".o_kanban_record:contains(Lead 3) .o_dropdown_kanban .dropdown-toggle", {
+        visible: false,
+    }).click();
+    await contains(".o-dropdown--menu .o_colorlist_item_color_6").click();
+    expect.verifySteps([`web_save [3] ${JSON.stringify({ color: 6 })}`]);
+    expect(sent.at(-1).context).not.toInclude(CRM_OFFLINE_UID_KEY);
+    expect(sent.at(-1).context).not.toInclude(CRM_OFFLINE_DB_KEY);
+
+    // The card moves the lead to C (Won): its save waits for the lead's queued move.
+    await moveLeadCard("Lead 1", STAGE_WON, 2);
+    expect.verifySteps([]);
+
+    // Sent at its turn, after the queued move, the save names the user who made it and
+    // the database of their session, in the context the queued move of the same card
+    // was sent in.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_WON })}`,
+        "get_rainbowman_message",
+    ]);
+    const [replayedMove, heldSave] = sent.filter(({ ids }) => ids[0] === 1);
+    expect(heldSave.context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    expect(heldSave.context[CRM_OFFLINE_DB_KEY]).toBe(session.db);
+    expect(heldSave.context).toEqual({
+        ...replayedMove.context,
+        [CRM_OFFLINE_DB_KEY]: session.db,
+    });
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(STAGE_WON);
+    expect(".o_kanban_group:eq(2) .o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] card delete held during a replay is sent with the user and database that made it", async () => {
+    const unlinks = recordCallContexts("crm.lead", "unlink");
+    onRpc("crm.lead", "unlink", ({ args }) => {
+        expect.step(`unlink ${JSON.stringify(args[0])}`);
+    });
+    const { plugin, lead2Write, renameKey } = await holdReplayBeforeLead1CardMove();
+
+    // Deleted from its card menu meanwhile, the lead is not deleted ahead of its queued
+    // move.
+    await contains(".o_kanban_record:contains(Lead 1) .o_dropdown_kanban .dropdown-toggle", {
+        visible: false,
+    }).click();
+    await contains(".o-dropdown--menu .dropdown-item:contains(Delete)").click();
+    await contains(".modal-footer .btn-danger").click();
+    await animationFrame();
+    expect.verifySteps([]);
+
+    // Sent at its turn, after the queued move, the delete names the user who made it
+    // and the database of their session, in the context a queued delete of the card
+    // menu is sent in.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+        "unlink [1]",
+    ]);
+    expect(unlinks).toEqual([
+        {
+            ids: [1],
+            context: {
+                ...queuedContext(PIPELINE_ACTION.context),
+                [CRM_OFFLINE_DB_KEY]: session.db,
+            },
+        },
+    ]);
+    expect(unlinks[0].context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    expect(unlinks[0].context[CRM_OFFLINE_DB_KEY]).toBe(session.db);
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].search_count([["id", "=", 1]])).toBe(0);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] card save held during a replay is refused, and changes nothing, once the browser's session belongs to another user", async () => {
+    // The framework's error dialog of the refused save.
+    expect.errors(1);
+    const browserSession = mockBrowserSession();
+    // Registered after the refusal, so that it runs first: the refused calls too.
+    const sent = recordCallContexts("crm.lead", "web_save");
+    const { plugin, lead2Write, renameKey, cardMove } = await holdReplayBeforeLead1CardMove();
+
+    // The card moves the lead to C (Won): its save waits for the lead's queued move.
+    await moveLeadCard("Lead 1", STAGE_WON, 2);
+    expect.verifySteps([]);
+
+    // Another user signs in on this browser (another tab) before the save's turn: the
+    // server session the replay and the save then reach is theirs. This user's queued
+    // calls are refused and parked; the save, released by them, is sent with the id
+    // of the user who made it and refused as well. The framework shows its error.
+    browserSession.uid = serverState.userId + 100;
+    await releaseLead2RenameRefused(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_WON })}`,
+    ]);
+    await waitFor(".o_error_dialog");
+    expect(queryFirst(".o_error_dialog").textContent).toInclude(ORIGIN_ERROR_MESSAGE);
+    expect(sent.at(-1).ids).toEqual([1]);
+    expect(sent.at(-1).context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    expect(sent.at(-1).context[CRM_OFFLINE_DB_KEY]).toBe(session.db);
+    expect.verifyErrors([ORIGIN_ERROR_MESSAGE]);
+
+    // Nothing was applied: the server keeps the lead as it was, and both queued calls
+    // stay parked with the server's error, for their user.
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    const [serverLead] = MockServer.env["crm.lead"].browse(1);
+    expect(serverLead.stage_id).toBe(STAGE_NEW);
+    expect(MockServer.env["crm.lead"].browse(2)[0].name).toBe("Lead 2");
+    expect(queued("crm.lead").map(({ key, value }) => [key, value.extras.error])).toEqual([
+        [renameKey, originParkedError()],
+        [cardMove.key, originParkedError()],
+    ]);
+    expect(".o_kanban_group:eq(2) .o_kanban_record:contains(Lead 1)").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] card delete held during a replay is refused, and deletes nothing, once the browser's session belongs to another user", async () => {
+    // The framework's error dialog of the refused delete.
+    expect.errors(1);
+    const browserSession = mockBrowserSession();
+    onRpc("crm.lead", "unlink", ({ kwargs }) => {
+        // As the server refuses it (`_check_offline_queue_origin`).
+        const queuedBy = kwargs.context?.[CRM_OFFLINE_UID_KEY];
+        if (Number.isInteger(queuedBy) && queuedBy !== browserSession.uid) {
+            throw makeServerError({ errorName: ORIGIN_ERROR_NAME, message: ORIGIN_ERROR_MESSAGE });
+        }
+    });
+    // Registered after the refusal, so that it runs first: the refused calls too.
+    const unlinks = recordCallContexts("crm.lead", "unlink");
+    const { plugin, lead2Write, renameKey, cardMove } = await holdReplayBeforeLead1CardMove();
+
+    // Deleted from its card menu meanwhile, the lead is not deleted ahead of its queued
+    // move.
+    await contains(".o_kanban_record:contains(Lead 1) .o_dropdown_kanban .dropdown-toggle", {
+        visible: false,
+    }).click();
+    await contains(".o-dropdown--menu .dropdown-item:contains(Delete)").click();
+    await contains(".modal-footer .btn-danger").click();
+    await animationFrame();
+    expect(unlinks).toEqual([]);
+
+    // Another user signs in on this browser before the delete's turn: released once
+    // this user's queued calls are refused, the delete names the user who made it and
+    // is refused too. The framework shows its error.
+    browserSession.uid = serverState.userId + 100;
+    await releaseLead2RenameRefused(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([`web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`]);
+    await waitFor(".o_error_dialog");
+    expect(queryFirst(".o_error_dialog").textContent).toInclude(ORIGIN_ERROR_MESSAGE);
+    expect(unlinks).toEqual([
+        {
+            ids: [1],
+            context: {
+                ...queuedContext(PIPELINE_ACTION.context),
+                [CRM_OFFLINE_DB_KEY]: session.db,
+            },
+        },
+    ]);
+    expect.verifyErrors([ORIGIN_ERROR_MESSAGE]);
+
+    // Nothing was deleted, and the lead's card stays listed.
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(MockServer.env["crm.lead"].search_count([["id", "=", 1]])).toBe(1);
+    expect(".o_kanban_record:contains(Lead 1)").toHaveCount(1);
+    expect(queued("crm.lead").map(({ key, value }) => [key, value.extras.error])).toEqual([
+        [renameKey, originParkedError()],
+        [cardMove.key, originParkedError()],
+    ]);
+    expect.verifySteps([]);
+});
+
+test.tags("desktop");
+test("[Online] card save held during a replay is refused, and changes nothing, once the browser's session belongs to another database", async () => {
+    // The framework's error dialog of the refused save.
+    expect.errors(1);
+    const otherDb = `${serverState.db}_other`;
+    /** @type {{uid: number|false, db: string}} */
+    let browserSession;
+    // Registered first, so that it runs last, once the call is applied: the same user
+    // id signs in on another database served on this origin (another tab) as the
+    // replay sends the card's queued move, which this database applies. The session
+    // the save, sent after that move, reaches is then the other database's, where this
+    // user id names another user.
+    onRpc("crm.lead", "web_save", ({ args }) => {
+        if (args[0][0] === 1 && args[1].stage_id === STAGE_QUALIFIED) {
+            browserSession.db = otherDb;
+        }
+    });
+    browserSession = mockBrowserSession();
+    // Registered after the refusal, so that it runs first: the refused calls too.
+    const sent = recordCallContexts("crm.lead", "web_save");
+    const { plugin, lead2Write, renameKey } = await holdReplayBeforeLead1CardMove();
+
+    // The card moves the lead to C (Won): its save waits for the lead's queued move.
+    await moveLeadCard("Lead 1", STAGE_WON, 2);
+    expect.verifySteps([]);
+
+    // Released once the queued move is sent, the save names the user who made it,
+    // whose id the other database's session has too, and the database of their
+    // session: it is refused. The framework shows its error.
+    await releaseLead2Rename(plugin, lead2Write, renameKey);
+    await expect.waitForSteps([
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_QUALIFIED })}`,
+        `web_save [1] ${JSON.stringify({ stage_id: STAGE_WON })}`,
+    ]);
+    await waitFor(".o_error_dialog");
+    expect(queryFirst(".o_error_dialog").textContent).toInclude(ORIGIN_ERROR_MESSAGE);
+    expect(browserSession).toEqual({ uid: user.userId, db: otherDb });
+    expect(sent.at(-1).ids).toEqual([1]);
+    expect(sent.at(-1).context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    expect(sent.at(-1).context[CRM_OFFLINE_DB_KEY]).toBe(session.db);
+    expect.verifyErrors([ORIGIN_ERROR_MESSAGE]);
+
+    // Nothing of the save was applied: the server keeps the lead in the stage of its
+    // queued move, applied before the switch, and the held save is not queued.
+    await runAllTimers();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(MockServer.env["crm.lead"].browse(1)[0].stage_id).toBe(STAGE_QUALIFIED);
+    expect(MockServer.env["crm.lead"].browse(2)[0].name).toBe("Lead 2 renamed");
+    expect(queued("crm.lead")).toEqual([]);
+    expect(".o_kanban_group:eq(2) .o_kanban_record:contains(Lead 1)").toHaveCount(0);
+    expect.verifySteps([]);
+});
+
 
 test("[Offline] lead form opened after a card move shows its queued stage, not as an edit", async () => {
     // Offline root loads served from the cache: the lead form, the pipeline groups back
@@ -15888,15 +16403,17 @@ function expectQueuedAsStored(plugin, snapshot, keys) {
 
 /**
  * Emulates, for the lead saves and activity creates the replay of every tab sends,
- * the server session of the browser: it belongs to `browserSession.uid`, the session
- * user by default, and refuses, as the server does (`_check_offline_queue_origin`,
- * `CrmOfflineOriginError`), such a call whose context names another user under
- * `CRM_OFFLINE_UID_KEY`. Signed out (`false`), it refuses each of them as expired.
+ * the server session of the browser: it belongs to `browserSession.uid` on
+ * `browserSession.db`, the session user and database by default, and refuses, as the
+ * server does (`_check_offline_queue_origin`, `CrmOfflineOriginError`), such a call
+ * whose context names another user under `CRM_OFFLINE_UID_KEY`, or another database
+ * under `CRM_OFFLINE_DB_KEY`. Signed out (`false`), it refuses each of them as
+ * expired.
  *
- * @returns {{uid: number|false}}
+ * @returns {{uid: number|false, db: string}}
  */
 function mockBrowserSession() {
-    const browserSession = { uid: serverState.userId };
+    const browserSession = { uid: serverState.userId, db: serverState.db };
     const refuse = ({ kwargs }) => {
         if (browserSession.uid === false) {
             throw makeServerError({
@@ -15905,7 +16422,11 @@ function mockBrowserSession() {
             });
         }
         const queuedBy = kwargs.context?.[CRM_OFFLINE_UID_KEY];
-        if (Number.isInteger(queuedBy) && queuedBy !== browserSession.uid) {
+        const madeIn = kwargs.context?.[CRM_OFFLINE_DB_KEY];
+        if (
+            (Number.isInteger(queuedBy) && queuedBy !== browserSession.uid) ||
+            (typeof madeIn === "string" && madeIn !== browserSession.db)
+        ) {
             throw makeServerError({ errorName: ORIGIN_ERROR_NAME, message: ORIGIN_ERROR_MESSAGE });
         }
     };
@@ -17276,6 +17797,65 @@ test("[Offline] phone lead form reaches Won under the header's More toggle and q
 
     expect(".ribbon:contains(Won)").toHaveCount(1);
     expect(".o_field_widget[name=probability]").toHaveText("100.00");
+    const won = {
+        model: "crm.lead",
+        method: "action_set_won",
+        args: [[1]],
+        kwargs: { context: queuedContext(PIPELINE_ACTION.context) },
+    };
+    expect(queuedCalls("crm.lead")).toEqual([won]);
+    // Neither the rainbowman variant nor the rainbowman lookup, nor "New Quotation".
+    expect.verifySteps([]);
+
+    await reconnect(setOffline);
+    await expect.waitForSteps([won]);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(MockServer.env["crm.lead"].browse(1)[0]).toMatchObject({
+        stage_id: STAGE_WON,
+        won_status: "won",
+        probability: 100,
+    });
+    expect.verifySteps([]);
+});
+
+/** The `sale_crm` lead form whose "Won" carries an empty `data-available-offline`. */
+const LEAD_FORM_QUOTATION_EMPTY_MARKER_ARCH = LEAD_FORM_QUOTATION_FIRST_ARCH.replace(
+    'title="Mark as won" data-available-offline="1"',
+    'title="Mark as won" data-available-offline=""'
+);
+
+test.tags("mobile");
+test("[Offline] phone header More toggle holding Won with an empty available-offline marker stays available", async () => {
+    registerInlineViewArchs("crm.lead", { "form,false": LEAD_FORM_QUOTATION_EMPTY_MARKER_ARCH });
+    const setOffline = mockOffline();
+    stepRoutes(
+        (route) =>
+            route === RAINBOWMAN_ROUTE ||
+            /\/crm\.lead\/(action_set_won_rainbowman|action_sale_quotations_new)$/.test(route)
+    );
+    await openPipeline();
+    await openLead(1);
+    await flushStartupSync();
+
+    // Online: "Won" is under "More", whose toggle carries the attribute: the marker's
+    // presence, not its value, tags "Won" available offline.
+    expect(HEADER_QUOTATION).toHaveCount(1);
+    expect(".o_statusbar_buttons button[name=action_set_won_rainbowman]").toHaveCount(0);
+    expectAvailableOffline(HEADER_MORE);
+
+    // Offline: "More" stays available and opens on an enabled "Won", which keeps its
+    // empty marker, next to a guarded "Lost".
+    await setOffline(true);
+    expectAvailableOffline(HEADER_MORE);
+    await contains(HEADER_MORE).click();
+    expect(MORE_WON).toHaveCount(1);
+    expect(MORE_WON).toHaveAttribute("data-available-offline", "");
+    expect(MORE_WON).not.toHaveClass("o_disabled_offline");
+    expect(MORE_WON).toBeEnabled();
+    expectGuarded(MORE_LOST, 1);
+    await contains(MORE_WON).click();
+
+    expect(".ribbon:contains(Won)").toHaveCount(1);
     const won = {
         model: "crm.lead",
         method: "action_set_won",

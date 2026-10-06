@@ -2780,7 +2780,9 @@ export class CrmFormController extends formView.Controller {
  * Tells whether a compiled header element is a view button whose arch tags it
  * `data-available-offline` ("Won" in the lead form): the compiler serializes the
  * button's non-click attributes as the JSON of its `attrs` prop
- * (`ViewCompiler.compileButton`).
+ * (`ViewCompiler.compileButton`). The attribute's presence, whatever its value
+ * (even empty), marks the button available offline, as it does for the framework's
+ * offline selector (`OfflinePlugin.SELECTORS_TO_DISABLE`).
  *
  * @param {Element} compiled
  * @returns {boolean}
@@ -2791,7 +2793,7 @@ function isAvailableOfflineViewButton(compiled) {
     }
     try {
         const attrs = JSON.parse(compiled.getAttribute("attrs") || "{}");
-        return Boolean(attrs["data-available-offline"]);
+        return Object.hasOwn(attrs, "data-available-offline");
     } catch {
         return false;
     }

@@ -99,12 +99,18 @@ CRM_OFFLINE_UID_KEY = 'crm_offline_uid'
 # Context key asking `web_search_read` to list, under the same key of its result,
 # the stage choices of its search, see `web_search_read`.
 CRM_STAGE_CHOICES_KEY = 'crm_stage_choices'
+# Context key of the database of the session in which the web client held an
+# online lead write until the replay of the lead's queued writes, see
+# `_check_offline_queue_origin`.
+CRM_OFFLINE_DB_KEY = 'crm_offline_db'
 
 
 class CrmOfflineOriginError(AccessError):
     """ A call queued in the web client's offline queue, sent in the session of
-    another user than the one who queued it, and refused before anything was
-    read or written (``_check_offline_queue_origin``, keyed ``web_save``).
+    another user than the one who queued it, or an online lead write the web
+    client held for the replay, sent in a session of another database, and
+    refused before anything was read or written (``_check_offline_queue_origin``,
+    keyed ``web_save``).
 
     The web client parks a refused replay under the JSON-RPC error name, this
     class's full path ``odoo.addons.crm.models.crm_lead.CrmOfflineOriginError``,
@@ -1164,7 +1170,8 @@ class CrmLead(models.Model):
 
     @api.model
     def _check_offline_queue_origin(self):
-        """ Refuse a call queued offline by another user than the caller.
+        """ Refuse a call queued offline by another user than the caller, or
+        made in a session of another database.
 
         The web client keeps one offline queue per browser, shared by every
         session of that browser, and pages that do not load the CRM client code
@@ -1178,11 +1185,24 @@ class CrmLead(models.Model):
         server code) are not checked. Every method the CRM offline queue
         replays calls this check, of this model and of the other ones.
 
+        An online lead write the web client holds until the replay of the
+        lead's queued writes is sent with that key and with the name of the
+        database of the session it was made in, in the ``CRM_OFFLINE_DB_KEY``
+        context key: databases served on one origin share the browser's
+        session cookie, and a user id names a different user in each database.
+        A call whose database key names another database than this one is
+        refused the same way. Calls without that string key are not checked
+        for their database.
+
         :raise CrmOfflineOriginError: (an ``AccessError``) when the call was
-            queued by another user
+            queued by another user, or made in a session of another database
         """
         origin_uid = self.env.context.get(CRM_OFFLINE_UID_KEY)
-        if isinstance(origin_uid, int) and not isinstance(origin_uid, bool) and origin_uid != self.env.uid:
+        origin_db = self.env.context.get(CRM_OFFLINE_DB_KEY)
+        if (
+            (isinstance(origin_uid, int) and not isinstance(origin_uid, bool) and origin_uid != self.env.uid)
+            or (isinstance(origin_db, str) and origin_db != self.env.cr.dbname)
+        ):
             raise CrmOfflineOriginError(_("This offline change was sent in another user's session and was not applied."))
 
     @api.model

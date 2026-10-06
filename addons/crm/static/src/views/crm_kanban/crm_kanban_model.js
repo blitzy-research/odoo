@@ -1,8 +1,10 @@
 import { toRaw, untrack } from "@odoo/owl";
 import {
     CRM_STAGE_CHOICES_KEY,
+    crmContextWithOrigin,
     crmLeadWriteTurn,
     crmPendingLeadWrites,
+    crmTurnWriteTimeStamp,
 } from "@crm/mobile/crm_offline_hooks";
 import { checkRainbowmanMessage } from "@crm/views/check_rainbowman_message";
 import { ConnectionLostError } from "@web/core/network/rpc";
@@ -91,11 +93,58 @@ async function removeRecordsDeletedOffline(list, records) {
  *
  * @param {Object} list `CrmKanbanDynamicRecordList` or `CrmKanbanDynamicGroupList`
  * @param {Object[]} records the records passed to `_deleteRecords`
- * @returns {Promise<void>|undefined} `undefined` when the delete may be sent now
+ * @returns {Promise<import("@crm/mobile/crm_offline_hooks").CrmWriteOrigin>|undefined}
+ *  `undefined` when the delete may be sent now; else resolved at its turn with the
+ *  user who made it and the database of their session
  */
 function deleteTurn(list, records) {
     const targets = records.length ? records : list.selection || [];
     return crmLeadWriteTurn(list.model.offlinePlugin, targets);
+}
+
+/**
+ * Runs `send`, the framework save or delete of a lead write held for its turn
+ * (`crmLeadWriteTurn`), with the model's ORM sending its `method` call of `resModel`
+ * (the `web_save` of the lead `resId`, or the `unlink` of the deleted leads, any
+ * `resId`) with `origin`, the user who made the write and the database of their
+ * session, in its context (`crmContextWithOrigin`): sent at its turn, in another
+ * user's session or in a session of another database, it is refused by the server,
+ * and its error is handled by the framework as for any refused save or delete. Every other call of the model's ORM is sent unchanged
+ * meanwhile, and a request lost meanwhile is queued by the framework as before.
+ *
+ * @template T
+ * @param {Object} model
+ * @param {import("@crm/mobile/crm_offline_hooks").CrmWriteOrigin} origin
+ * @param {string} resModel
+ * @param {string} method
+ * @param {number|null} resId the record the call targets alone; `null` for any
+ * @param {() => Promise<T>} send
+ * @returns {Promise<T>} the result of `send`
+ */
+async function sendWithOrigin(model, origin, resModel, method, resId, send) {
+    const rawModel = toRaw(model);
+    const orm = rawModel.orm;
+    const originOrm = Object.assign(Object.create(orm), {
+        call(callModel, callMethod, args, kwargs) {
+            const ids = args?.[0];
+            if (
+                callModel === resModel &&
+                callMethod === method &&
+                (resId === null || (ids?.length === 1 && ids[0] === resId))
+            ) {
+                kwargs = { ...kwargs, context: crmContextWithOrigin(kwargs?.context, origin) };
+            }
+            return orm.call.call(this, callModel, callMethod, args, kwargs);
+        },
+    });
+    rawModel.orm = originOrm;
+    try {
+        return await send();
+    } finally {
+        if (rawModel.orm === originOrm) {
+            rawModel.orm = orm;
+        }
+    }
 }
 
 /**
@@ -111,9 +160,13 @@ function deleteTurn(list, records) {
  * A write of a lead from its card (a save, such as a stage move or a colour, or a
  * delete) made while the replay has still to send queued writes of that lead waits
  * for them, whatever connection state the plugin reports (`crmWriteInTurn`,
- * `crmLeadWriteTurn`), so that the write made last reaches the server last. A card
- * save made while the connection is reported lost and such a write is pending is
- * queued after it instead of being sent (`CrmKanbanRecord`).
+ * `crmLeadWriteTurn`), so that the write made last reaches the server last, and is
+ * then sent with the user who made it and the database of their session, which the
+ * server checks against the session it reaches (`sendWithOrigin`). A card save made while the connection is reported
+ * lost and such a write is pending is queued after it instead of being sent
+ * (`CrmKanbanRecord`). Root loads started
+ * meanwhile (`load`), and server answers of cached root loads read before such a
+ * write (`_getCacheParams`), give way to it: the root then shows what it saved.
  */
 export class CrmKanbanModel extends RelationalModel {
     setup(params, { effect }) {
@@ -132,6 +185,10 @@ export class CrmKanbanModel extends RelationalModel {
          * @type {WeakMap<Object, (stages: {id: number, display_name: string}[]|null) => void>}
          */
         this._crmStageChoicesCallbacks = new WeakMap();
+        /** @type {number} count of the writes `crmWriteInTurn` has held */
+        this._crmHeldWriteCount = 0;
+        /** @type {Object|null} token of the root load (`load`) running, if any */
+        this._crmRootLoad = null;
     }
 
     /**
@@ -141,16 +198,21 @@ export class CrmKanbanModel extends RelationalModel {
      * last; a connection reported lost meanwhile does not end the wait. With no
      * replay running, or none of those writes left, `write` runs at once, with no
      * added wait. A held write marks the record (`crmTurnWrite`, which the mobile
-     * projections read): its values of `fieldNames` show over the queued and
-     * replayed writes stamped up to now, while it waits and once it is done, until
-     * a reload replaces the record; a write that fails or saves nothing (`false`)
-     * drops the mark. Root loads started meanwhile wait for the held write (`load`),
-     * so that the reload ending a replay reads what it wrote.
+     * projections read): its values of `fieldNames` show over every write of the
+     * lead queued or replayed when it is made, even one stamped past the clock
+     * (`crmTurnWriteTimeStamp`), while it waits and once it is done, until a reload
+     * replaces the record; a write that fails or saves nothing (`false`) drops the
+     * mark. Root loads started meanwhile wait for the held write (`load`), so that
+     * the reload ending a replay reads what it wrote. A held write is given the user
+     * who made it and the database of their session, read when the hold starts
+     * (`CrmWriteOrigin`), which its request must send (`crmContextWithOrigin`,
+     * `sendWithOrigin`); a write run at once is given none, and sends its request as
+     * before.
      *
      * @template T
      * @param {Object} record
      * @param {string[]} fieldNames
-     * @param {() => Promise<T>} write
+     * @param {(origin?: import("@crm/mobile/crm_offline_hooks").CrmWriteOrigin) => Promise<T>} write
      * @returns {Promise<T>}
      */
     crmWriteInTurn(record, fieldNames, write) {
@@ -158,7 +220,10 @@ export class CrmKanbanModel extends RelationalModel {
         if (!turn) {
             return write();
         }
-        const mark = { timeStamp: Date.now(), fieldNames: [...fieldNames] };
+        const mark = {
+            timeStamp: crmTurnWriteTimeStamp(this.offlinePlugin, record),
+            fieldNames: [...fieldNames],
+        };
         record.crmTurnWrite = mark;
         const dropMark = () => {
             if (toRaw(record.crmTurnWrite) === mark) {
@@ -175,6 +240,7 @@ export class CrmKanbanModel extends RelationalModel {
             dropMark
         );
         this._crmHeldWrites.add(settled);
+        this._crmHeldWriteCount++;
         settled.then(() => this._crmHeldWrites.delete(settled));
         return result;
     }
@@ -200,20 +266,115 @@ export class CrmKanbanModel extends RelationalModel {
      * server-value snapshot needs no handling here: it belongs to the root the load
      * builds. A load started while card writes wait for their turn in the replay
      * (`crmWriteInTurn`) first waits for them, whatever their outcome, so that it
-     * reads what they wrote; otherwise it starts at once.
+     * reads what they wrote; otherwise it starts at once. Until the last load
+     * started ends, `_crmRootLoad` tells that one is running (a load the framework
+     * supersedes never ends), so that a server answer of a cached root load read
+     * before held card writes gives way to it (`_crmReloadOverCacheUpdate`).
      */
     async load(params = {}) {
+        const rootLoad = {};
+        this._crmRootLoad = rootLoad;
+        try {
+            if (this._crmHeldWrites.size) {
+                await Promise.all(this._crmHeldWrites);
+            }
+            try {
+                await this._crmLoadRoot(...arguments);
+            } catch (error) {
+                if (!(error instanceof ConnectionLostError) || !this.hooks.crmUseDesktopSpec?.()) {
+                    throw error;
+                }
+                await this._crmLoadRoot(...arguments);
+            }
+        } finally {
+            if (this._crmRootLoad === rootLoad) {
+                this._crmRootLoad = null;
+            }
+        }
+    }
+
+    /**
+     * @override
+     *
+     * A root load served from the RPC cache gets the server's answer afterwards; the
+     * framework sets it on the root when it differs from the cached one (`callback`),
+     * rebuilding its groups and records. A card write held in the replay
+     * (`crmWriteInTurn`) that is pending when that answer arrives, or was made since
+     * the load was requested, may be missing from it: set on the root, the answer
+     * would show the lead as it was before the write (a moved card back in its former
+     * stage) and drop the held move's records, whose rainbowman lookup and mobile
+     * projection follow them. Such an answer is not set: the framework still records
+     * the view as available offline and caches the answer's many2x values, as for an
+     * unchanged answer, and the root is loaded again once the held writes are done
+     * (`_crmReloadOverCacheUpdate`). Every other answer, and every answer while no
+     * card write was held, is handled by the framework at once, as before.
+     *
+     * @param {Object} config
+     * @param {Promise<{root: Object, loadId: string}>} rootLoadProm
+     * @returns {Object|undefined}
+     */
+    _getCacheParams(config, rootLoadProm) {
+        const params = super._getCacheParams(...arguments);
+        if (!params) {
+            return params;
+        }
+        const { callback } = params;
+        const firstLoad = !this.isReady();
+        const heldWriteCount = this._crmHeldWriteCount;
+        params.callback = (result, hasChanged) => {
+            if (
+                !hasChanged ||
+                (!this._crmHeldWrites.size && this._crmHeldWriteCount === heldWriteCount)
+            ) {
+                return callback(result, hasChanged);
+            }
+            return this._crmReloadOverCacheUpdate(callback(result, false), rootLoadProm, firstLoad);
+        };
+        return params;
+    }
+
+    /**
+     * Ends the handling of a server answer of a cached root load that
+     * `_getCacheParams` did not set because of held card writes: once the
+     * framework's callback (`handled`, told that the answer is unchanged) and the
+     * held writes are done, reloads the root, so that it shows what they saved. The
+     * reload only runs where the framework would have set the answer (the root the
+     * answer was read for, not replaced nor reloaded since), while online and with
+     * no root load running, which reads what the writes saved as well; otherwise
+     * the root keeps showing the values the user wrote. As the framework does with
+     * the answer of a model's first load, the reload lists only the groups the
+     * server returns (`crmServerGroups`), and the view is then rendered, as after the
+     * view's own loads (`notify`). A lost connection ends the reload with the root
+     * as it was, as the file's other reloads end.
+     *
+     * @param {Promise<void>} handled
+     * @param {Promise<{root: Object, loadId: string}>} rootLoadProm
+     * @param {boolean} firstLoad whether the answer is that of the model's first load
+     * @returns {Promise<void>}
+     */
+    async _crmReloadOverCacheUpdate(handled, rootLoadProm, firstLoad) {
+        await handled;
+        const { root, loadId } = await rootLoadProm;
         if (this._crmHeldWrites.size) {
             await Promise.all(this._crmHeldWrites);
         }
+        if (
+            root.id !== this.root.id ||
+            loadId !== root.config.loadId ||
+            this._crmRootLoad ||
+            this.offlinePlugin.isOffline()
+        ) {
+            return;
+        }
         try {
-            await this._crmLoadRoot(...arguments);
+            await this.load(firstLoad ? { crmServerGroups: true } : {});
         } catch (error) {
-            if (!(error instanceof ConnectionLostError) || !this.hooks.crmUseDesktopSpec?.()) {
+            if (!(error instanceof ConnectionLostError)) {
                 throw error;
             }
-            await this._crmLoadRoot(...arguments);
+            return;
         }
+        this.notify();
     }
 
     /**
@@ -369,9 +530,11 @@ export class CrmKanbanRecord extends RelationalModel.Record {
      * already shows its changes meanwhile. The save then runs as the framework runs
      * it (queued if its request is lost), except that while the connection is
      * reported lost and such a write is still pending, it is queued after that write
-     * without being sent (`_crmQueuesSave`). Urgent saves (page close) are never
+     * without being sent (`_crmQueuesSave`). A held save sends its `web_save` with
+     * the user who made it and the database of their session (`sendWithOrigin`).
+     * Urgent saves (page close) are never
      * held or queued here, and online with no replay running every save is sent at
-     * once.
+     * once, as before.
      */
     _save() {
         if (this.model._urgentSave || this.resModel !== "crm.lead") {
@@ -379,11 +542,17 @@ export class CrmKanbanRecord extends RelationalModel.Record {
         }
         const args = arguments;
         toRaw(this)._crmSaveQueued = false;
-        return this.model.crmWriteInTurn(this, Object.keys(this._changes), () =>
-            untrack(() => this._crmQueuesSave())
-                ? this._crmQueueSave(() => super._save(...args))
-                : super._save(...args)
-        );
+        return this.model.crmWriteInTurn(this, Object.keys(this._changes), (origin) => {
+            if (untrack(() => this._crmQueuesSave())) {
+                return this._crmQueueSave(() => super._save(...args));
+            }
+            if (!origin) {
+                return super._save(...args);
+            }
+            return sendWithOrigin(this.model, origin, this.resModel, "web_save", this.resId, () =>
+                super._save(...args)
+            );
+        });
     }
 
     /**
@@ -554,22 +723,27 @@ export class CrmKanbanDynamicGroupList extends RelationalModel.DynamicGroupList 
      * A move queued while the connection was still reported lost
      * (`CrmKanbanRecord._crmQueueSave`) is an offline move as well, even once the
      * connection check it started reports the connection back: it is not looked up.
+     * The groups and the moved record are read before the move: a root update set
+     * while the move is saved can replace this list's groups and records, so the
+     * lookup follows the record the user moved. A move the framework reverted (its
+     * save saved nothing) moved no lead: it is not looked up.
      */
     async moveRecord(dataRecordId, dataGroupId, refId, targetGroupId) {
-        await super.moveRecord(...arguments);
         const sourceGroup = this.groups.find((g) => g.id === dataGroupId);
         const targetGroup = this.groups.find((g) => g.id === targetGroupId);
-        if (
+        const record = sourceGroup?.list.records.find((r) => r.id === dataRecordId);
+        const isStageMove =
             dataGroupId !== targetGroupId &&
-            sourceGroup &&
-            targetGroup &&
-            sourceGroup.groupByField.name === "stage_id" &&
-            !this.model.offlinePlugin.isOffline()
+            Boolean(record && targetGroup) &&
+            sourceGroup.groupByField.name === "stage_id";
+        await super.moveRecord(...arguments);
+        if (
+            isStageMove &&
+            targetGroup.list.records.some((r) => r.id === dataRecordId) &&
+            !this.model.offlinePlugin.isOffline() &&
+            !toRaw(record)._crmSaveQueued
         ) {
-            const record = targetGroup.list.records.find((r) => r.id === dataRecordId);
-            if (!toRaw(record)._crmSaveQueued) {
-                await checkRainbowmanMessage(this.model.orm, this.model.effect, record.resId);
-            }
+            await checkRainbowmanMessage(this.model.orm, this.model.effect, record.resId);
         }
     }
 
@@ -608,14 +782,15 @@ export class CrmKanbanDynamicGroupList extends RelationalModel.DynamicGroupList 
      * which is this list when grouped: offline, the deleted cards are removed from
      * their groups at once, each group decrementing its own count. Online, during a
      * replay that has still to send queued writes of the deleted leads, the delete
-     * is sent after them (`deleteTurn`).
+     * is sent after them (`deleteTurn`), with the user who made it and the database
+     * of their session (`sendWithOrigin`).
      */
     async _deleteRecords(records) {
         const turn = deleteTurn(this, records);
-        if (turn) {
-            await turn;
-        }
-        const res = await super._deleteRecords(...arguments);
+        const del = () => super._deleteRecords(...arguments);
+        const res = turn
+            ? await sendWithOrigin(this.model, await turn, this.resModel, "unlink", null, del)
+            : await del();
         await removeRecordsDeletedOffline(this, records);
         return res;
     }
@@ -729,14 +904,15 @@ export class CrmKanbanDynamicRecordList extends RelationalModel.DynamicRecordLis
      * root, or a group's list through `Group.deleteRecords`, the group then
      * decrementing its own count). Online, `super` reloads the model; during a
      * replay that has still to send queued writes of the deleted leads, the delete
-     * is sent after them (`deleteTurn`).
+     * is sent after them (`deleteTurn`), with the user who made it and the database
+     * of their session (`sendWithOrigin`).
      */
     async _deleteRecords(records) {
         const turn = deleteTurn(this, records);
-        if (turn) {
-            await turn;
-        }
-        const res = await super._deleteRecords(...arguments);
+        const del = () => super._deleteRecords(...arguments);
+        const res = turn
+            ? await sendWithOrigin(this.model, await turn, this.resModel, "unlink", null, del)
+            : await del();
         await removeRecordsDeletedOffline(this, records);
         return res;
     }

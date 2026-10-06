@@ -1707,6 +1707,52 @@ class TestCrmOffline(HttpCase, TestCrmCommon):
         self._queued_by(doomed, manager, manager, context).unlink()
         self.assertFalse(doomed.exists())
 
+    def test_offline_held_lead_write_from_another_database(self):
+        """ An online card write (a stage move or colour save, a delete) the web
+        client held until the replay of the lead's queued writes is sent with
+        the user who made it and the database of the session they made it in.
+        Databases served on one origin share the browser's session cookie, and a
+        user id names a different user in each of them: such a write reaching a
+        session of another database as the same user id is refused and changes
+        nothing. Reaching the database it was made in, it is applied as before. """
+        salesman, manager = self.user_sales_salesman, self.user_sales_manager
+        dbname = self.env.cr.dbname
+        other_db = f'not_{dbname}'
+        lead = self._create_salesman_opportunity('Held Write Lead', color=0)
+        context = self.pipeline_context
+
+        def held_by(records, caller, db):
+            # as the held write reaches ``caller``'s session: made by that same
+            # user id, in a session of ``db``
+            return records.with_user(caller).with_context(dict(context, crm_offline_uid=caller.id, crm_offline_db=db))
+
+        def lead_audit():
+            # with the tracking messages of the writes made so far
+            self.env.cr.flush()
+            lead.invalidate_recordset()
+            return (lead.stage_id, lead.color, lead.write_uid, lead.message_ids)
+
+        # stage move and colour (card save, mobile stage select, colour picker)
+        before = lead_audit()
+        for vals in ({'stage_id': self.stage_gen_won.id}, {'color': 7}):
+            with self.subTest(vals=vals), self._assert_queued_by_another_user():
+                held_by(lead, salesman, other_db).web_save(vals, specification={})
+            self.assertEqual(lead_audit(), before)
+        held_by(lead, salesman, dbname).web_save({'stage_id': self.stage_gen_won.id}, specification={})
+        held_by(lead, salesman, dbname).web_save({'color': 7}, specification={})
+        self.assertEqual(lead_audit()[:2], (self.stage_gen_won, 7))
+        # a database key that is no name is checked as without one
+        lead.with_user(salesman).with_context(context, crm_offline_db=False).web_save({'color': 3}, specification={})
+        self.assertEqual(lead_audit()[1], 3)
+
+        # delete (card menu), by a user allowed to delete
+        doomed = self._create_salesman_opportunity('Held Delete Lead')
+        with self._assert_queued_by_another_user():
+            held_by(doomed, manager, other_db).unlink()
+        self.assertTrue(doomed.exists())
+        held_by(doomed, manager, dbname).unlink()
+        self.assertFalse(doomed.exists())
+
     def test_offline_replay_queued_by_another_user_activity_calls(self):
         """ The activity calls the CRM queue replays ("Log a call", "Schedule
         follow-up", "Mark done") are refused when queued by another user than

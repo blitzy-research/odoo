@@ -39,6 +39,7 @@ import {
     CRM_MOBILE_ACTIVITY_LIMIT,
     CrmLeadCardCompiler,
     consumeQuickCreateDeepLink,
+    crmContextWithOrigin,
     crmFocusFirst,
     crmOwnEffectPromise,
     crmReturnFocusFromSheet,
@@ -2369,7 +2370,9 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * offline systray reads with `changes` for an edit). Online, during a replay
      * that has still to send queued stage writes of the lead, the write is sent
      * after them (`crmWriteInTurn`, as a card's save is); its time stamp is then
-     * read when it is sent.
+     * read when it is sent, and its context names the user who made it and the
+     * database of their session (`crmContextWithOrigin`), so that the server refuses
+     * it once the browser's session belongs to another user or to another database.
      *
      * @param {Object} record
      * @param {{id: number, display_name: string}} stageValue
@@ -2386,7 +2389,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                 this.stages.find((stage) => stage.id === shownStageId)?.display_name ??
                 "",
         };
-        const result = await record.model.crmWriteInTurn(record, ["stage_id"], () => {
+        const result = await record.model.crmWriteInTurn(record, ["stage_id"], (origin) => {
             const extras = getScheduleORMExtras(record.model, [record]);
             // Replay follows `extras.timeStamp`: after the writes it overrides, even
             // when the clock has not moved since they were queued.
@@ -2397,7 +2400,7 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
                 "crm.lead",
                 "web_save",
                 [[record.resId], { stage_id: stageValue.id }],
-                { context: record.context, specification: {} },
+                { context: crmContextWithOrigin(record.context, origin), specification: {} },
                 {
                     ...extras,
                     changes: { stage_id: stageValue },

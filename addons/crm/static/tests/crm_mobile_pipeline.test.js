@@ -63,6 +63,7 @@ import {
 import {
     CRM_OFFLINE_CREATE_KEY,
     CRM_OFFLINE_CREATE_WRITE,
+    CRM_OFFLINE_DB_KEY,
     CRM_OFFLINE_UID_KEY,
     CRM_STAGE_CHOICES_KEY,
     isQuickCreateDeepLink,
@@ -81,6 +82,7 @@ import { registry } from "@web/core/registry";
 import { registerTemplate } from "@web/core/templates";
 import { user } from "@web/core/user";
 import { IndexedDB } from "@web/core/utils/indexed_db";
+import { session } from "@web/session";
 import { formatMonetary } from "@web/views/fields/formatters";
 import { Many2One } from "@web/views/fields/many2one/many2one";
 import { buildM2OFieldDescription, Many2OneField } from "@web/views/fields/many2one/many2one_field";
@@ -13332,8 +13334,8 @@ test("[Offline] card stage choices after a move back to the server stage replay 
     ];
     expect(queued("crm.lead").map(ormCall)).toEqual(writes);
 
-    // Replayed in timestamp order (B, then A, then the card's own write, C then D), the
-    // last choice reaches the server last.
+    // Replay sends B, then A, then D (the value retained in C's queue entry), so the last
+    // choice reaches the server last.
     const replayStart = calls.length;
     await reconnect(setOffline);
     expect(queued("crm.lead")).toEqual([]);
@@ -13479,6 +13481,9 @@ test("[Online] mobile card stage chosen during the replay of the lead's queued f
     expect(`${card("Office Design")} .o_crm_mobile_lead_stage`).toHaveValue(String(WON));
     expect(received.length).toBe(1);
 
+    // From here until the card's save is answered, the pipeline does not reload: the
+    // reconciliation reload ending the replay waits for that answer.
+    const heldFrom = calls.length;
     // The form save replays one second later, then the card's choice is sent.
     await release();
     await waitUntil(() => received.length === 3);
@@ -13489,13 +13494,12 @@ test("[Online] mobile card stage chosen during the replay of the lead's queued f
     await animationFrame();
     expect(plugin.syncingORM()).toBe(false);
     expect(queued("crm.lead")).toEqual([]);
-    // The replay is over, and the reconciliation reload of the pipeline waits for the
-    // card's save to be answered.
-    const answeredAt = calls.length;
+    // The replay is over, and no reload was sent while the card's save waited, held
+    // then unanswered: its answer brings the reload.
     await animationFrame();
-    expect(calls.slice(answeredAt)).not.toInclude("crm.lead/web_read_group");
+    expect(calls.slice(heldFrom)).not.toInclude("crm.lead/web_read_group");
     cardSave.resolve();
-    await waitUntil(() => calls.slice(answeredAt).includes("crm.lead/web_read_group"));
+    await waitUntil(() => calls.slice(heldFrom).includes("crm.lead/web_read_group"));
     await animationFrame();
     await animationFrame();
 
@@ -13508,6 +13512,260 @@ test("[Online] mobile card stage chosen during the replay of the lead's queued f
     expect(`${card("Office Design")} .o_crm_mobile_pending_sync`).toHaveCount(0);
     expect(".modal").toHaveCount(0);
     expect.verifyErrors(["/web/dataset/call_kw/crm.lead/web_read_group"]);
+});
+
+test.tags("mobile");
+test("[Online] mobile card stage chosen during the replay shows over the lead's older queued stage stamped past the clock", async () => {
+    // The framework's own cached pipeline load offline (back from the form).
+    expect.errors(1);
+    const received = [];
+    const rename = Promise.withResolvers();
+    // The card's choice is answered, and the reload ending the replay served, only
+    // once released, to show the card in between.
+    const choiceSave = Promise.withResolvers();
+    let reloadGate = null;
+    onRpc("crm.lead", "web_save", async ({ args, kwargs }) => {
+        received.push(JSON.parse(JSON.stringify({ args, context: kwargs.context })));
+        if (args[0][0] === 2) {
+            await rename.promise;
+        } else if (args[1].stage_id === NEW) {
+            await choiceSave.promise;
+        }
+    });
+    onRpc("crm.lead", "web_read_group", () => reloadGate?.promise);
+    const setOffline = mockOffline();
+    const calls = trackCalls();
+    await mountWithCleanup(WebClient);
+    await openAction(ACTION_ID);
+    await contains(`${card("Office Design")} .o_crm_mobile_lead_open`).click();
+    // The framework's start-up sync (3 s after the plugin starts), with an empty queue.
+    await runAllTimers();
+    const plugin = getService(OfflinePlugin);
+    // A held clock: the lead's writes below are all made in the same millisecond.
+    let clock = Date.now();
+    patchWithCleanup(Date, { now: () => clock });
+
+    // Offline: a rename of "Quote for Chairs" (2) is queued, then, a minute later, the
+    // form of "Office Design" (1) saves "Qualified" (B) and its card chooses "Won" (C).
+    // C is queued after B, one millisecond past the clock.
+    await setOffline(true);
+    const renameKey = plugin.scheduleORM(
+        "crm.lead",
+        "web_save",
+        [[2], { name: "Chairs Quote" }],
+        { context: { ...user.context, ...PIPELINE_CONTEXT }, specification: {} },
+        {
+            extras: {
+                actionId: ACTION_ID,
+                viewType: "form",
+                displayName: "Chairs Quote",
+                timeStamp: clock,
+                changes: { name: "Chairs Quote" },
+                originalValues: { name: "Quote for Chairs" },
+            },
+        }
+    );
+    clock += 60_000;
+    await contains(STAGE_DROPDOWN_TOGGLE).click();
+    await contains(".o-dropdown--menu .dropdown-item:contains(Qualified)").click();
+    await contains(".o_form_button_save").click();
+    await contains(".o_back_button").click();
+    await showStage("Qualified");
+    await contains(`${card("Office Design")} .o_crm_mobile_lead_stage`).select(String(WON));
+    const leadWrites = queued("crm.lead");
+    expect(leadWrites.map(({ args, extras }) => [args, extras.timeStamp - clock])).toEqual([
+        [[[2], { name: "Chairs Quote" }], -60_000],
+        [[[1], { stage_id: QUALIFIED }], 0],
+        [[[1], { stage_id: WON }], 1],
+    ]);
+    await showStage("Won");
+    expect(headerTexts()).toEqual(["Won", "2", "$ 1,000"]);
+    expect(received).toEqual([]);
+
+    // Reconnected, the replay sends the rename first, which the server holds.
+    await setOffline(false);
+    await waitUntil(() => received.length === 1);
+    expect(plugin.syncingORM()).toBe(true);
+
+    /**
+     * The card shows the user's last choice, "New": listed there with "New"
+     * selected, and counted there by the stage headers, not in the stage of the
+     * lead's older queued choice C.
+     */
+    const expectChoiceShown = async () => {
+        await showStage("Won");
+        expect(cardNames()).not.toInclude("Office Design");
+        expect(headerTexts()).toEqual(["Won", "1", "$ 900"]);
+        await showStage("Qualified");
+        expect(cardNames()).not.toInclude("Office Design");
+        expect(headerTexts()).toEqual(["Qualified", "3", "$ 700"]);
+        await showStage("New");
+        expect(cardNames()).toInclude("Office Design");
+        expect(`${card("Office Design")} .o_crm_mobile_lead_stage`).toHaveValue(String(NEW));
+        expect(headerTexts()).toEqual(["New", "3", "$ 600"]);
+    };
+
+    // Online meanwhile, still on the held clock, the card chooses "New": the choice
+    // waits for B and C, and shows at once over C although C is stamped past it.
+    await contains(`${card("Office Design")} .o_crm_mobile_lead_stage`).select(String(NEW));
+    await animationFrame();
+    expect(received.length).toBe(1);
+    await expectChoiceShown();
+
+    // B replays one second after the rename: the choice still shows over C, queued.
+    rename.resolve();
+    await waitUntil(() => !(renameKey in plugin._ormToSync()));
+    await advanceTime(1000);
+    await waitUntil(() => received.length === 2 && !(leadWrites[1].key in plugin._ormToSync()));
+    await animationFrame();
+    await expectChoiceShown();
+
+    // C replays one second later, then the choice is sent, with the id of the user who
+    // made it: it still shows over B and C, both replayed, until its answer.
+    await advanceTime(1000);
+    await waitUntil(() => received.length === 4);
+    expect(received.slice(1).map(({ args }) => args)).toEqual([
+        [[1], { stage_id: QUALIFIED }],
+        [[1], { stage_id: WON }],
+        [[1], { stage_id: NEW }],
+    ]);
+    expect(received[3].context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    await expectChoiceShown();
+
+    // Answered, the choice brings the reconciliation reload, held by the server: the
+    // card shows the choice until the reload is served.
+    const reloadFrom = calls.length;
+    reloadGate = Promise.withResolvers();
+    choiceSave.resolve();
+    await waitUntil(() => calls.slice(reloadFrom).includes("crm.lead/web_read_group"));
+    await animationFrame();
+    await expectChoiceShown();
+
+    // The server keeps the user's choice, which the reloaded pipeline shows.
+    reloadGate.resolve();
+    await animationFrame();
+    await animationFrame();
+    expect(serverStage(1)).toEqual([{ id: 1, stage_id: [NEW, "New"] }]);
+    await expectChoiceShown();
+    expect(`${card("Office Design")} .o_crm_mobile_pending_sync`).toHaveCount(0);
+    expect(".modal").toHaveCount(0);
+    expect.verifyErrors(["/web/dataset/call_kw/crm.lead/web_read_group"]);
+});
+
+// Shared browser: a mobile card stage write held for its turn in the replay is sent
+// with the id of the user who made it (`CRM_OFFLINE_UID_KEY`), as every queued CRM
+// call is, and with the database of their session (`CRM_OFFLINE_DB_KEY`), so that the
+// server refuses it once the browser's session belongs to another user (another tab
+// signed in), as it refuses a queued call replayed there, or to another database
+// served on this origin.
+
+/** JSON-RPC error name of the server's `CrmOfflineOriginError`. */
+const ORIGIN_ERROR_NAME = "odoo.addons.crm.models.crm_lead.CrmOfflineOriginError";
+/** Message of the server's `CrmOfflineOriginError`. */
+const ORIGIN_ERROR_MESSAGE =
+    "This offline change was sent in another user's session and was not applied.";
+
+test.tags("mobile");
+test("[Online] mobile card moved back to its server stage during the replay is sent with the user and database that chose it", async () => {
+    // The framework's own cached pipeline load offline (back from the form).
+    expect.errors(1);
+    const sent = receivedCalls("crm.lead", "web_save");
+    const { received, release } = await startReplayBeforeFormSave();
+
+    // Online meanwhile, the card of the lead, which its queued form save shows in
+    // "Qualified", chooses its server stage "New" again: the lead's own stage write
+    // waits for the queued form save.
+    await showStage("Qualified");
+    await contains(`${card("Office Design")} .o_crm_mobile_lead_stage`).select(String(NEW));
+    await animationFrame();
+    expect(received.length).toBe(1);
+
+    // Sent at its turn, the write names the user who made it and the database of their
+    // session, in the context the card's queued writes are sent in (the card's, with
+    // the user who queued them).
+    await release();
+    await waitUntil(() => received.length === 3);
+    const cardContext = {
+        ...user.context,
+        ...PIPELINE_CONTEXT,
+        default_stage_id: NEW,
+        [CRM_OFFLINE_UID_KEY]: user.userId,
+    };
+    expect(sent.at(-1)).toEqual({
+        model: "crm.lead",
+        method: "web_save",
+        args: [[1], { stage_id: NEW }],
+        kwargs: {
+            context: { ...cardContext, [CRM_OFFLINE_DB_KEY]: session.db },
+            specification: {},
+        },
+    });
+    await advanceTime(1000);
+    await animationFrame();
+    await animationFrame();
+    expect(serverStage(1)).toEqual([{ id: 1, stage_id: [NEW, "New"] }]);
+    expect(".modal").toHaveCount(0);
+    expect.verifyErrors(["/web/dataset/call_kw/crm.lead/web_read_group"]);
+});
+
+test.tags("mobile");
+test("[Online] mobile card stage written during the replay is refused, and changes nothing, once the browser's session belongs to another user", async () => {
+    // The framework's own cached pipeline load offline (back from the form), and its
+    // error dialog of the refused stage write.
+    expect.errors(2);
+    // Registered first, so that it runs last: only the calls the server applies.
+    const applied = receivedCalls("crm.lead", "web_save");
+    // The server session of the browser, which refuses, as the server does
+    // (`_check_offline_queue_origin`), a call naming another user.
+    const browserSession = { uid: serverState.userId };
+    onRpc("crm.lead", "web_save", ({ kwargs }) => {
+        const queuedBy = kwargs.context?.[CRM_OFFLINE_UID_KEY];
+        if (Number.isInteger(queuedBy) && queuedBy !== browserSession.uid) {
+            throw makeServerError({ errorName: ORIGIN_ERROR_NAME, message: ORIGIN_ERROR_MESSAGE });
+        }
+    });
+    // Registered after the refusal, so that it runs first: the refused calls too.
+    const sent = receivedCalls("crm.lead", "web_save");
+    const { plugin, received, release } = await startReplayBeforeFormSave((args) => {
+        if (args[0][0] === 1 && args[1].stage_id === QUALIFIED) {
+            // Another user signs in on this browser (another tab) as the replay sends
+            // the lead's queued form save: the server session it, and the card's write
+            // after it, reach is theirs.
+            browserSession.uid = serverState.userId + 100;
+        }
+    });
+
+    // Online meanwhile, the card chooses its server stage "New" again: the lead's own
+    // stage write waits for the queued form save.
+    await showStage("Qualified");
+    await contains(`${card("Office Design")} .o_crm_mobile_lead_stage`).select(String(NEW));
+    await animationFrame();
+    expect(received.length).toBe(1);
+
+    // The form save is refused and parked; the write it released names the user who
+    // made it, and is refused too. The framework shows its error.
+    await release();
+    await waitUntil(() => received.length === 3);
+    await waitFor(".o_error_dialog");
+    expect(queryFirst(".o_error_dialog").textContent).toInclude(ORIGIN_ERROR_MESSAGE);
+    expect(sent.at(-1).args).toEqual([[1], { stage_id: NEW }]);
+    expect(sent.at(-1).kwargs.context[CRM_OFFLINE_UID_KEY]).toBe(user.userId);
+    expect(sent.at(-1).kwargs.context[CRM_OFFLINE_DB_KEY]).toBe(session.db);
+    await advanceTime(1000);
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+
+    // Nothing of the lead was applied in the other user's session: the server only
+    // applied the rename, sent before the switch, and the form save stays parked.
+    expect(applied.map(({ args }) => args)).toEqual([[[2], { name: "Chairs Quote" }]]);
+    expect(serverStage(1)).toEqual([{ id: 1, stage_id: [NEW, "New"] }]);
+    const [parked] = queued("crm.lead");
+    expect(parked.args).toEqual([[1], { stage_id: QUALIFIED }]);
+    expect(parked.extras.error).toBe(`${ORIGIN_ERROR_NAME} - ${ORIGIN_ERROR_MESSAGE}`);
+    expect.verifyErrors(["/web/dataset/call_kw/crm.lead/web_read_group", ORIGIN_ERROR_MESSAGE]);
 });
 
 test.tags("mobile");
@@ -13576,6 +13834,88 @@ async function openLeadFormController(resId) {
     expect(".o_form_view").toHaveCount(1);
     return controller;
 }
+
+test.tags("mobile");
+test("[Online] mobile card stage held during a replay is not undone by the server answer of a pipeline reopened from the cache", async () => {
+    // The framework's own cached pipeline load offline (back from the form).
+    expect.errors(1);
+    // While `rootAnswer` is set, the server answers a root load of the pipeline only
+    // once that deferred is resolved.
+    let rootAnswer = null;
+    onRpc("crm.lead", "web_read_group", () => rootAnswer?.promise);
+    const { calls, plugin, received, release } = await startReplayBeforeFormSave();
+
+    // Online meanwhile, the pipeline is opened again: its groups are served from the
+    // cache at once, while the server's answer, which another user's rename of "Desk
+    // Upgrade" changed since, is held.
+    MockServer.env["crm.lead"].write([3], { name: "Desk Upgrade Pro" });
+    rootAnswer = Promise.withResolvers();
+    const reopenedFrom = calls.length;
+    await openAction(ACTION_ID);
+    expect(calls.slice(reopenedFrom)).toInclude("crm.lead/web_read_group");
+    expect(cardNames()).toInclude("Desk Upgrade");
+
+    // The card of the lead, which its queued form save shows in "Qualified", chooses
+    // "Won": the choice waits for that save, and the card and the stage headers show
+    // it at once.
+    await showStage("Qualified");
+    await contains(`${card("Office Design")} .o_crm_mobile_lead_stage`).select(String(WON));
+    await animationFrame();
+    expect(received.length).toBe(1);
+    expect(cardNames()).not.toInclude("Office Design");
+    const qualifiedHeader = headerTexts();
+    await showStage("Won");
+    expect(`${card("Office Design")} .o_crm_mobile_lead_stage`).toHaveValue(String(WON));
+    const wonHeader = headerTexts();
+    expect(wonHeader).toEqual(["Won", "2", "$ 1,000"]);
+
+    // The server's answer arrives while the choice waits. Read before the choice was
+    // saved, it is not set over it: the card and the headers still show the choice.
+    rootAnswer.resolve();
+    await animationFrame();
+    await animationFrame();
+    expect(`${card("Office Design")} .o_crm_mobile_lead_stage`).toHaveValue(String(WON));
+    expect(headerTexts()).toEqual(wonHeader);
+    await showStage("Qualified");
+    expect(cardNames()).not.toInclude("Office Design");
+    expect(headerTexts()).toEqual(qualifiedHeader);
+    expect(received.length).toBe(1);
+
+    // The form save replays one second later, then the card's choice is sent, with
+    // the online rainbowman lookup of the move; the pipeline then shows what the
+    // server holds: the card's stage, chosen last, and the other user's rename.
+    await release();
+    await waitUntil(() => received.length === 3);
+    expect(received.slice(1)).toEqual([
+        [[1], { stage_id: QUALIFIED }],
+        [[1], { stage_id: WON }],
+    ]);
+    await advanceTime(1000);
+    await animationFrame();
+    await animationFrame();
+    expect(plugin.syncingORM()).toBe(false);
+    expect(queued("crm.lead")).toEqual([]);
+    expect(serverStage(1)).toEqual([{ id: 1, stage_id: [WON, "Won"] }]);
+    expect(
+        calls.slice(reopenedFrom).filter((call) => call === "crm.lead/get_rainbowman_message")
+    ).toHaveLength(1);
+    // One reload follows the reopened pipeline's own root load: the one ending the
+    // replay, which waited for the card's save.
+    expect(
+        calls.slice(reopenedFrom).filter((call) => call === "crm.lead/web_read_group")
+    ).toHaveLength(2);
+    expect(cardNames()).not.toInclude("Office Design");
+    expect(headerTexts()).toEqual(qualifiedHeader);
+    await showStage("New");
+    expect(cardNames()).toInclude("Desk Upgrade Pro");
+    await showStage("Won");
+    await waitFor(card("Office Design"));
+    expect(`${card("Office Design")} .o_crm_mobile_lead_stage`).toHaveValue(String(WON));
+    expect(`${card("Office Design")} .o_crm_mobile_pending_sync`).toHaveCount(0);
+    expect(headerTexts()).toEqual(wonHeader);
+    expect(".modal").toHaveCount(0);
+    expect.verifyErrors(["/web/dataset/call_kw/crm.lead/web_read_group"]);
+});
 
 test.tags("mobile");
 test("mobile activities from a dirty lead form keep its unsaved edits online", async () => {

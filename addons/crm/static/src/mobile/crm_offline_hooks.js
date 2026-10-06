@@ -754,18 +754,32 @@ function hasLeadWriteAhead(plugin, record, fieldNames) {
  * neither read for conflicts nor changed: nothing is dropped, merged or reordered,
  * and no request is added.
  *
+ * Sent at its turn, the write reaches the server in whatever session the browser
+ * then holds, which another user, or the same user id on another database served on
+ * this origin, may have opened meanwhile (in another tab). So the turn resolves with
+ * the user who made the write and the database of the session they made it in, read
+ * when its wait starts (`CrmWriteOrigin`), which its request sends in its context
+ * (`crmContextWithOrigin`): the server refuses it in another user's session, as it
+ * refuses a queued call replayed there, and in a session of another database, and
+ * nothing is applied.
+ *
  * @param {OfflinePlugin} plugin
  * @param {Object[]} records the datapoints of the leads the write targets
  * @param {string[]|null} [fieldNames] the fields it writes; `null` for a delete
- * @returns {Promise<void>|undefined} `undefined` when the write may be sent now,
- *  which is always the case with no replay running, so that it is then sent
- *  without any added wait; else a promise resolved at its turn
+ * @returns {Promise<CrmWriteOrigin>|undefined} `undefined` when the write may be
+ *  sent now, which is always the case with no replay running, so that it is then
+ *  sent as before, without any added wait; else a promise resolved at its turn with
+ *  the origin of the write
  */
 export function crmLeadWriteTurn(plugin, records, fieldNames = null) {
     const isAhead = () => records.some((record) => hasLeadWriteAhead(plugin, record, fieldNames));
     if (!untrack(isAhead)) {
         return undefined;
     }
+    const origin = Object.freeze({
+        [CRM_OFFLINE_UID_KEY]: user.userId,
+        [CRM_OFFLINE_DB_KEY]: session.db,
+    });
     let stop;
     const turn = new Promise((resolve) => {
         stop = untrack(() =>
@@ -776,7 +790,33 @@ export function crmLeadWriteTurn(plugin, records, fieldNames = null) {
             })
         );
     });
-    return turn.then(() => stop());
+    return turn.then(() => {
+        stop();
+        return origin;
+    });
+}
+
+/**
+ * Origin of a lead write held for its turn (`crmLeadWriteTurn`): the context keys
+ * naming the user who made it (`CRM_OFFLINE_UID_KEY`), the one every queued CRM call
+ * carries, and the database of the session they made it in (`CRM_OFFLINE_DB_KEY`),
+ * by which the server refuses a call made by another user than the caller, or in a
+ * session of another database.
+ *
+ * @typedef {{crm_offline_uid: number|false, crm_offline_db: string}} CrmWriteOrigin
+ */
+
+/**
+ * The context a lead write sends: `context` with its origin added when it was held
+ * for its turn (`crmLeadWriteTurn`); the very `context` given for a write sent at
+ * once (no `origin`), whose call is sent as before.
+ *
+ * @param {Object|undefined} context
+ * @param {CrmWriteOrigin} [origin]
+ * @returns {Object|undefined}
+ */
+export function crmContextWithOrigin(context, origin) {
+    return origin ? { ...context, ...origin } : context;
 }
 
 /**
@@ -784,10 +824,45 @@ export function crmLeadWriteTurn(plugin, records, fieldNames = null) {
  * made at it, as the CRM kanban model marks it on the record (`crmTurnWrite`, see
  * `CrmKanbanModel.crmWriteInTurn`): the record's values of `fieldNames` follow
  * every queued or replayed write of the lead stamped up to `timeStamp`, and the
- * later ones follow them. `undefined` for a record without such a write.
+ * later ones follow them. Its `timeStamp` is `crmTurnWriteTimeStamp`: not before any
+ * write of the lead queued or replayed when it was made, so that those, made before
+ * it, never show over it. `undefined` for a record without such a write.
  *
  * @typedef {{timeStamp: number, fieldNames: string[]}} CrmTurnWrite
  */
+
+/**
+ * Time stamp of an online write of the lead of `record` made now and waiting for its
+ * turn (`CrmTurnWrite`): now, or the latest time stamp of the lead's writes queued or
+ * just replayed (`leadWritesIn` of the queue and of the replay hold, the writes
+ * `projectLead` applies) when that is later. A queued write may be stamped past the
+ * clock (one that must replay after another write queued in the same millisecond is
+ * stamped one past it), and the online write, made after all of them, must still
+ * apply after them; on a tie, `projectLead` applies it last. Nothing in the queue is
+ * changed. Later writes of those fields through the record itself (a save, the
+ * mobile `crmWriteStage`) are in the record's values the write shows, so they show
+ * whatever their time stamp. Reads the queue and the hold without tracking them.
+ *
+ * @param {OfflinePlugin} plugin
+ * @param {Object} record
+ * @returns {number}
+ */
+export function crmTurnWriteTimeStamp(plugin, record) {
+    return untrack(() => {
+        // Without a replay hold (no mobile pipeline yet), no write was kept: none is
+        // created here.
+        const indexes = replayHolds.has(plugin)
+            ? [readQueueIndex(plugin), readHeldIndex(plugin)]
+            : [readQueueIndex(plugin)];
+        let timeStamp = Date.now();
+        for (const index of indexes) {
+            for (const { value } of leadWritesIn(index, record)) {
+                timeStamp = Math.max(timeStamp, value.extras?.timeStamp || 0);
+            }
+        }
+        return timeStamp;
+    });
+}
 
 // -----------------------------------------------------------------------------
 // Replay hold (entries the replay just sent, until the views reload)
@@ -1157,7 +1232,8 @@ export const CRM_OFFLINE_CREATE_KEY = "crm_offline_create_key";
 export const CRM_OFFLINE_CREATE_WRITE = "crm_offline_create_write";
 
 /**
- * Context key of the id of the user who queued a call of `CRM_REPLAY_MODELS`. The
+ * Context key of the id of the user who queued a call of `CRM_REPLAY_MODELS`, or
+ * made an online lead write held for its turn in a replay (`crmLeadWriteTurn`). The
  * offline store is shared by every session of the browser, and pages that do not
  * load this module (website, portal) replay it in whatever session they have, so
  * the server refuses a call carrying this key whose user is not the caller.
@@ -1171,6 +1247,18 @@ export const CRM_OFFLINE_UID_KEY = "crm_offline_uid";
  * an ungrouped small-screen list only (`CrmKanbanModel`).
  */
 export const CRM_STAGE_CHOICES_KEY = "crm_stage_choices";
+
+/**
+ * Context key of the database of the session in which an online lead write held for
+ * its turn in a replay was made (`crmLeadWriteTurn`), sent with the user who made it
+ * (`CRM_OFFLINE_UID_KEY`). Several databases served on one origin share the
+ * browser's session cookie, and a user id names a user of one database only (the
+ * administrator has the same id in each of them): signed in on another database
+ * meanwhile (in another tab), the browser would send the write there, as that
+ * database's user of the same id. So the server refuses a call carrying this key
+ * that reaches another database than this one.
+ */
+export const CRM_OFFLINE_DB_KEY = "crm_offline_db";
 
 /**
  * A new delivery key (`CRM_OFFLINE_CREATE_KEY`): 128 random bits as 32 lowercase
@@ -1386,8 +1474,9 @@ patch(OfflinePlugin.prototype, {
      * call queued again with its stored kwargs does. Pages that do not load this
      * module replay the shared offline store without the filter above, in their
      * own session, and the server refuses a call whose context names another
-     * user than the caller. Only queued calls carry the key: online calls are
-     * sent unchanged.
+     * user than the caller. Only queued calls carry the key, and the online lead
+     * writes held for their turn in a replay (`crmLeadWriteTurn`): every other
+     * online call is sent unchanged.
      *
      * A lead create (`crm.lead` `web_save` without ids) queued without a valid
      * delivery key (`CRM_OFFLINE_CREATE_KEY`) gets one, whoever queues it: the key
@@ -1874,8 +1963,10 @@ export function useCrmOffline() {
          * replay has just sent stay applied until the view reloads (`holdReplayed`).
          * An online write of the record made during the replay (`crmTurnWrite`)
          * applies the record's values of the fields it writes at its time stamp,
-         * after the writes stamped up to it (on a tie, it was made last): the card
-         * shows it at once, while it waits for its turn, and until the view reloads.
+         * after the writes stamped up to it (on a tie, it was made last), which are
+         * all those of the lead queued or replayed when it was made, even stamped
+         * past the clock (`crmTurnWriteTimeStamp`): the card shows it at once, while
+         * it waits for its turn, and until the view reloads.
          *
          * @param {Object} record
          * @returns {Object|null}
