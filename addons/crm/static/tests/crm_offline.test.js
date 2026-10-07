@@ -12578,6 +12578,9 @@ test("[Offline] lead chatter attachments, pinned messages, search and composer r
     await settle();
     await contains("button[title='Pinned Messages']").click();
     await waitFor(".o-mail-pinnedMessages .o-mail-Message:contains(Kick-off call done)");
+    // The pinned messages show at once from the store, while their fetch only leaves
+    // after the store's request debounce: it is awaited before the connection drops.
+    await waitUntil(() => mailRequests.includes("/mail/store"), { timeout: 1000 });
     expect(mailRequests).toInclude("/mail/store");
     expect(".o-mail-pinnedMessages .o-mail-MessageCard-jump").toHaveCount(1);
     await setOffline(true);
