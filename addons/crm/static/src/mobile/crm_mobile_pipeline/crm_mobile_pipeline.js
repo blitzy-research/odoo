@@ -2249,13 +2249,19 @@ export class CrmMobilePipeline extends CrmKanbanRenderer {
      * integer of an offered stage (`stages`) is ignored: nothing changes, and
      * nothing is saved or queued. A move that is neither saved nor queued leaves
      * the lead in its stage (`crmSaveStage`), and its save error, if any, rejects
-     * the returned promise.
+     * the returned promise. Offline where the queue cannot hold the move
+     * (`isOfflineQueueBlocked`, a non-secure origin, where the card's stage
+     * selector is disabled), it does nothing: no request, queue entry or
+     * notification, and the lead stays in its stage.
      *
      * @param {Object} record
      * @param {number} stageId
      * @returns {Promise|undefined}
      */
     moveLead(record, stageId) {
+        if (this.crmOffline.isOfflineQueueBlocked()) {
+            return;
+        }
         const stage =
             Number.isSafeInteger(stageId) && stageId > 0
                 ? this.stages.find((s) => s.id === stageId)

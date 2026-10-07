@@ -1213,12 +1213,21 @@ export class CrmMobileLeadCard extends Component {
      * A stage chosen on the open option list, by pointer or touch, moves the lead
      * at once. A key that changes the closed selector's value (see
      * `onStageKeydown`) only makes that option the pending choice: the selector
-     * shows it, and nothing is saved until it is confirmed.
+     * shows it, and nothing is saved until it is confirmed. Offline where the
+     * queue cannot hold the move (`isOfflineQueueBlocked`, a non-secure origin,
+     * where the selector is disabled), a change racing that disabling saves and
+     * queues nothing, and the selector shows the lead's stage again.
      *
      * @param {Event} ev change event of the stage `<select>`
      */
     onStageChange(ev) {
         if (this.isProvisional || !this.props.record) {
+            return;
+        }
+        if (this.crmOffline.isOfflineQueueBlocked()) {
+            this.stageKeyChange = false;
+            this.pendingStageValue = null;
+            this.showLeadStage(ev.target);
             return;
         }
         if (this.stageKeyChange) {
@@ -1280,6 +1289,10 @@ export class CrmMobileLeadCard extends Component {
     /**
      * Saves the pending choice, if the selector still shows it: a render that
      * changed its selected option meanwhile (the lead's stage changed) drops it.
+     * Offline where the queue cannot hold the move (`isOfflineQueueBlocked`), as
+     * when the connection drops before the selector is left, the choice is dropped
+     * instead: nothing is saved or queued, and the selector shows the lead's stage
+     * again.
      *
      * @param {HTMLSelectElement} select
      */
@@ -1287,13 +1300,17 @@ export class CrmMobileLeadCard extends Component {
         const value = this.pendingStageValue;
         this.pendingStageValue = null;
         if (value !== null && select.value === value) {
+            if (this.crmOffline.isOfflineQueueBlocked()) {
+                this.showLeadStage(select);
+                return;
+            }
             return this.moveToStage(value);
         }
     }
 
     /**
      * Drops the pending choice and shows the lead's stage again on the selector
-     * (its unselectable current option when the stage is none of the choices).
+     * (`showLeadStage`).
      *
      * @param {HTMLSelectElement} select
      */
@@ -1302,6 +1319,16 @@ export class CrmMobileLeadCard extends Component {
             return;
         }
         this.pendingStageValue = null;
+        this.showLeadStage(select);
+    }
+
+    /**
+     * Shows the lead's stage on the selector: its option, or the unselectable
+     * current option when the stage is none of the choices.
+     *
+     * @param {HTMLSelectElement} select
+     */
+    showLeadStage(select) {
         const values = this.values;
         const stage = values && this.stageChoice(values);
         if (stage) {
@@ -1310,12 +1337,14 @@ export class CrmMobileLeadCard extends Component {
     }
 
     /**
-     * Moves the lead to a chosen stage, unless it already shows it.
+     * Moves the lead to a chosen stage, unless it already shows it. Does nothing
+     * offline where the queue cannot hold the move (`isOfflineQueueBlocked`, a
+     * non-secure origin), which also covers a direct call.
      *
      * @param {string} value value of the chosen option
      */
     moveToStage(value) {
-        if (this.isProvisional || !this.props.record) {
+        if (this.isProvisional || !this.props.record || this.crmOffline.isOfflineQueueBlocked()) {
             return;
         }
         const values = this.values;

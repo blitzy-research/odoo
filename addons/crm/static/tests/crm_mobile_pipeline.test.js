@@ -12590,6 +12590,107 @@ test("[Offline] non-secure origin disables New, its deep link and quick-create S
 });
 
 test.tags("mobile");
+test("[Offline] non-secure origin disables the lead card stage selector", async () => {
+    let pipeline = null;
+    patchWithCleanup(CrmMobilePipeline.prototype, {
+        setup() {
+            super.setup(...arguments);
+            pipeline = this;
+        },
+    });
+    // The live (not destroyed) lead cards, whose methods are called directly.
+    const cards = new Set();
+    patchWithCleanup(CrmMobileLeadCard.prototype, {
+        setup() {
+            super.setup(...arguments);
+            cards.add(this);
+            onWillDestroy(() => cards.delete(this));
+        },
+    });
+    const setOffline = mockOffline();
+    await mountPipeline();
+    // Both stages visited online.
+    await contains(".o_crm_mobile_pipeline_next").click();
+    await contains(".o_crm_mobile_pipeline_prev").click();
+    const leadSelects =
+        ".o_crm_mobile_lead_card:not(.o_crm_mobile_lead_card_provisional) .o_crm_mobile_lead_stage";
+    const provisionalSelect = ".o_crm_mobile_lead_card_provisional .o_crm_mobile_lead_stage";
+    const desk = `${card("Desk Upgrade")} .o_crm_mobile_lead_stage`;
+    const deskCard = () => [...cards].find((leadCard) => leadCard.props.record?.resId === 3);
+
+    // On a secure origin offline, the selectors stay enabled; a lead created offline
+    // shows a provisional card, whose selector is disabled.
+    await setOffline(true);
+    await animationFrame();
+    expectQueueControl(leadSelects, { blocked: false, count: 3 });
+    await quickCreateLead({ name: "LAN Lead" });
+    await animationFrame();
+    expect(provisionalSelect).toHaveCount(1);
+    expect(provisionalSelect).not.toBeEnabled();
+    expect(provisionalSelect).not.toHaveClass("o_disabled_offline");
+    const [create] = queued("crm.lead");
+    expect(create.args[0]).toEqual([]);
+
+    // Served from a non-secure origin, online, nothing changes. The framework replays
+    // nothing there, so the create stays queued and its card provisional.
+    mockNonSecureContext();
+    await setOffline(false);
+    await animationFrame();
+    expectQueueControl(leadSelects, { blocked: false, count: 3 });
+    expect(provisionalSelect).not.toBeEnabled();
+    expect(queued("crm.lead")).toEqual([create]);
+    const calls = trackCalls();
+
+    // A stage chosen with the keyboard is still pending when the connection drops:
+    // every selector is disabled, and leaving the focused one drops the choice.
+    await chooseStageWithKey(desk, "ArrowDown", QUALIFIED);
+    expect(desk).toHaveValue(String(QUALIFIED));
+    await setOffline(true);
+    await animationFrame();
+    expectQueueControl(leadSelects, { blocked: true, count: 3 });
+    expect(desk).toHaveValue(String(NEW));
+    // The provisional card's selector stays disabled without the framework's
+    // offline state, whose removal on reconnection would enable it.
+    expect(provisionalSelect).not.toBeEnabled();
+    expect(provisionalSelect).not.toHaveClass("o_disabled_offline");
+
+    // Neither a change racing the disabling, a pending choice confirmed, nor a
+    // direct call moves the lead: no request, queue entry or notification.
+    const deskEl = queryFirst(desk);
+    deskEl.value = String(QUALIFIED);
+    await manuallyDispatchProgrammaticEvent(deskEl, "change");
+    expect(desk).toHaveValue(String(NEW));
+    deskEl.value = String(QUALIFIED);
+    deskCard().pendingStageValue = String(QUALIFIED);
+    expect(deskCard().commitPendingStage(deskEl)).toBe(undefined);
+    expect(desk).toHaveValue(String(NEW));
+    expect(deskCard().moveToStage(String(QUALIFIED))).toBe(undefined);
+    expect(pipeline.moveLead(deskCard().props.record, QUALIFIED)).toBe(undefined);
+    await animationFrame();
+    expect(calls.filter((call) => WRITE_CALL.test(call))).toEqual([]);
+    expect(queued("crm.lead")).toEqual([create]);
+    expect(".o_notification").toHaveCount(0);
+    expect(cardNames()).toEqual(["Office Design", "Quote for Chairs", "Desk Upgrade", "LAN Lead"]);
+    expect(desk).toHaveValue(String(NEW));
+    expect(`${card("Desk Upgrade")} .o_crm_mobile_pending_sync`).toHaveCount(0);
+    expect(serverStage(3)).toEqual([{ id: 3, stage_id: [NEW, "New"] }]);
+
+    // Online again, the selectors are enabled, the provisional one excepted, and a
+    // stage choice is saved online.
+    await setOffline(false);
+    await animationFrame();
+    expectQueueControl(leadSelects, { blocked: false, count: 3 });
+    expect(provisionalSelect).not.toBeEnabled();
+    await contains(desk).select(String(QUALIFIED));
+    await animationFrame();
+    expect(serverStage(3)).toEqual([{ id: 3, stage_id: [QUALIFIED, "Qualified"] }]);
+    expect(calls.filter((call) => WRITE_CALL.test(call))).toEqual(["crm.lead/web_save"]);
+    expect(cardNames()).toEqual(["Office Design", "Quote for Chairs", "LAN Lead"]);
+    expect(queued("crm.lead")).toEqual([create]);
+    expect(".o_notification").toHaveCount(0);
+});
+
+test.tags("mobile");
 test("[Offline] non-secure origin disables the activity sheet writes", async () => {
     const setOffline = mockOffline();
     await mountPipeline();
