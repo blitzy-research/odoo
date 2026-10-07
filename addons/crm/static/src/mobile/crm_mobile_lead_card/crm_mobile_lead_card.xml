@@ -1,0 +1,291 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+    <!--
+        Render the projected card unless a pending, non-parked delete/archive hides it;
+        provisional actions need a server ID.
+    -->
+    <t t-name="crm.CrmMobileLeadCard">
+        <t t-set="card" t-value="this.cardData"/>
+        <!-- A sample record of an empty pipeline is inert and hidden from assistive technology (dimmed by the stylesheet). -->
+        <div t-if="card"
+            class="o_crm_mobile_lead_card d-flex flex-column gap-2 p-2 border bg-view"
+            t-att-class="{ 'o_crm_mobile_lead_card_provisional': this.isProvisional }"
+            t-att-inert="this.isSample ? '' : false"
+            t-att-aria-hidden="this.isSample ? 'true' : false">
+            <button type="button"
+                class="o_crm_mobile_lead_open btn btn-link text-start text-reset py-0 d-flex flex-column align-items-start"
+                data-available-offline="1"
+                t-att-aria-label="card.openAriaLabel"
+                t-att-aria-describedby="card.openDescribedBy"
+                t-att-disabled="this.isProvisional"
+                t-on-click="this.onOpenClick">
+                <span class="o_crm_mobile_lead_name fw-bold fs-5" t-out="card.values.name"/>
+                <span t-if="card.partnerLabel" class="o_crm_mobile_lead_partner fw-normal" t-out="card.partnerLabel"/>
+                <span t-if="card.revenueLabel" class="o_crm_mobile_lead_revenue fw-normal" t-out="card.revenueLabel"/>
+            </button>
+            <span t-if="card.syncState"
+                class="o_crm_mobile_pending_sync badge align-self-start"
+                t-att-class="card.syncState === 'failed' ? 'text-bg-danger' : 'text-bg-warning'"
+                aria-hidden="true">
+                <t t-if="card.syncState === 'failed'">Sync failed</t><t t-else="">Pending sync</t>
+            </span>
+            <!-- Always present, and empty when the card is inserted, so its text changes are announced; the visible badge is hidden from assistive technology to avoid reading it twice. -->
+            <span class="o_crm_mobile_lead_sync_status visually-hidden" role="status" t-out="card.syncStatus"/>
+            <!-- Descriptions of the controls (aria-describedby), which read them out; hidden otherwise, as the button already shows the partner, revenue and badge. -->
+            <span t-if="card.openDescription"
+                class="o_crm_mobile_lead_description visually-hidden"
+                t-att-id="this.descriptionId"
+                aria-hidden="true"
+                t-out="card.openDescription"/>
+            <span t-if="card.unavailableReason"
+                class="o_crm_mobile_lead_unavailable visually-hidden"
+                t-att-id="this.unavailableId"
+                aria-hidden="true"
+                t-out="card.unavailableReason"/>
+            <div class="o_crm_mobile_lead_actions d-flex gap-2 align-items-center">
+                <!-- No selector without a loaded stage or choices; a stage outside the choices shows as an unselectable current option: its name while pending, "Stage unavailable" once its sync failed, "None" without stage. -->
+                <!-- Offline where the queue cannot hold the move (non-secure origin), the selector loses data-available-offline and takes the framework's offline-disabled state, which the framework gives buttons only; a provisional card's selector, disabled anyway, never takes that state, whose removal on reconnection would enable it. -->
+                <t t-set="stageBlocked" t-value="this.crmOffline.isOfflineQueueBlocked()"/>
+                <select t-if="card.stage"
+                    class="o_crm_mobile_lead_stage form-select"
+                    t-att-class="{ 'o_disabled_offline': stageBlocked and !this.isProvisional }"
+                    name="stage_id"
+                    t-att-data-available-offline="stageBlocked ? false : '1'"
+                    t-att-aria-label="card.stageAriaLabel"
+                    t-att-aria-describedby="card.unavailableReason ? this.unavailableId : false"
+                    t-att-disabled="this.isProvisional or stageBlocked"
+                    t-on-change="this.onStageChange"
+                    t-on-keydown="this.onStageKeydown"
+                    t-on-keyup="this.onStageKeyup"
+                    t-on-blur="this.onStageBlur">
+                    <option t-if="card.stage.missing" value="" selected="selected" disabled="disabled" t-out="card.stage.label"/>
+                    <t t-foreach="this.props.stages" t-as="stage" t-key="stage.id">
+                        <option t-att-value="stage.id"
+                            t-att-selected="stage.id === card.stage.id"
+                            t-out="stage.display_name"/>
+                    </t>
+                </select>
+                <!-- Scheduling needs the lead's server id: no sheet for a provisional card. -->
+                <button type="button"
+                    class="o_crm_mobile_lead_activities_button btn btn-secondary"
+                    data-available-offline="1"
+                    title="Activities"
+                    t-att-aria-label="card.activitiesAriaLabel"
+                    t-att-aria-describedby="card.unavailableReason ? this.unavailableId : false"
+                    t-att-disabled="this.isProvisional"
+                    t-on-click="this.openActivities">
+                    <i class="fa fa-clock-o" aria-hidden="true"/>
+                </button>
+            </div>
+        </div>
+    </t>
+
+    <!--
+        Use a div for the draft: Enter must not schedule an activity; only Save does.
+        Offline where the queue cannot hold a call (non-secure origin), the write
+        controls (Mark done, Log a call, Schedule follow-up, Save) lose
+        data-available-offline, so the framework disables them; the rest is unchanged.
+        The sheet body already pads the content; the heading takes the focus on open.
+    -->
+    <t t-name="crm.CrmMobileLeadActivities">
+        <t t-set="queueBlocked" t-value="this.crmOffline.isOfflineQueueBlocked()"/>
+        <div class="o_crm_mobile_lead_activities_sheet d-flex flex-column gap-3"
+            tabindex="-1"
+            t-ref="this.rootRef"
+            t-on-focusin="this.onFocusIn">
+            <header class="d-flex flex-column">
+                <h4 class="mb-0" tabindex="-1" t-ref="this.headingRef">Activities</h4>
+                <span t-if="this.leadRecord" class="o_crm_mobile_activities_lead_name" t-out="this.leadRecord.data.name"/>
+            </header>
+
+            <ul class="o_crm_mobile_lead_activities list-unstyled d-flex flex-column mb-0" aria-live="polite">
+                <li t-foreach="this.syncedRows" t-as="row" t-key="row.id"
+                    class="o_crm_mobile_activity_row d-flex align-items-center gap-2"
+                    t-att-class="{ 'o_crm_mobile_activity_done_pending': row.donePending }"
+                    t-att-data-activity-id="row.id">
+                    <div class="o_crm_mobile_activity_info d-flex flex-column flex-grow-1 min-w-0">
+                        <span class="o_crm_mobile_activity_title fw-bold text-truncate" t-out="row.summary or row.typeLabel"/>
+                        <span class="o_crm_mobile_activity_details d-flex flex-wrap column-gap-2 small">
+                            <span t-if="row.typeLabel" class="o_crm_mobile_activity_type_label" t-out="row.typeLabel"/>
+                            <span t-if="row.deadlineLabel" class="o_crm_mobile_activity_deadline" t-out="row.deadlineLabel"/>
+                            <span t-if="row.assigneeLabel" class="o_crm_mobile_activity_assignee" t-out="row.assigneeLabel"/>
+                        </span>
+                    </div>
+                    <button type="button"
+                        class="o_crm_mobile_activity_done btn btn-secondary ms-auto"
+                        t-att-data-available-offline="queueBlocked ? false : '1'"
+                        t-att-disabled="row.donePending or row.doneBusy"
+                        t-att-aria-busy="row.doneBusy ? 'true' : false"
+                        t-att-aria-label="row.doneAriaLabel"
+                        t-on-click="() => this.markDone(row)">
+                        <t t-if="row.donePending">Done · Pending sync</t><t t-else="">Mark done</t>
+                    </button>
+                </li>
+                <li t-foreach="this.pendingRows" t-as="row" t-key="row.key"
+                    class="o_crm_mobile_activity_row o_crm_mobile_activity_pending d-flex align-items-center gap-2">
+                    <div class="o_crm_mobile_activity_info d-flex flex-column flex-grow-1 min-w-0">
+                        <span class="o_crm_mobile_activity_title fw-bold text-truncate" t-out="row.summary or row.typeLabel"/>
+                        <span class="o_crm_mobile_activity_details d-flex flex-wrap column-gap-2 small">
+                            <span t-if="row.typeLabel" class="o_crm_mobile_activity_type_label" t-out="row.typeLabel"/>
+                            <span t-if="row.deadlineLabel" class="o_crm_mobile_activity_deadline" t-out="row.deadlineLabel"/>
+                            <span t-if="row.assigneeLabel" class="o_crm_mobile_activity_assignee" t-out="row.assigneeLabel"/>
+                        </span>
+                    </div>
+                    <!-- A queued create has no server id yet, hence no "Mark done". -->
+                    <span class="o_crm_mobile_pending_sync badge"
+                        t-att-class="row.parked ? 'text-bg-danger' : 'text-bg-warning'">
+                        <t t-if="row.parked">Sync failed</t><t t-else="">Pending sync</t>
+                    </span>
+                </li>
+            </ul>
+            <!-- Loaded activity data that lists nothing: scheduling stays available. -->
+            <p t-if="this.hasNoActivities" class="o_crm_mobile_activities_empty">No activities</p>
+
+            <!-- Additional mobile pages require an online root reload; otherwise show only the remaining count. -->
+            <div t-if="this.canLoadMoreActivities"
+                class="o_crm_mobile_activities_more_online d-flex align-items-center gap-2">
+                <span class="o_crm_mobile_activities_more_count" t-out="this.moreCountLabel"/>
+                <button type="button"
+                    class="o_crm_mobile_activities_load_more btn btn-secondary ms-auto"
+                    t-att-disabled="this.isLoadingMoreActivities"
+                    t-att-aria-busy="this.isLoadingMoreActivities ? 'true' : false"
+                    t-on-click="this.loadMoreActivities">Show more</button>
+            </div>
+            <p t-elif="this.moreCount" class="o_crm_mobile_activities_more mb-0" role="status" t-out="this.moreAfterSyncLabel"/>
+            <!-- No activity data cached for this lead: scheduling stays available. -->
+            <p t-if="this.hasNoActivityData" class="o_crm_mobile_activities_notice mb-0" role="status">Activities load after sync</p>
+
+            <!-- Why an opener is disabled for a missing activity type; each opener it explains references it. -->
+            <t t-set="typesNotice" t-value="this.state.form ? '' : this.typesNotice"/>
+            <p t-if="typesNotice"
+                class="o_crm_mobile_activity_types_notice small mb-0"
+                role="status"
+                t-att-id="this.fieldId('types_notice')"
+                t-out="typesNotice"/>
+            <div t-if="!this.state.form" class="o_crm_mobile_activity_actions d-flex gap-2">
+                <!-- Where the queue is blocked, the framework disables the openers with its offline state whatever the types: its selector skips a button the template has already disabled. -->
+                <button type="button"
+                    class="o_crm_mobile_log_call btn btn-primary"
+                    t-att-data-available-offline="queueBlocked ? false : '1'"
+                    t-att-disabled="!queueBlocked and !this.canLogCall"
+                    t-att-aria-describedby="typesNotice and !this.canLogCall ? this.fieldId('types_notice') : false"
+                    t-on-click="this.openLogCall">Log a call</button>
+                <button type="button"
+                    class="o_crm_mobile_schedule_followup btn btn-secondary"
+                    t-att-data-available-offline="queueBlocked ? false : '1'"
+                    t-att-disabled="!queueBlocked and !this.hasTypes"
+                    t-att-aria-describedby="typesNotice and !this.hasTypes ? this.fieldId('types_notice') : false"
+                    t-on-click="this.openFollowUp">Schedule follow-up</button>
+            </div>
+            <!-- The openers require cached types; an open form keeps its type options until it closes, and Save revalidates against the options shown. -->
+            <div t-else="" class="o_crm_mobile_activity_form d-flex flex-column gap-2">
+                <div class="o_crm_mobile_activity_form_row d-flex flex-column">
+                    <label class="form-label" t-att-for="this.fieldId('activity_type_id')">Activity type</label>
+                    <select class="o_crm_mobile_activity_type form-select"
+                        t-att-class="{ 'is-invalid o_field_invalid': this.state.invalid.activity_type_id }"
+                        t-att-id="this.fieldId('activity_type_id')"
+                        name="activity_type_id"
+                        data-available-offline="1"
+                        required=""
+                        t-ref="this.typeRef"
+                        t-att-aria-invalid="this.state.invalid.activity_type_id ? 'true' : false"
+                        t-att-aria-describedby="this.state.invalid.activity_type_id ? this.fieldId('activity_type_id_feedback') : false"
+                        t-on-change="(ev) => this.onFormChange('activity_type_id', ev)">
+                        <option t-foreach="this.state.types" t-as="type" t-key="type.id"
+                            t-att-value="type.id"
+                            t-att-selected="type.id == this.state.form.activity_type_id"
+                            t-out="type.display_name"/>
+                    </select>
+                    <div t-if="this.state.invalid.activity_type_id"
+                        class="invalid-feedback d-block"
+                        t-att-id="this.fieldId('activity_type_id_feedback')">An activity type is required.</div>
+                </div>
+                <div class="o_crm_mobile_activity_form_row d-flex flex-column">
+                    <label class="form-label" t-att-for="this.fieldId('summary')">Summary</label>
+                    <input type="text"
+                        class="o_crm_mobile_activity_summary form-control"
+                        t-att-id="this.fieldId('summary')"
+                        name="summary"
+                        autocomplete="off"
+                        data-available-offline="1"
+                        placeholder="Summary"
+                        t-att-value="this.state.form.summary"
+                        t-on-input="(ev) => this.onFormChange('summary', ev)"/>
+                </div>
+                <div class="o_crm_mobile_activity_form_row d-flex flex-column">
+                    <label class="form-label" t-att-for="this.fieldId('date_deadline')">Due date</label>
+                    <input type="date"
+                        class="o_crm_mobile_activity_date form-control"
+                        t-att-class="{ 'is-invalid o_field_invalid': this.state.invalid.date_deadline }"
+                        t-att-id="this.fieldId('date_deadline')"
+                        name="date_deadline"
+                        data-available-offline="1"
+                        required=""
+                        t-ref="this.dateRef"
+                        t-att-aria-invalid="this.state.invalid.date_deadline ? 'true' : false"
+                        t-att-aria-describedby="this.state.invalid.date_deadline ? this.fieldId('date_deadline_feedback') : false"
+                        t-att-value="this.state.form.date_deadline"
+                        t-on-change="(ev) => this.onFormChange('date_deadline', ev)"/>
+                    <div t-if="this.state.invalid.date_deadline"
+                        class="invalid-feedback d-block"
+                        t-att-id="this.fieldId('date_deadline_feedback')">A valid due date is required.</div>
+                </div>
+                <div class="o_crm_mobile_activity_form_row d-flex flex-column">
+                    <label class="form-label" t-att-for="this.fieldId('user_id')">Assigned to</label>
+                    <select class="o_crm_mobile_activity_user form-select"
+                        t-att-class="{ 'is-invalid o_field_invalid': this.state.invalid.user_id }"
+                        t-att-id="this.fieldId('user_id')"
+                        name="user_id"
+                        data-available-offline="1"
+                        required=""
+                        t-ref="this.userRef"
+                        t-att-aria-invalid="this.state.invalid.user_id ? 'true' : false"
+                        t-att-aria-describedby="this.state.invalid.user_id ? this.fieldId('user_id_feedback') : false"
+                        t-on-change="(ev) => this.onFormChange('user_id', ev)">
+                        <option t-foreach="this.state.assignees" t-as="assignee" t-key="assignee.id"
+                            t-att-value="assignee.id"
+                            t-att-selected="assignee.id == this.state.form.user_id"
+                            t-out="assignee.display_name"/>
+                    </select>
+                    <div t-if="this.state.invalid.user_id"
+                        class="invalid-feedback d-block"
+                        t-att-id="this.fieldId('user_id_feedback')">An assignee is required.</div>
+                </div>
+                <div class="o_crm_mobile_activity_form_buttons d-flex gap-2">
+                    <button type="button"
+                        class="o_crm_mobile_activity_save btn btn-primary"
+                        t-att-data-available-offline="queueBlocked ? false : '1'"
+                        t-att-disabled="this.state.saving"
+                        t-att-aria-busy="this.state.saving ? 'true' : false"
+                        t-on-click="this.saveForm">Save</button>
+                    <button type="button"
+                        class="o_crm_mobile_activity_cancel btn btn-secondary"
+                        data-available-offline="1"
+                        t-att-disabled="this.state.saving"
+                        t-on-click="this.cancelForm">Cancel</button>
+                </div>
+            </div>
+        </div>
+    </t>
+
+    <!--
+        Primary inheritance preserves framework extensions without adding a desktop activities button.
+        An icon button, like the card's: a text label would widen the phone control panel's
+        breadcrumbs row past its container and push the pager onto a second row.
+    -->
+    <t t-name="crm.CrmFormView" t-inherit="web.FormView" t-inherit-mode="primary">
+        <xpath expr="//Layout/t[@t-set-slot='control-panel-additional-actions']" position="inside">
+            <button t-if="this.crmOffline.isSmall and this.model.root.resId and !this.env.inDialog"
+                type="button"
+                class="btn btn-secondary o_crm_mobile_activities_button"
+                data-available-offline="1"
+                title="Activities"
+                t-att-aria-label="this.crmActivitiesAriaLabel"
+                t-on-click="this.openMobileActivities">
+                <i class="fa fa-clock-o" aria-hidden="true"/>
+            </button>
+        </xpath>
+    </t>
+
+</templates>

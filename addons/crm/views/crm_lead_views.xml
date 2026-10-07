@@ -7,7 +7,7 @@
                 <form class="o_lead_opportunity_form" js_class="crm_form">
                     <header>
                         <button name="action_set_won_rainbowman" string="Won"
-                            type="object" class="oe_highlight" data-hotkey="w" title="Mark as won"
+                            type="object" class="oe_highlight" data-hotkey="w" title="Mark as won" data-available-offline="1"
                             invisible="won_status == 'won' or type == 'lead' or not active"/>
                         <button name="action_convert_to_opportunity" string="Convert to Opportunity" type="object"
                             class="oe_highlight" invisible="type == 'opportunity' or not active" data-hotkey="v"/>
@@ -16,7 +16,7 @@
                         <button name="%(crm.crm_lead_lost_action)d" string="Lost" type="action" data-hotkey="l" title="Mark as lost"
                             invisible="won_status != 'pending' or not active"/>
                         <field name="stage_id" widget="rotting_statusbar_duration"
-                            options="{'clickable': '1', 'fold_field': 'fold'}"
+                            options="{'clickable': '1', 'fold_field': 'fold', 'crm_call_activity_type_id': %(mail.mail_activity_data_call)d}"
                             domain="['|', ('team_ids', 'in', team_id), ('team_ids', '=', False)]"
                             invisible="type == 'lead'" readonly="won_status == 'lost' or not active"/>
                     </header>
@@ -360,7 +360,7 @@
             <field name="model">crm.lead</field>
             <field name="priority" eval="100"/>
             <field name="arch" type="xml">
-                <kanban class="o_kanban_mobile" archivable="false" js_class="crm_kanban" sample="1">
+                <kanban class="o_kanban_mobile" archivable="false" js_class="crm_mobile_pipeline" sample="1">
                     <progressbar field="activity_state" colors='{"planned": "success", "today": "warning", "overdue": "danger"}'/>
                     <templates>
                         <t t-name="card">
@@ -370,7 +370,7 @@
                             <footer class="pt-1 mt-0">
                                 <div class="d-flex mt-auto">
                                     <field name="priority" widget="priority" class="me-2"/>
-                                    <field name="activity_ids" widget="kanban_activity"/>
+                                    <field name="activity_ids" widget="kanban_activity" options="{'crm_call_activity_type_id': %(mail.mail_activity_data_call)d}"/>
                                 </div>
                                 <field name="user_id" widget="many2one_avatar_user" domain="[('share', '=', False)]" class="ms-auto"/>
                             </footer>
@@ -500,7 +500,7 @@
             <field name="priority" eval="1"/>
             <field name="arch" type="xml">
                 <kanban  highlight_color="color" default_group_by="stage_id" class="o_kanban_small_column o_opportunity_kanban" on_create="quick_create" quick_create_view="crm.quick_create_opportunity_form"
-                    archivable="false" sample="1" js_class="crm_kanban">
+                    archivable="false" sample="1" js_class="crm_mobile_pipeline">
                     <field name="stage_id" options='{"group_by_tooltip": {"requirements": "Description"}}'/>
                     <field name="probability"/>
                     <field name="active"/>
@@ -543,7 +543,7 @@
                             <footer class="pt-1">
                                 <div class="d-flex mt-auto align-items-center">
                                     <field name="priority" widget="priority" groups="base.group_user" class="me-2"/>
-                                    <field name="activity_ids" widget="kanban_activity"/>
+                                    <field name="activity_ids" widget="kanban_activity" options="{'crm_call_activity_type_id': %(mail.mail_activity_data_call)d}"/>
                                 </div>
                                 <div class="ms-auto d-flex">
                                     <field name="is_rotting" invisible="1"/>

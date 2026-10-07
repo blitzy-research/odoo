@@ -1,0 +1,292 @@
+// Styles of the `crm_mobile_pipeline` view: the mobile pipeline, whose logical spacing
+// follows the writing direction, and one drag fix for its framework kanban branches.
+
+// Offline, the framework gives every card whose form is not available offline
+// `.o_disabled_offline { pointer-events: auto !important }`, which overrides the
+// `pointer-events: none` of `.o_dragged`. The dragged card would then stay under the
+// pointer and be its own drop target: no column would receive the pointer, nothing
+// would move or be queued, and the release would open the card. While dragged, the
+// card and its offline-disabled controls are kept out of hit-testing again.
+.o_crm_mobile_pipeline_view .o_kanban_renderer .o_kanban_record.o_dragged {
+    &.o_disabled_offline,
+    .o_disabled_offline {
+        pointer-events: none !important;
+    }
+}
+
+.o_crm_mobile_pipeline {
+    --CrmMobilePipeline-gap: #{$spacer * 0.5};
+    --CrmMobilePipeline-touchTarget: 44px;
+
+    display: flex;
+    flex-direction: column;
+    flex-wrap: nowrap;
+    width: 100%;
+    min-height: 100%;
+
+    // Named selectors preserve minimum touch targets under button size modifiers.
+    button,
+    select,
+    input,
+    a,
+    .o_crm_mobile_pipeline_prev,
+    .o_crm_mobile_pipeline_next,
+    .o_crm_mobile_pipeline_new,
+    .o_crm_mobile_pipeline_helper_back,
+    .o_crm_mobile_pipeline_skip,
+    .o_crm_mobile_pipeline_load_more button {
+        min-width: var(--CrmMobilePipeline-touchTarget);
+        min-height: var(--CrmMobilePipeline-touchTarget);
+    }
+
+    // `.btn` is an inline-block: grown to 44 px, it would keep its icon or label at
+    // the top of the box. As inline flex containers, the controls centre it.
+    .o_crm_mobile_pipeline_prev,
+    .o_crm_mobile_pipeline_next,
+    .o_crm_mobile_pipeline_new,
+    .o_crm_mobile_pipeline_helper_back,
+    .o_crm_mobile_pipeline_skip,
+    .o_crm_mobile_pipeline_load_more button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    // A touch screen keeps `:hover` on the last tapped element, so Bootstrap's hover
+    // colours would stay on a button after a tap. On a touch-primary screen that
+    // cannot hover, a hovered button keeps its own colours; the pressed (`:active`)
+    // state is unchanged.
+    @media (hover: none) and (pointer: coarse) {
+        .btn:hover {
+            --#{$prefix}btn-hover-color: var(--#{$prefix}btn-color);
+            --#{$prefix}btn-hover-bg: var(--#{$prefix}btn-bg);
+            --#{$prefix}btn-hover-border-color: var(--#{$prefix}btn-border-color);
+        }
+    }
+
+    .o_crm_mobile_pipeline_header {
+        position: sticky;
+        top: 0;
+        // One level above the pipeline's root no-content helper, which keeps the
+        // framework's overlay positioning: where the helper reaches over the header
+        // (a phone in landscape), Previous, Next and New stay tappable.
+        z-index: calc(var(--o-view-nocontent-zindex, 1) + 1);
+        display: flex;
+        align-items: center;
+        gap: var(--CrmMobilePipeline-gap);
+        padding-block: var(--CrmMobilePipeline-gap);
+        padding-inline: $spacer;
+        background: var(--Kanban-background);
+        border-block-end: $border-width solid $border-color;
+
+        // Previous, next and New keep their size: a long stage name never squeezes
+        // them below their label or their touch target.
+        > button {
+            flex: 0 0 auto;
+        }
+    }
+
+    // The stage block takes the free width between the controls. A zero minimum
+    // replaces the flex item's automatic one (its text width), so it can shrink.
+    .o_crm_mobile_pipeline_stage {
+        flex: 1 1 auto;
+        min-width: 0;
+        text-align: center;
+    }
+
+    .o_crm_mobile_pipeline_stage_name {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    // Lead count and revenue on one line under the name, centred like it. The
+    // revenue is an `AnimatedNumber` (a block with its own `ms-2` start margin and
+    // `text-nowrap`): as a flex item it sits beside the count, and it moves to a line
+    // of its own only when both do not fit.
+    .o_crm_mobile_pipeline_summary {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        justify-content: center;
+    }
+
+    .o_crm_mobile_pipeline_body {
+        // A stacking context of its own: whatever z-index the cards or the offline
+        // helper (`.o_view_nocontent`, `.o_nocontent_help`) carry, they stay under
+        // the sticky header when the body scrolls beneath it.
+        isolation: isolate;
+        // Cards run edge to edge, without gap or inset, as framework kanban cards do
+        // on a phone; the body's other children carry their own spacing.
+        display: flex;
+        flex: 1 1 auto;
+        flex-direction: column;
+        width: 100%;
+        overflow-x: hidden;
+        overflow-y: auto;
+        // The browser handles vertical panning only, so a horizontal swipe reaches
+        // the body's touch handlers, which change the stage.
+        touch-action: pan-y;
+
+        // A card that no other card follows has no border to share: it keeps its full
+        // height, so this scroll container neither clips its bottom border nor scrolls
+        // by one pixel, and "Load more" keeps its full spacing.
+        > .o_crm_mobile_lead_card:not(:has(+ .o_crm_mobile_lead_card)) {
+            margin-block-end: 0;
+        }
+
+        // Keep the helper in flow, below Back or below the stage's cards; its
+        // d-contents wrapper must not introduce a layout box.
+        > .o_view_nocontent,
+        > .o_crm_mobile_pipeline_lead_helper > .o_view_nocontent {
+            position: relative;
+            flex: 1 1 auto;
+        }
+    }
+
+    // Under the stage header, the first card shares the header's bottom border: its
+    // own top border lies above the body, which clips it as a scroll container. The
+    // visually hidden skip link, when present, precedes the first card.
+    .o_crm_mobile_pipeline_header + .o_crm_mobile_pipeline_body {
+        > .o_crm_mobile_lead_card:first-child,
+        > .o_crm_mobile_pipeline_skip:first-child + .o_crm_mobile_lead_card {
+            margin-block-start: -$border-width;
+        }
+    }
+
+    // "Back" from the uncached-lead helper, and the skip link while it has the focus,
+    // keep their own width at the start of the body; the body's column would
+    // otherwise stretch them across the screen. The margin keeps them off the
+    // screen edges and Back apart from the helper below it.
+    .o_crm_mobile_pipeline_helper_back,
+    .o_crm_mobile_pipeline_skip {
+        align-self: flex-start;
+        margin: var(--CrmMobilePipeline-gap);
+    }
+
+    // The cards have no inset: "Load more" keeps its button off the screen edges.
+    .o_crm_mobile_pipeline_load_more {
+        padding: var(--CrmMobilePipeline-gap);
+    }
+
+    .o_crm_mobile_pipeline_load_more button {
+        width: 100%;
+    }
+
+    // "No leads in this stage": muted, with a text colour that keeps a contrast of
+    // at least 4.5:1 on the stage background.
+    .o_crm_mobile_pipeline_empty {
+        margin: 0;
+        padding-block: $spacer;
+        color: $gray-700;
+        text-align: center;
+    }
+
+    // Sample data of an empty pipeline: its count, revenue and "Load more" are
+    // dimmed, as the framework kanban dims its counters and load-more buttons. The
+    // stage name, the stage controls and the body stay usable.
+    .o_view_sample_data & {
+        .o_crm_mobile_pipeline_summary,
+        .o_crm_mobile_pipeline_load_more {
+            @include o-sample-data-disabled;
+        }
+    }
+
+    // End marker of the cards, focused by the skip link and shown only while it
+    // has the focus. A focused `<div>` gets no ring from Bootstrap: it takes the
+    // controls' focus ring, also when the skip link was activated without a key.
+    .o_crm_mobile_pipeline_end {
+        padding: var(--CrmMobilePipeline-gap);
+        border-radius: $border-radius;
+        text-align: center;
+        // While shown, its ring stays whole: the marker keeps off the body's clipped
+        // edges, as "Load more" does, and scrolling it into view leaves room for the
+        // ring below it.
+        margin: var(--CrmMobilePipeline-gap);
+        scroll-margin-block: var(--CrmMobilePipeline-gap);
+
+        &:focus {
+            outline: 0;
+            box-shadow: $focus-ring-box-shadow;
+        }
+    }
+}
+
+// Stage control of the lead form on small screens, where it is a single arrow toggle
+// opening the stage dropdown. The framework clips each statusbar arrow button to its
+// arrow shape, which cuts away the outset focus ring; it gives focus the hover
+// background, and gives the first-stage toggle (`o_last`) no pressed state. Here the
+// ring is drawn inside the clip, with the arrow's diagonal edges in the ring colour,
+// every toggle shows the active colours while pressed, and the dropdown stage reached
+// from the keyboard is ringed instead of only shaded like a hovered one. Only CRM sets
+// `data-available-offline` to "1", so the value keeps these rules to its stage control;
+// wider screens keep the framework look.
+@include media-breakpoint-down(md) {
+    $-crm-focus-ring-inset: inset 0 0 $focus-ring-blur ($focus-ring-width * 0.5)
+            $o-component-active-border,
+        inset 0 0 $focus-ring-blur $focus-ring-width $focus-ring-color;
+
+    .o_field_statusbar > .o_statusbar_status > .o_arrow_button[data-available-offline="1"] {
+        &:focus-visible {
+            box-shadow: $-crm-focus-ring-inset;
+
+            &::before {
+                background-color: $o-component-active-border;
+            }
+        }
+
+        &:active:not(:disabled) {
+            background-color: var(--o-statusbar-background-active);
+            color: $o-component-active-color;
+
+            &::before {
+                background-color: var(--o-statusbar-border-active);
+            }
+        }
+    }
+
+    // Arrow keys mark the item `.focus` and focus it; the mouse moves `.focus` without
+    // moving focus, and Enter picks the `.focus` item. Requiring both rings that item
+    // only, never one the mouse has since left.
+    .o-dropdown--menu .dropdown-item[data-available-offline="1"].focus:focus-visible {
+        box-shadow: $-crm-focus-ring-inset;
+    }
+}
+
+// Opacity compounds: a control CRM disables offline (`o_disabled_offline`, opacity .5)
+// inside a container that is disabled offline too would render at .25. Such a control
+// resets its own opacity, so it keeps the framework's single 50% disabled appearance.
+// Both classes exist only while offline, so nothing changes online. It covers:
+// - the Late/Today/Future counters of the CRM activity-menu row (only CRM disables an
+//   activity group);
+// - CRM-disabled controls (`o_disabled_offline pe-none`) inside a dimmed kanban card:
+//   "Unassigned Leads" and the team-leader quick-assign on the Sales Teams dashboard,
+//   whose cards are all dimmed offline, and the lead counter on campaign cards, which
+//   the framework dims when their record's form was not visited.
+.o-mail-ActivityGroup.o_disabled_offline .o_disabled_offline,
+.o_crm_team_kanban .o_kanban_record.o_disabled_offline .o_disabled_offline.pe-none,
+.o_utm_kanban .o_kanban_record.o_disabled_offline .o_disabled_offline.pe-none {
+    opacity: 1 !important;
+}
+
+// The framework's `.o_disabled_offline { pointer-events: auto !important }` cancels the
+// `pe-none` CRM gives the sales-team leader quick-assign offline, which would then
+// still take hover, focus and clicks. It is kept out of hit-testing, so the pointer
+// reaches its card, which is inert offline. Only CRM disables a quick-assign.
+a.o_quick_assign.o_disabled_offline.pe-none {
+    pointer-events: none !important;
+}
+
+// The same framework rule cancels the `pe-none` of guarded CRM view-button links
+// (`o_crm_offline_guarded`, set only while offline by the `ViewButton` guard in
+// `crm_offline_hooks.js`), such as the lead form's AI-probability switch, the Sales
+// Teams dashboard links and the campaign lead counter: they would still take hover
+// and clicks. They keep the framework's dimmed, not-allowed state and are kept out of
+// hit-testing. A kanban card treats a click passing through a guarded link as the
+// click on the link (`KanbanRecord.onGlobalClick` patch in `crm_offline_hooks.js`), so
+// the campaign card does not open through its lead counter. Guarded `<button>`s are
+// `disabled` and keep the framework's pointer events, like every button the
+// framework disables offline.
+a.o_crm_offline_guarded.o_disabled_offline {
+    pointer-events: none !important;
+}

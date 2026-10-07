@@ -1,0 +1,455 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+    <!--
+        Wide screens and other groupings reuse framework rendering. Synced-card `resId`
+        keys preserve open sheets across record replacement.
+    -->
+    <t t-name="crm.CrmMobilePipeline">
+        <t t-if="!this.isMobile" t-call="web.KanbanRenderer"/>
+        <t t-elif="this.props.list.isGrouped and !(this.isStagePipeline and this.activeGroup)" t-call="web.KanbanRenderer"/>
+        <div t-else=""
+            class="o_kanban_renderer o_renderer o_crm_mobile_pipeline"
+            t-att-class="{ o_crm_mobile_pipeline_ungrouped: !this.props.list.isGrouped }"
+            t-ref="this.rootRef"
+            t-on-keydown="this.onMobileKeydown">
+            <t t-set="stageChoices" t-value="this.stages"/>
+            <t t-if="this.isStagePipeline">
+                <t t-set="group" t-value="this.activeGroup"/>
+                <t t-if="group">
+                    <t t-set="stageView" t-value="this.crmStageView(group)"/>
+                    <div class="o_crm_mobile_pipeline_header">
+                        <!-- Navigation reads the clamped index: a stale `mobile.activeIndex` past the last stage never blocks it. -->
+                        <button type="button"
+                            class="btn btn-secondary o_crm_mobile_pipeline_prev"
+                            data-available-offline="1"
+                            t-att-disabled="!this.hasPreviousStage"
+                            aria-label="Previous stage"
+                            title="Previous stage"
+                            t-on-click="() => this.goToStage(this.activeIndex - 1)">
+                            <i class="oi oi-chevron-left" aria-hidden="true"/>
+                        </button>
+                        <div class="o_crm_mobile_pipeline_stage">
+                            <!-- A heading by role, so heading navigation reaches the displayed stage; a <h2> would bring Bootstrap's heading size and margin. It takes the focus when no header button can. -->
+                            <div class="o_crm_mobile_pipeline_stage_name fs-4 fw-bold" role="heading" aria-level="2" aria-live="polite" tabindex="-1" t-out="group.displayName"/>
+                            <!-- Bare numbers: assistive technology reads them, labelled, from the status region below, which stays silent for the sample data of an empty pipeline (dimmed by the stylesheet). -->
+                            <div class="o_crm_mobile_pipeline_summary" aria-hidden="true">
+                                <span class="o_crm_mobile_pipeline_count" t-out="stageView.count"/>
+                                <!-- Omit revenue for a filtered count or a root without the revenue aggregate; empty stages use zero. -->
+                                <t t-set="revenue" t-value="stageView.revenue"/>
+                                <span t-if="revenue" class="o_crm_mobile_pipeline_revenue">
+                                    <AnimatedNumber value="revenue.value" duration="1000" currencies="revenue.currencies"/>
+                                </span>
+                            </div>
+                            <!-- Reads out the final count and revenue when queued writes, a replay or a stage change update them; the animated number itself stays out of any live region. -->
+                            <span class="visually-hidden o_crm_mobile_pipeline_status" role="status" aria-atomic="true" t-out="this.crmStageStatus(stageView)"/>
+                        </div>
+                        <button type="button"
+                            class="btn btn-secondary o_crm_mobile_pipeline_next"
+                            data-available-offline="1"
+                            t-att-disabled="!this.hasNextStage"
+                            aria-label="Next stage"
+                            title="Next stage"
+                            t-on-click="() => this.goToStage(this.activeIndex + 1)">
+                            <i class="oi oi-chevron-right" aria-hidden="true"/>
+                        </button>
+                        <!-- The quick create needs no cached onchange: usable offline in every loaded stage, unless the offline queue cannot hold its create (non-secure origin). -->
+                        <button type="button"
+                            class="btn btn-primary o_crm_mobile_pipeline_new"
+                            t-att-data-available-offline="this.crmOffline.isOfflineQueueBlocked() ? false : '1'"
+                            t-att-aria-label="this.crmNewLeadAriaLabel(group)"
+                            t-att-disabled="!this.canQuickCreate()"
+                            t-on-click="(ev) => this.openQuickCreate(ev.currentTarget)">New</button>
+                    </div>
+                    <div class="o_crm_mobile_pipeline_body"
+                        t-on-touchstart="this.onTouchStart"
+                        t-on-touchend="this.onTouchEnd">
+                        <!-- A lead whose form was never visited online cannot open offline. "Back" takes the focus, described by the helper's text. -->
+                        <t t-if="this.mobile.helperLeadId">
+                            <button type="button"
+                                class="btn btn-link o_crm_mobile_pipeline_helper_back"
+                                data-available-offline="1"
+                                t-att-aria-describedby="this.crmLeadHelperId"
+                                t-ref="this.crmHelperBackRef"
+                                t-on-click="() => this.closeLeadHelper()"><i class="oi oi-arrow-left me-1" aria-hidden="true"/>Back</button>
+                            <!-- Generates no box: the helper is laid out in the body as the stage helper is. -->
+                            <div class="o_crm_mobile_pipeline_lead_helper d-contents" t-att-id="this.crmLeadHelperId">
+                                <OfflineActionHelper/>
+                            </div>
+                        </t>
+                        <t t-else="">
+                            <!-- Each card holds three tab stops: the visually hidden skip link takes the focus to the end marker after the last card, so the next Tab reaches "Load more" and Shift+Tab the last card. The inert sample records of an empty pipeline have no tab stop, so neither frames them; a provisional card is a real lead. -->
+                            <t t-set="hasCards" t-value="(stageView.records.length and !this.props.list.model.useSampleModel) or stageView.pending.length"/>
+                            <button t-if="hasCards"
+                                type="button"
+                                class="btn btn-link visually-hidden-focusable o_crm_mobile_pipeline_skip"
+                                data-available-offline="1"
+                                t-on-click="() => this.crmSkipToEnd()">Skip to the end of the leads</button>
+                            <!-- The card calls onOpen(record) and onMoveStage(record, stageId). -->
+                            <t t-foreach="stageView.records" t-as="record" t-key="record.resId">
+                                <CrmMobileLeadCard
+                                    record="record"
+                                    stages="stageChoices"
+                                    archInfo="this.props.archInfo"
+                                    getRecord.bind="this.getRecord"
+                                    onOpen.bind="this.openLead"
+                                    onMoveStage.bind="this.moveLead"/>
+                            </t>
+                            <!-- Leads created offline: the card itself never opens or moves a provisional card. -->
+                            <t t-foreach="stageView.pending" t-as="pending" t-key="pending.key">
+                                <CrmMobileLeadCard
+                                    provisional="pending"
+                                    stages="stageChoices"
+                                    archInfo="this.props.archInfo"
+                                    getRecord.bind="this.getRecord"
+                                    onOpen.bind="this.openLead"
+                                    onMoveStage.bind="this.moveLead"/>
+                            </t>
+                            <div t-if="hasCards"
+                                class="visually-hidden-focusable o_crm_mobile_pipeline_end"
+                                tabindex="-1"
+                                t-ref="this.crmEndRef">End of the leads</div>
+                            <!-- Offline, the stage's uncached leads are explained below any card the pipeline can show: a lead created offline, or one projected into the stage. "Load more" shows online only, so never beside it. -->
+                            <OfflineActionHelper t-if="this.isStageUnavailableOffline(group)"/>
+                            <!-- A filtered count of 0 leaves nothing to load, as the header shows. -->
+                            <t t-set="unloadedCount" t-value="this.crmGetUnloadedCount(group)"/>
+                            <!-- Inert on sample data, as the sample cards are. -->
+                            <div t-if="this.showLoadMore(unloadedCount)" class="o_crm_mobile_pipeline_load_more"
+                                t-att-inert="this.props.list.model.useSampleModel ? '' : false">
+                                <!-- Disabled and busy while its load runs: a repeat click starts no other load. -->
+                                <t t-set="loadingMore" t-value="this.crmLoadingMore.has(group.id)"/>
+                                <button type="button"
+                                    class="btn btn-outline-primary w-100"
+                                    t-att-disabled="loadingMore"
+                                    t-att-aria-busy="loadingMore ? 'true' : false"
+                                    t-on-click="() => this.crmLoadMore(group)"><i t-if="loadingMore" class="fa fa-circle-o-notch fa-spin me-1" aria-hidden="true"/>Load more... (<t t-out="unloadedCount"/> remaining)</button>
+                            </div>
+                            <!-- No live region: the header status already reads out the count of 0. -->
+                            <p t-if="this.crmIsStageEmpty(stageView)" class="o_crm_mobile_pipeline_empty">No leads in this stage</p>
+                        </t>
+                    </div>
+                </t>
+            </t>
+            <t t-else="">
+                <div class="o_crm_mobile_pipeline_body">
+                    <t t-if="this.mobile.helperLeadId">
+                        <button type="button"
+                            class="btn btn-link o_crm_mobile_pipeline_helper_back"
+                            data-available-offline="1"
+                            t-att-aria-describedby="this.crmLeadHelperId"
+                            t-ref="this.crmHelperBackRef"
+                            t-on-click="() => this.closeLeadHelper()"><i class="oi oi-arrow-left me-1" aria-hidden="true"/>Back</button>
+                        <div class="o_crm_mobile_pipeline_lead_helper d-contents" t-att-id="this.crmLeadHelperId">
+                            <OfflineActionHelper/>
+                        </div>
+                    </t>
+                    <t t-else="">
+                        <!-- Skip link and end marker as on the stage pipeline, never around sample records. -->
+                        <t t-set="ungroupedRecords" t-value="this.getUngroupedRecords()"/>
+                        <t t-set="hasCards" t-value="ungroupedRecords.length and !this.props.list.model.useSampleModel"/>
+                        <button t-if="hasCards"
+                            type="button"
+                            class="btn btn-link visually-hidden-focusable o_crm_mobile_pipeline_skip"
+                            data-available-offline="1"
+                            t-on-click="() => this.crmSkipToEnd()">Skip to the end of the leads</button>
+                        <t t-foreach="ungroupedRecords" t-as="record" t-key="record.resId">
+                            <CrmMobileLeadCard
+                                record="record"
+                                stages="stageChoices"
+                                archInfo="this.props.archInfo"
+                                getRecord.bind="this.getRecord"
+                                onOpen.bind="this.openLead"
+                                onMoveStage.bind="this.moveLead"/>
+                        </t>
+                        <div t-if="hasCards"
+                            class="visually-hidden-focusable o_crm_mobile_pipeline_end"
+                            tabindex="-1"
+                            t-ref="this.crmEndRef">End of the leads</div>
+                    </t>
+                </div>
+            </t>
+            <ActionHelper t-if="this.showNoContentHelper" noContentHelp="this.props.noContentHelp"/>
+            <!-- Reads out the outcome of a replay of offline changes: present and empty until one ends, so its text change is announced. -->
+            <span class="visually-hidden o_crm_mobile_pipeline_sync_status" role="status" t-out="this.crmSyncStatus()"/>
+        </div>
+    </t>
+
+    <!--
+        Mail retargets only the after dropdown; before/all-stages need the plain
+        variant. Both variants mark stage choices available offline, except where the
+        queue cannot hold the stage save (crmAvailableOffline, CrmStatusBarField),
+        where they are announced disabled instead.
+    -->
+    <t t-name="crm.StatusBarDurationField.Dropdown" t-inherit="mail.StatusBarDurationField.Dropdown" t-inherit-mode="primary">
+        <xpath expr="//DropdownItem" position="attributes">
+            <attribute name="attrs">this.crmAvailableOffline ? {'data-available-offline': '1'} : {'aria-disabled': 'true'}</attribute>
+        </xpath>
+    </t>
+
+    <t t-name="crm.StatusBarField.Dropdown" t-inherit="web.StatusBarField.Dropdown" t-inherit-mode="primary">
+        <xpath expr="//DropdownItem" position="attributes">
+            <attribute name="attrs">this.crmAvailableOffline ? {'data-available-offline': '1'} : {'aria-disabled': 'true'}</attribute>
+        </xpath>
+    </t>
+
+    <!--
+        Where the queue cannot hold the stage save, the buttons lose the attribute and
+        are disabled with the framework's offline state by this template itself: Owl
+        re-applies t-att-disabled on every render, which would undo the framework's.
+    -->
+    <t t-name="crm.RottingStatusBarDurationField" t-inherit="mail.RottingStatusBarDurationField" t-inherit-mode="primary">
+        <xpath expr="//button[@t-ref='this.afterRef']" position="attributes">
+            <attribute name="t-att-data-available-offline">this.crmAvailableOffline ? '1' : false</attribute>
+            <attribute name="t-att-disabled" add="!this.crmAvailableOffline" separator=" || "/>
+            <attribute name="t-attf-class">{{ this.crmOfflineDisabledClass(this.props.isDisabled) }}</attribute>
+        </xpath>
+        <xpath expr="//button[@role='radio']" position="attributes">
+            <attribute name="t-att-data-available-offline">this.crmAvailableOffline ? '1' : false</attribute>
+            <attribute name="t-att-disabled" add="!this.crmAvailableOffline" separator=" || "/>
+            <attribute name="t-attf-class">{{ this.crmOfflineDisabledClass(this.props.isDisabled || item.isSelected) }}</attribute>
+        </xpath>
+        <xpath expr="//button[@t-ref='this.beforeRef']" position="attributes">
+            <attribute name="t-att-data-available-offline">this.crmAvailableOffline ? '1' : false</attribute>
+            <attribute name="t-att-disabled" add="!this.crmAvailableOffline" separator=" || "/>
+            <attribute name="t-attf-class">{{ this.crmOfflineDisabledClass(this.props.isDisabled) }}</attribute>
+        </xpath>
+        <xpath expr="//button[@t-ref='this.dropdownRef']" position="attributes">
+            <attribute name="t-att-data-available-offline">this.crmAvailableOffline ? '1' : false</attribute>
+            <attribute name="t-att-disabled" add="!this.crmAvailableOffline" separator=" || "/>
+            <attribute name="t-attf-class">{{ this.crmOfflineDisabledClass(this.props.isDisabled) }}</attribute>
+        </xpath>
+        <xpath expr="//t[@t-call='mail.StatusBarDurationField.Dropdown']" position="attributes">
+            <attribute name="t-call">crm.StatusBarDurationField.Dropdown</attribute>
+        </xpath>
+        <xpath expr="//Dropdown[button[@t-ref='this.beforeRef']]//t[@t-call='web.StatusBarField.Dropdown']" position="attributes">
+            <attribute name="t-call">crm.StatusBarField.Dropdown</attribute>
+        </xpath>
+        <xpath expr="//Dropdown[button[@t-ref='this.dropdownRef']]//t[@t-call='web.StatusBarField.Dropdown']" position="attributes">
+            <attribute name="t-call">crm.StatusBarField.Dropdown</attribute>
+        </xpath>
+    </t>
+
+    <!--
+        Module installation confirmation of the lead generation dropdown
+        (CrmInstallConfirmationDialog). Same DOM as web.ConfirmationDialog except that
+        Confirm loses data-available-offline (an empty attribute removes it), so the
+        framework disables it offline: installing needs the server. Cancel keeps it.
+    -->
+    <t t-name="crm.InstallConfirmationDialog" t-inherit="web.ConfirmationDialog" t-inherit-mode="primary">
+        <xpath expr="//button[@t-on-click='this._confirm']" position="attributes">
+            <attribute name="data-available-offline"/>
+        </xpath>
+    </t>
+
+    <!--
+        CRM availability attributes remain present online; offline-only disabled states
+        restore the original values online. Repeated inheritance targets need separate
+        xpaths.
+    -->
+
+    <!-- The CRM activity-menu row and its Late/Today/Future counters are not buttons: disabled while offline (isCrmGroupOffline, activity_menu_patch.js). -->
+    <t t-inherit="mail.ActivityMenu" t-inherit-mode="extension">
+        <xpath expr="//div[hasclass('o-mail-ActivityGroup')]" position="attributes">
+            <attribute name="t-att-class">this.isCrmGroupOffline(group) ? 'o_disabled_offline pe-none' : ''</attribute>
+            <attribute name="t-att-aria-disabled">this.isCrmGroupOffline(group) ? 'true' : false</attribute>
+            <attribute name="t-att-tabindex">this.isCrmGroupOffline(group) ? '-1' : false</attribute>
+        </xpath>
+        <xpath expr="//div[@t-if=&quot;group.type === 'activity'&quot;]/span[1]" position="attributes">
+            <attribute name="t-att-class">this.isCrmGroupOffline(group) ? 'o_disabled_offline pe-none' : ''</attribute>
+            <attribute name="t-att-aria-disabled">this.isCrmGroupOffline(group) ? 'true' : false</attribute>
+            <attribute name="t-att-tabindex">this.isCrmGroupOffline(group) ? '-1' : false</attribute>
+        </xpath>
+        <xpath expr="//div[@t-if=&quot;group.type === 'activity'&quot;]/span[2]" position="attributes">
+            <attribute name="t-att-class">this.isCrmGroupOffline(group) ? 'o_disabled_offline pe-none' : ''</attribute>
+            <attribute name="t-att-aria-disabled">this.isCrmGroupOffline(group) ? 'true' : false</attribute>
+            <attribute name="t-att-tabindex">this.isCrmGroupOffline(group) ? '-1' : false</attribute>
+        </xpath>
+        <!-- span[3] is the flex spacer. -->
+        <xpath expr="//div[@t-if=&quot;group.type === 'activity'&quot;]/span[4]" position="attributes">
+            <attribute name="t-att-class">this.isCrmGroupOffline(group) ? 'o_disabled_offline pe-none' : ''</attribute>
+            <attribute name="t-att-aria-disabled">this.isCrmGroupOffline(group) ? 'true' : false</attribute>
+            <attribute name="t-att-tabindex">this.isCrmGroupOffline(group) ? '-1' : false</attribute>
+        </xpath>
+    </t>
+
+    <!-- Reschedule dropdown of activity-mixin lists: a state the CRM guard closes when a lead's connection drops (crmRescheduleState, crm_offline_hooks.js). -->
+    <t t-inherit="mail.MailActivityMixinListRescheduleDropdown" t-inherit-mode="extension">
+        <xpath expr="//Dropdown" position="attributes">
+            <attribute name="state">this.crmRescheduleState</attribute>
+        </xpath>
+    </t>
+
+    <!--
+        Card-menu toggle of lead cards: every item of the menu is queued or available
+        offline, except where the queue cannot hold a call (crmMenuAvailableOffline,
+        crm_offline_hooks.js).
+    -->
+    <t t-inherit="web.KanbanMenu" t-inherit-mode="extension">
+        <xpath expr="//button[@title='Dropdown menu']" position="attributes">
+            <attribute name="t-att-data-available-offline">this.crmMenuAvailableOffline ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <!--
+        Colour buttons of lead and sales-team cards: their colour write is queued
+        offline, except where the queue cannot hold it (crmColorAvailableOffline,
+        crm_offline_hooks.js).
+    -->
+    <t t-inherit="web.KanbanColorPickerField" t-inherit-mode="extension">
+        <xpath expr="//button[@role='menuitem']" position="attributes">
+            <attribute name="t-att-data-available-offline">this.crmColorAvailableOffline ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <!-- Team-leader quick-assign of sales-team cards is not a button: disabled while offline (crmOfflineAssignGuarded, crm_offline_hooks.js); it keeps its tabindex of -1. -->
+    <t t-inherit="web.KanbanMany2One" t-inherit-mode="extension">
+        <xpath expr="//a[hasclass('o_quick_assign')]" position="attributes">
+            <attribute name="t-att-class">this.crmOfflineAssignGuarded ? 'o_disabled_offline pe-none' : ''</attribute>
+            <attribute name="t-att-aria-disabled">this.crmOfflineAssignGuarded ? 'true' : false</attribute>
+        </xpath>
+    </t>
+
+    <!--
+        Anchors ignore disabled; guarded CRM buttons (crmOfflineGuarded,
+        crm_offline_hooks.js) leave the tab order and lose data-available-offline, which
+        would make the framework re-enable a guarded "Won" (non-secure origin).
+        Otherwise preserve aria-disabled and data-available-offline from the attributes
+        spread and the original tabindex. The ref lets the guard follow the connection
+        on the element when a render is held (crmSyncGuardDom).
+    -->
+    <t t-inherit="web.views.ViewButton" t-inherit-mode="extension">
+        <xpath expr="//t[@t-tag='this.props.tag']" position="attributes">
+            <attribute name="t-att-aria-disabled">this.crmOfflineGuarded ? 'true' : (this.props.attrs['aria-disabled'] ?? false)</attribute>
+            <attribute name="t-att-tabindex">this.crmOfflineGuarded ? -1 : this.props.tabindex</attribute>
+            <attribute name="t-att-data-available-offline">this.crmOfflineGuarded ? false : (this.props.attrs['data-available-offline'] ?? false)</attribute>
+            <attribute name="t-ref">this.crmButtonRef</attribute>
+        </xpath>
+    </t>
+
+    <!--
+        Small-screen "More" toggle of the form header buttons: available offline while
+        it holds a lead-form button tagged available offline, such as "Won" under
+        sale_crm's "New Quotation" (crmMoreAvailableOffline, crm_form.js). Otherwise
+        the attribute is absent, as in the framework template.
+    -->
+    <t t-inherit="web.StatusBarButtons" t-inherit-mode="extension">
+        <xpath expr="//button[@title='More']" position="attributes">
+            <attribute name="t-att-data-available-offline">this.crmMoreAvailableOffline ? '1' : false</attribute>
+        </xpath>
+    </t>
+
+    <!-- View-mount backstop (crmOfflineBlocked, crm_offline_hooks.js): a blocked CRM target shows the offline helper instead of its controller. -->
+    <t t-inherit="web.View" t-inherit-mode="extension">
+        <xpath expr="//WithSearch" position="attributes">
+            <attribute name="t-if">!this.crmOfflineBlocked</attribute>
+        </xpath>
+        <xpath expr="//WithSearch" position="after">
+            <OfflineActionHelper t-else=""/>
+        </xpath>
+    </t>
+
+    <!--
+        The backstop is outside WithSearch: Reset Filters has no search model and
+        cannot unblock the target. Keep the button only where a search model exists.
+    -->
+    <t t-inherit="web.OfflineActionHelper" t-inherit-mode="extension">
+        <xpath expr="//button[@t-on-click='this.onResetFilters']" position="attributes">
+            <attribute name="t-if" add="this.env.searchModel" separator=" and "/>
+        </xpath>
+    </t>
+
+    <!--
+        Phone sidebar leaf entries of the CRM app (crmOfflineSectionDisabled,
+        crm_offline_hooks.js) render unavailable offline, as the desktop dropdown items
+        do. The added class attribute merges with the original one; online it adds
+        nothing and aria-disabled is absent.
+    -->
+    <t t-inherit="web.SectionMenu" t-inherit-mode="extension">
+        <xpath expr="//li[@t-else='']" position="attributes">
+            <attribute name="t-attf-class">{{ this.crmOfflineSectionDisabled(section) ? 'o_disabled_offline' : '' }}</attribute>
+            <attribute name="t-att-aria-disabled">this.crmOfflineSectionDisabled(section) ? 'true' : false</attribute>
+        </xpath>
+    </t>
+
+    <!--
+        Desktop navbar entries of the blocked CRM menus (crmOfflineMenuAttrs,
+        crm_offline_hooks.js) also carry aria-disabled offline, where the framework
+        dims them. Each attrs object is the framework's, passed through unchanged
+        online and for every other menu.
+    -->
+    <t t-inherit="web.NavBar.SectionsMenu" t-inherit-mode="extension">
+        <xpath expr="//t[@t-if='!section.childrenTree.length']/DropdownItem" position="attributes">
+            <attribute name="attrs">this.crmOfflineMenuAttrs(section, {
+                href: this.getMenuItemHref(section),
+                'data-hotkey': hotkey,
+                'data-menu-xmlid': section.xmlid,
+                'data-section': section.id,
+            })</attribute>
+        </xpath>
+    </t>
+    <t t-inherit="web.NavBar.SectionsMenu.Dropdown.MenuSlot" t-inherit-mode="extension">
+        <xpath expr="//DropdownItem" position="attributes">
+            <attribute name="attrs">this.crmOfflineMenuAttrs(item, { style: style, href: this.getMenuItemHref(item), 'data-menu-xmlid': item.xmlid, 'data-section': item.id })</attribute>
+        </xpath>
+    </t>
+    <t t-inherit="web.NavBar.SectionsMenu.MoreDropdown" t-inherit-mode="extension">
+        <xpath expr="//DropdownItem" position="attributes">
+            <attribute name="attrs">this.crmOfflineMenuAttrs(section, { href: this.getMenuItemHref(section), 'data-menu-xmlid': section.xmlid, 'data-section': section.id })</attribute>
+        </xpath>
+    </t>
+
+    <!--
+        Command palette results of the same menus (crmOfflineCommandDisabled,
+        crm_offline_hooks.js) are dimmed and aria-disabled offline, their link carries
+        no href, so a middle click or "open in new tab" opens nothing, and their
+        "new tab" hint is hidden, as Ctrl+Enter opens nothing. Online, and for every
+        other command, the link keeps the framework's class and href, aria-disabled is
+        absent and the hint is the framework's.
+    -->
+    <t t-inherit="web.CommandPalette" t-inherit-mode="extension">
+        <xpath expr="//div[hasclass('o_command')]" position="attributes">
+            <attribute name="t-att-aria-disabled">this.crmOfflineCommandDisabled(command) ? 'true' : false</attribute>
+        </xpath>
+        <xpath expr="//div[hasclass('o_command')]/a" position="attributes">
+            <attribute name="t-att-href">this.crmOfflineCommandHref(command)</attribute>
+            <attribute name="t-att-class">this.crmOfflineCommandClass(command)</attribute>
+        </xpath>
+        <xpath expr="//small[hasclass('o_command_focus')]" position="attributes">
+            <attribute name="t-if" add="!this.crmOfflineCommandDisabled(command)" separator=" and "/>
+        </xpath>
+    </t>
+
+    <!-- Offline lead fields use cached inline autocomplete; the phone dialog requires the server. -->
+    <t t-inherit="web.Many2XAutocomplete" t-inherit-mode="extension">
+        <xpath expr="//input[@t-on-click='this.onSearchMore']" position="attributes">
+            <attribute name="t-if">this.uiService.isSmall and this.props.dropdown and !this.crmOfflineInlineSearch</attribute>
+        </xpath>
+    </t>
+
+    <!--
+        Offline, a lead whose follower count was never loaded (crmFollowersCountUnknown,
+        crm_form.js) shows neither an endless spinner nor a made-up count; the count
+        loads on reconnection. Online the condition is false and the markup is mail's.
+    -->
+    <t t-inherit="mail.Chatter" t-inherit-mode="extension">
+        <xpath expr="//div[hasclass('o-mail-Followers')]//i[hasclass('fa-spin')]" position="attributes">
+            <attribute name="t-if" add="!this.crmFollowersCountUnknown" separator=" and "/>
+        </xpath>
+        <xpath expr="//sup[hasclass('o-mail-Followers-counter')]" position="attributes">
+            <attribute name="t-else"/>
+            <attribute name="t-elif">!this.crmFollowersCountUnknown</attribute>
+        </xpath>
+    </t>
+
+    <!--
+        Offline, a lead chatter's attachment dropzones (crmOfflineInert, crm_form.js)
+        render nothing, so a dropped file is neither saved with a new lead nor
+        uploaded. Online, and for every other dropzone, the markup is mail's.
+    -->
+    <t t-inherit="mail.MailAttachmentDropzone" t-inherit-mode="extension">
+        <xpath expr="//Dropzone" position="attributes">
+            <attribute name="t-if">!this.crmOfflineInert</attribute>
+        </xpath>
+    </t>
+
+</templates>
