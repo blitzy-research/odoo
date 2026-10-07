@@ -110,7 +110,7 @@ import { AutoComplete } from "@web/core/autocomplete/autocomplete";
 import { browser } from "@web/core/browser/browser";
 import { router } from "@web/core/browser/router";
 import { CommandPalette } from "@web/core/commands/command_palette";
-import { ConnectionLostError, RPCError } from "@web/core/network/rpc";
+import { ConnectionLostError, rpc, RPCError } from "@web/core/network/rpc";
 import { OfflinePlugin } from "@web/core/offline/offline_plugin";
 import { registry } from "@web/core/registry";
 import { registerTemplate } from "@web/core/templates";
@@ -5199,6 +5199,7 @@ function expectUnguarded(selector, count) {
     expect(selector).toHaveCount(count);
     for (const el of queryAll(selector)) {
         expect(el).not.toHaveClass("o_disabled_offline");
+        expect(el).not.toHaveClass("pe-none");
         expect(el).not.toHaveClass("o_crm_offline_guarded");
         expect(el).not.toHaveAttribute("aria-disabled");
         expect(el).not.toHaveAttribute("tabindex");
@@ -5414,6 +5415,117 @@ test("[Offline] lead form DISABLE buttons unreachable and re-enabled online", as
     expect(wonButton).toHaveCount(0);
     expect(".o_field_widget[name=probability]").toHaveText("100.00");
     expect(queued("crm.lead")).toEqual([]);
+});
+
+test("[Offline] non-secure origin: guarded lead-form buttons re-enabled online after a failed breadcrumb restore", async () => {
+    // The list views requested by the offline breadcrumb restore: no RPC cache serves
+    // them, so the framework reports the lost connection once.
+    expect.errors(1);
+    const LEAD_VIEWS_LOAD = "/web/dataset/call_kw/crm.lead/get_views";
+    const setOffline = mockOffline();
+    stepRoutes((route) => route.startsWith("/web/dataset/call_button/"));
+    await makeMockServer();
+    // A non-secure origin (a plain-http LAN address) has no RPC cache: the web client
+    // installs one only in a secure context.
+    rpc.setCache(null);
+    await mountWithCleanup(WebClient);
+    // Its framework queue refuses every call (set after the web client started, as
+    // in the "Won" test above).
+    patchWithCleanup(window, { isSecureContext: false });
+    await getService("action").doAction(LEADS_ACTION.id);
+    await flushStartupSync();
+    await openLead(1);
+
+    // Guarded controls displayed outside any menu: "Won" (guarded where the queue is
+    // unusable) and the AI-probability switches (wide and small layouts) on both
+    // presets; on desktop also the Lost header button and the Schedule Meeting smart
+    // button, which the mobile preset puts in menus.
+    const wonButton = ".o_form_statusbar button[name=action_set_won_rainbowman]";
+    const aiSwitch = "a[name=action_set_automated_probability]";
+    const meetingButton = "button[name=action_schedule_meeting]";
+    const lostButton = `button[name='${LOST_ACTION_ID}']`;
+    const controls = [
+        { selector: wonButton, count: 1 },
+        { selector: aiSwitch, count: 2 },
+        ...(isSmall()
+            ? []
+            : [
+                  { selector: meetingButton, count: 1 },
+                  { selector: lostButton, count: 1 },
+              ]),
+    ];
+    const allControls = controls.map(({ selector }) => selector).join(", ");
+    const expectOnline = () => {
+        for (const { selector, count } of controls) {
+            expectUnguarded(selector, count);
+        }
+        expect(wonButton).toHaveAttribute("data-available-offline", "1");
+        for (const value of pointerEventsOf(allControls)) {
+            expect(value).not.toBe("none");
+        }
+        expect(`${aiSwitch}:interactive`).toHaveCount(2);
+        expect(".o_crm_offline_guarded").toHaveCount(0);
+    };
+    const expectOffline = async () => {
+        for (const { selector, count } of controls) {
+            expectGuarded(selector, count);
+        }
+        expect(wonButton).not.toHaveAttribute("data-available-offline");
+        // Inert by pointer, keyboard and hotkey.
+        for (const { selector } of controls) {
+            await activateByPointerAndKeyboard(selector);
+        }
+        await press(["alt", "w"]);
+        await animationFrame();
+        expect(".modal").toHaveCount(0);
+        expect(queued("crm.lead")).toEqual([]);
+        expect.verifySteps([]);
+    };
+    expectOnline();
+
+    await setOffline(true);
+    await expectOffline();
+
+    // Offline, the breadcrumb restore of the list fails: the form stays displayed,
+    // and the renders below the action container stay held.
+    await goBack();
+    await animationFrame();
+    expect(".o_form_view").toHaveCount(1);
+    expect(".o_list_view").toHaveCount(0);
+    expect.verifyErrors([LEAD_VIEWS_LOAD]);
+
+    // Online again: every guarded control is back to its own attributes and pointer
+    // events, and works.
+    await setOffline(false);
+    await animationFrame();
+    expect(".o_form_view").toHaveCount(1);
+    expectOnline();
+    await contains(`${aiSwitch}:visible`).click();
+    await expect.waitForSteps([
+        buttonRoute("crm.lead", "action_set_automated_probability"),
+        "action_set_automated_probability [1]",
+    ]);
+
+    // Offline again, the guard is applied to the still displayed form.
+    await setOffline(true);
+    await expectOffline();
+
+    // And lifted again online: each control issues its call ("Won" last, as it
+    // marks the lead won).
+    await setOffline(false);
+    await animationFrame();
+    expectOnline();
+    const calls = [
+        ...(isSmall() ? [] : [{ selector: meetingButton, name: "action_schedule_meeting" }]),
+        { selector: `${aiSwitch}:visible`, name: "action_set_automated_probability" },
+        { selector: wonButton, name: "action_set_won_rainbowman" },
+    ];
+    for (const { selector, name } of calls) {
+        await contains(selector).click();
+        await expect.waitForSteps([buttonRoute("crm.lead", name), `${name} [1]`]);
+    }
+    expect(queued("crm.lead")).toEqual([]);
+    expect.verifyErrors([]);
 });
 
 // Guarded CRM view-button links keep no pointer events offline, although the

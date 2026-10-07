@@ -3635,10 +3635,56 @@ export function useCrmOffline() {
 // Guard: view buttons (DOM state and click boundary)
 // -----------------------------------------------------------------------------
 
+/** Marker class of a guarded CRM view button: only `ViewButton.getClassName` sets it. */
+const CRM_VIEW_BUTTON_GUARD_MARKER = "o_crm_offline_guarded";
+
+/**
+ * Classes a guarded CRM view button carries (`ViewButton.getClassName`), its marker
+ * last; the guard's DOM sync (`ViewButton.crmSyncGuardDom`) writes the same ones.
+ */
+const CRM_VIEW_BUTTON_GUARD_CLASSES = Object.freeze([
+    "o_disabled_offline",
+    "pe-none",
+    CRM_VIEW_BUTTON_GUARD_MARKER,
+]);
+
+/**
+ * Writes an attribute of `el` as an Owl template binding (`t-att-*`) does: `false`,
+ * `null` and `undefined` remove it, `true` sets it empty, any other value is set as
+ * is.
+ *
+ * @param {HTMLElement} el
+ * @param {string} name
+ * @param {unknown} value
+ */
+function setTemplateAttribute(el, name, value) {
+    if (value === false || value === null || value === undefined) {
+        el.removeAttribute(name);
+    } else {
+        el.setAttribute(name, value === true ? "" : value);
+    }
+}
+
 patch(ViewButton.prototype, {
+    /**
+     * Also keeps the element's guard state in step with `crmOfflineGuarded` without
+     * a render (`crmSyncGuardDom`, run by an effect on the connection signal): a
+     * render held by an ancestor, such as the action container of a controller
+     * restore that failed offline (a non-secure origin has no RPC cache to serve its
+     * views), would otherwise leave a button reconnected while still guarded, or
+     * unguarded while offline.
+     */
     setup() {
         super.setup(...arguments);
         this.crmOfflinePlugin = usePlugin(OfflinePlugin);
+        this.crmButtonRef = signal.ref();
+        useEffect(() => {
+            const guarded = this.crmOfflineGuarded;
+            const el = this.crmButtonRef();
+            if (el) {
+                untrack(() => this.crmSyncGuardDom(el, guarded));
+            }
+        });
     },
 
     /**
@@ -3678,9 +3724,7 @@ patch(ViewButton.prototype, {
         if (!this.crmOfflineGuarded) {
             return className;
         }
-        return [className, "o_disabled_offline pe-none o_crm_offline_guarded"]
-            .filter(Boolean)
-            .join(" ");
+        return [className, ...CRM_VIEW_BUTTON_GUARD_CLASSES].filter(Boolean).join(" ");
     },
 
     onClick(ev, newWindow) {
@@ -3689,6 +3733,57 @@ patch(ViewButton.prototype, {
             return;
         }
         return super.onClick(...arguments);
+    },
+
+    /**
+     * Writes on the rendered element the guard state a render would give it
+     * (`getClassName`, `disabled` and the `web.views.ViewButton` extension), when its
+     * marker class shows the other state; a no-op otherwise, hence for every button
+     * the guard never holds. A later render stays consistent: Owl patches the element
+     * against its own last rendering, adding and removing the same classes and
+     * attributes.
+     *
+     * Unguarded, the guard classes are dropped unless the original class list holds
+     * them, and the attributes return to the button's own. While offline, the
+     * framework keeps owning a `<button>`'s `disabled` and `o_disabled_offline`
+     * (`OfflinePlugin._offlineUI`, which the restored `data-available-offline`
+     * re-runs).
+     *
+     * @param {HTMLElement} el the element the template renders
+     * @param {boolean} guarded the current `crmOfflineGuarded`
+     */
+    crmSyncGuardDom(el, guarded) {
+        if (el.classList.contains(CRM_VIEW_BUTTON_GUARD_MARKER) === guarded) {
+            return;
+        }
+        if (guarded) {
+            el.classList.add(...CRM_VIEW_BUTTON_GUARD_CLASSES);
+            setTemplateAttribute(el, "aria-disabled", "true");
+            setTemplateAttribute(el, "tabindex", -1);
+            setTemplateAttribute(el, "data-available-offline", false);
+            setTemplateAttribute(el, "disabled", true);
+            return;
+        }
+        const ownClasses = new Set(String(super.getClassName() || "").split(/\s+/));
+        const frameworkOwned = el.tagName === "BUTTON" && this.crmOfflinePlugin.isOffline();
+        for (const className of CRM_VIEW_BUTTON_GUARD_CLASSES) {
+            const keep =
+                ownClasses.has(className) || (frameworkOwned && className === "o_disabled_offline");
+            if (!keep) {
+                el.classList.remove(className);
+            }
+        }
+        const attrs = this.props.attrs || {};
+        setTemplateAttribute(el, "aria-disabled", attrs["aria-disabled"] ?? false);
+        setTemplateAttribute(el, "tabindex", this.props.tabindex);
+        setTemplateAttribute(
+            el,
+            "data-available-offline",
+            attrs["data-available-offline"] ?? false
+        );
+        if (!frameworkOwned) {
+            setTemplateAttribute(el, "disabled", this.disabled);
+        }
     },
 });
 

@@ -314,13 +314,15 @@
         crm_offline_hooks.js) leave the tab order and lose data-available-offline, which
         would make the framework re-enable a guarded "Won" (non-secure origin).
         Otherwise preserve aria-disabled and data-available-offline from the attributes
-        spread and the original tabindex.
+        spread and the original tabindex. The ref lets the guard follow the connection
+        on the element when a render is held (crmSyncGuardDom).
     -->
     <t t-inherit="web.views.ViewButton" t-inherit-mode="extension">
         <xpath expr="//t[@t-tag='this.props.tag']" position="attributes">
             <attribute name="t-att-aria-disabled">this.crmOfflineGuarded ? 'true' : (this.props.attrs['aria-disabled'] ?? false)</attribute>
             <attribute name="t-att-tabindex">this.crmOfflineGuarded ? -1 : this.props.tabindex</attribute>
             <attribute name="t-att-data-available-offline">this.crmOfflineGuarded ? false : (this.props.attrs['data-available-offline'] ?? false)</attribute>
+            <attribute name="t-ref">this.crmButtonRef</attribute>
         </xpath>
     </t>
 
